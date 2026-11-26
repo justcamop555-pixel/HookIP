@@ -7,6 +7,7 @@ import sys
 import time
 
 from .winproxy import _k32
+from . import notify
 
 
 def main(backup_path, parent_pid, event_name):
@@ -18,17 +19,26 @@ def main(backup_path, parent_pid, event_name):
         # cannot observe the parent (already gone / access denied):
         # give it a grace moment, then restore unconditionally.
         time.sleep(3)
-        winproxy.restore_from_file(backup_path)
+        if winproxy.restore_from_file(backup_path):
+            notify.notify("HookIP — internet restored",
+                          "HookIP stopped unexpectedly. Your normal internet "
+                          "settings are back.", timeout_s=12)
         return 0
     while True:
         if h_event and _k32.WaitForSingleObject(h_event, 0) == 0:
             return 0                      # told to stop — parent exited cleanly
         if _k32.WaitForSingleObject(h_parent, 0) == 0:
             # parent died — restore, best effort, then quit
+            restored = False
             for _ in range(3):
                 if winproxy.restore_from_file(backup_path):
+                    restored = True
                     break
                 time.sleep(0.5)
+            if restored:
+                notify.notify("HookIP — internet restored",
+                              "HookIP stopped unexpectedly. Your normal internet "
+                              "settings are back.", timeout_s=12)
             return 0
         time.sleep(1.0)
 

@@ -20,6 +20,7 @@ from .logutil import Log
 from .proxy import ProxyServer, Stats
 from .tooltips import Tooltip
 from . import winproxy
+from . import notify
 from .tray import TrayIcon
 from .doh import RESOLVERS, _DoHConn
 
@@ -71,7 +72,14 @@ class App:
         self._style()
         self._build()
         self._recover_stale_proxy()
+        self._recover_stale_proxy()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close_request)
+        # thread-safe UI event queue: background threads NEVER call tk
+        self._ui_queue = queue.Queue()
+        self._closing = threading.Event()
+        self.root.after(150, self._pump_ui)
+        # user-facing protocol so clicking a toast brings HookIP up
+        notify.ensure_protocol()
         # system tray (X button hides to tray; minimize stays a normal
         # minimize — hiding on minimize made double taskbar clicks "lose"
         # the window, which is why there is no <Unmap> binding)
@@ -98,18 +106,34 @@ class App:
                 return
 
             def watcher():
-                while True:
+                while not self._closing.is_set():
                     if winproxy._k32.WaitForSingleObject(ev, 1000) == 0:
                         try:
-                            self.root.after(0, self._show_self)
-                        except (RuntimeError, tk.TclError):
+                            self._ui_queue.put(("show", ()))
+                        except Exception:
                             return
-                    if not self.root.winfo_exists():
+                    time.sleep(0.05)
+                    if self._closing.is_set():
                         return
 
             threading.Thread(target=watcher, daemon=True).start()
         except Exception:
             pass
+
+    def _pump_ui(self):
+        """Drain events posted by background threads (activation, updates)."""
+        try:
+            while True:
+                kind, args = self._ui_queue.get_nowait()
+                if kind == "show":
+                    self._show_self()
+                elif kind == "update":
+                    self._update_result(*args)
+        except queue.Empty:
+            pass
+        except (tk.TclError, RuntimeError):
+            return
+        self.root.after(150, self._pump_ui)
 
     def _pump_tray(self):
         try:
@@ -179,7 +203,7 @@ class App:
                     pass
         except OSError:
             pass
-        self.root.after(0, lambda: self._update_result(latest, url))
+        self._ui_queue.put(("update", (latest, url)))
 
     @staticmethod
     def _ver_tuple(s):
@@ -201,6 +225,10 @@ class App:
                 self.update_label.configure(text=f"update available: {latest}", fg=WARN)
                 self.update_pill.configure(text=f"⬆ {latest} — click to update", fg=WARN)
                 self.log.ok(f"Update available: {latest} — you are on v{__version__}.")
+                notify.notify("HookIP update available",
+                              f"{latest} is out (you have v{__version__}). "
+                              "Click the banner in the app to get it.",
+                              timeout_s=12)
                 if messagebox.askyesno(
                         APP_NAME,
                         f"HookIP {latest} is available\n(you have v{__version__}).\n\n"
@@ -607,6 +635,10 @@ class App:
                 winproxy.clear_runonce()   # stale crash-cleanup entry
                 self.log.ok("Recovered from a crash: system proxy restored to "
                             "your previous settings — internet should work again.")
+                notify.notify("HookIP — internet restored",
+                              "The app crashed earlier and Windows was still "
+                              "pointed at it. Your original connection is back.",
+                              timeout_s=12)
                 return
         # no backup, but the registry still points at our own port
         port_s = f"127.0.0.1:{self.cfg.port}"
@@ -1117,6 +1149,7 @@ class App:
 
     def on_close(self):
         try:
+            self._closing.set()
             if self.running:
                 self.stop_proxy()
             self.cfg.minimize_to_tray = self.tray_var.get()

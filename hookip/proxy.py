@@ -426,7 +426,7 @@ class ProxyServer:
                 with lock:
                     errors.append(exc)
 
-        candidates = ips[:4]
+        candidates = ips[:6]
         threads = [threading.Thread(target=attempt, args=(ip,), daemon=True) for ip in candidates]
         for t in threads:
             t.start()
