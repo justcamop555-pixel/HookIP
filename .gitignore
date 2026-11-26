@@ -8,3 +8,7 @@ __pycache__/
 # runtime data
 proxy_backup.json
 restore.cmd
+
+# binaries go to GitHub Releases, not the repo
+HookIP.exe
+*.exe
