@@ -123,6 +123,7 @@ class ProxyServer:
         self.pac_token = pac_token
         self.resolver = Resolver(cfg, log, chunk=cfg.fragment_size)
         self._strat_pref = {}                 # host -> strategy that last worked
+        self._blocked_seen = {}               # host -> last 'blocked/dead' log ts
         self._lsock = None
         self._accept_thread = None
         self._ticker = None
@@ -290,7 +291,16 @@ class ProxyServer:
                 # NODATA probes) or the name does not exist anywhere — a dead
                 # or blocked domain, a feature working, not a proxy failure
                 blocked = True
-                self.log.info(f"{msg} — blocked/dead upstream, not a HookIP failure")
+                key = host or msg[:80]
+                now_s = time.time()
+                if len(self._blocked_seen) > 500:
+                    self._blocked_seen.clear()
+                if now_s - self._blocked_seen.get(key, 0) > 10:
+                    self._blocked_seen[key] = now_s
+                    self.log.info(f"{msg} — blocked/dead upstream, not a HookIP failure")
+                else:
+                    # parallel connections to the same dead host: log once
+                    self.log.debug(f"{msg} — blocked/dead upstream (repeat within 10s, suppressed)")
             elif isinstance(exc, ValueError):
                 failed = True
                 self.log.warn(f"Malformed request from client: {exc or 'unparseable target'}")
