@@ -7,7 +7,7 @@ import sys
 import threading
 import time
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, messagebox
 
 from . import __version__, APP_NAME
 from . import dnsmsg
@@ -62,7 +62,38 @@ class App:
         self.root.after(250, self._pump_log)
         self.root.after(500, self._refresh_dashboard)
         self.root.after(100, self._startup_restore_check)
+        self._watch_activation()
         self.log.info(f"{APP_NAME} {__version__} ready. Press Start to turn the proxy on.")
+
+    def _watch_activation(self):
+        """Watch the named event a second instance signals to bring this
+        window to the front (single-instance support)."""
+        try:
+            ev = winproxy._k32.CreateEventW(None, False, False, winproxy.ACTIVATE_EVENT)
+            if not ev:
+                return
+
+            def watcher():
+                while True:
+                    if winproxy._k32.WaitForSingleObject(ev, 1000) == 0:
+                        try:
+                            self.root.after(0, self._show_self)
+                        except (RuntimeError, tk.TclError):
+                            return
+                    if not self.root.winfo_exists():
+                        return
+
+            threading.Thread(target=watcher, daemon=True).start()
+        except Exception:
+            pass
+
+    def _show_self(self):
+        try:
+            self.root.deiconify()
+            self.root.lift()
+            self.root.focus_force()
+        except (tk.TclError, RuntimeError):
+            pass
 
     # ------------------------------------------------------------------
     def _style(self):
@@ -560,6 +591,27 @@ class App:
 
 
 def run():
+    # Single instance: if another HookIP is running, activate it and exit.
+    mutex = winproxy.acquire_single_instance()
+    if mutex is None:
+        root = tk.Tk()
+        root.withdraw()
+        if winproxy.notify_running_instance():
+            tk.messagebox.showinfo(
+                APP_NAME,
+                f"{APP_NAME} is already running —\nit was brought to the front instead.")
+        else:
+            tk.messagebox.showwarning(
+                APP_NAME,
+                f"{APP_NAME} is already running.\n"
+                f"Close the other instance before starting a new one.")
+        root.destroy()
+        return
     root = tk.Tk()
-    App(root)
+    app = App(root)
     root.mainloop()
+    try:
+        import ctypes
+        ctypes.windll.kernel32.CloseHandle(mutex)
+    except Exception:
+        pass

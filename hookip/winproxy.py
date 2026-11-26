@@ -6,6 +6,7 @@
 - Clean Stop/exit restores immediately.
 """
 import ctypes
+import ctypes.wintypes as wt
 import json
 import os
 import subprocess
@@ -14,6 +15,26 @@ import threading
 import winreg
 
 from . import APP_NAME
+
+# One properly-configured kernel32 for ALL handle work in the app.
+# ctypes.windll's GetLastError() is clobbered by ctypes internals, so we
+# must use use_last_error=True + ctypes.get_last_error(), and give handles
+# their true 64-bit type instead of truncating to c_int.
+_k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+_k32.CreateMutexW.restype = wt.HANDLE
+_k32.CreateMutexW.argtypes = [wt.HANDLE, wt.BOOL, wt.LPCWSTR]
+_k32.CreateEventW.restype = wt.HANDLE
+_k32.CreateEventW.argtypes = [wt.HANDLE, wt.BOOL, wt.BOOL, wt.LPCWSTR]
+_k32.OpenEventW.restype = wt.HANDLE
+_k32.OpenEventW.argtypes = [wt.DWORD, wt.BOOL, wt.LPCWSTR]
+_k32.OpenProcess.restype = wt.HANDLE
+_k32.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+_k32.SetEvent.argtypes = [wt.HANDLE]
+_k32.SetEvent.restype = wt.BOOL
+_k32.WaitForSingleObject.argtypes = [wt.HANDLE, wt.DWORD]
+_k32.WaitForSingleObject.restype = wt.DWORD
+_k32.CloseHandle.argtypes = [wt.HANDLE]
+_k32.CloseHandle.restype = wt.BOOL
 
 HWND_BROADCAST = 0xFFFF
 WM_SETTINGCHANGE = 0x001A
@@ -91,10 +112,16 @@ def describe(vals):
 
 # ----------------------------------------------------------------------
 def backup():
+    cur = read_current()
+    # Never overwrite the saved original with HookIP's own proxy state —
+    # that would happen if a second instance (or a restart) backed up while
+    # the first instance's proxy was already active.
+    if has_backup() and _is_ours(cur):
+        return
     os.makedirs(_app_dir(), exist_ok=True)
     with open(BACKUP_PATH, "w", encoding="utf-8") as fh:
-        json.dump(read_current(), fh)
-    _write_restore_cmd(read_current())
+        json.dump(cur, fh)
+    _write_restore_cmd(cur)
 
 
 def has_backup():
@@ -150,6 +177,39 @@ def remove_proxy():
 
 
 # ----------------------------------------------------------------------
+INSTANCE_MUTEX = "HookIP_Instance_Mutex"
+ACTIVATE_EVENT = "HookIP_Activate_Event"
+ERROR_ALREADY_EXISTS = 183
+EVENT_MODIFY_STATE = 0x0002
+
+
+def acquire_single_instance():
+    """Hold a named mutex for the app's lifetime.
+    Returns the handle, or None if another HookIP instance is running."""
+    handle = _k32.CreateMutexW(None, False, INSTANCE_MUTEX)
+    if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
+        _k32.CloseHandle(handle)
+        return None
+    return handle
+
+
+def notify_running_instance():
+    """Signal the running instance to show its window. True on success."""
+    ev = _k32.OpenEventW(EVENT_MODIFY_STATE, False, ACTIVATE_EVENT)
+    if not ev:
+        return False
+    ok = bool(_k32.SetEvent(ev))
+    _k32.CloseHandle(ev)
+    return ok
+
+
+def _is_ours(vals):
+    """Does this proxy configuration look like one HookIP set itself?"""
+    ps = str(vals.get("ProxyServer") or "")
+    ac = str(vals.get("AutoConfigURL") or "")
+    return ps.startswith("127.0.0.1") or ("127.0.0.1" in ac and ".pac" in ac)
+
+
 def _write_restore_cmd(vals):
     lines = ["@echo off"]
     lines.append(f'reg add "HKCU\\{KEY_PATH}" /v ProxyEnable /t REG_DWORD /d {1 if vals.get("ProxyEnable") else 0} /f')
@@ -204,8 +264,7 @@ class Watchdog:
         self.stop()
         pid = os.getpid()
         self.event_name = f"HookIP_Stop_{pid}_{port}"
-        kernel32 = ctypes.windll.kernel32
-        self._event = kernel32.CreateEventW(None, True, False, self.event_name)
+        self._event = _k32.CreateEventW(None, True, False, self.event_name)
         backup, ppid, event = BACKUP_PATH, str(pid), self.event_name
         if getattr(sys, "frozen", False):
             # packaged exe: the exe itself understands --hookip-watchdog
@@ -227,7 +286,7 @@ class Watchdog:
 
     def stop(self):
         if self._event:
-            ctypes.windll.kernel32.SetEvent(self._event)
+            _k32.SetEvent(self._event)
             self._event = None
         if self._proc and self._proc.poll() is None:
             try:
