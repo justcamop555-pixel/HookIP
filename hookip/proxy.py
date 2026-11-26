@@ -403,6 +403,7 @@ class ProxyServer:
 
     def _relay(self, csock, server, host):
         up = down = 0
+        started = time.time()
         sockets = [csock, server]
         _set_keepalive(csock)
         _set_keepalive(server)
@@ -429,6 +430,9 @@ class ProxyServer:
                         down += len(data)
         finally:
             self.stats.add(host, up=up, down=down)
+            self.log.debug(
+                f"{host} relay closed after {time.time()-started:.1f}s "
+                f"({up} B up, {down} B down)")
 
     # ------------------------------------------------------------------
     def _plain_http(self, csock, head, method, target, headers):

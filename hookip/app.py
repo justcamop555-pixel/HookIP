@@ -3,14 +3,16 @@ import os
 import secrets
 import socket
 import ssl
+import subprocess
 import sys
 import threading
 import time
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 
 from . import __version__, APP_NAME
 from . import dnsmsg
+from . import logutil
 from .config import Config, SETTINGS_PATH
 from .logutil import Log
 from .proxy import ProxyServer, Stats
@@ -41,6 +43,12 @@ class App:
         self.cfg = saved if saved.remember else Config()
         self.log = Log()
         self.log.verbose = self.cfg.verbose
+        # session log file (mirrors everything; helps bug reports)
+        from .config import APP_DIR
+        self._log_dir = os.path.join(APP_DIR, "logs")
+        Log.prune_session_files(self._log_dir, keep=7)
+        self._log_file = os.path.join(self._log_dir, time.strftime("hookip_%Y%m%d_%H%M%S.log"))
+        self.log.attach_file(self._log_file)
         self.stats = Stats()
         self.pac_token = secrets.token_hex(8)
         self.proxy = None
@@ -192,6 +200,27 @@ class App:
         # log ----------------------------------------------------------------
         logf = ttk.Frame(nb, style="Card.TFrame", padding=10)
         nb.add(logf, text=" Activity log ")
+        bar = tk.Frame(logf, bg=PANEL)
+        bar.pack(fill="x", pady=(0, 6))
+        tk.Label(bar, text="Show:", bg=PANEL, fg=MUTED).pack(side="left")
+        self._log_min_rank = 0
+        self._log_all = []                       # full in-app history for filter/export
+        self.log_filter = ttk.Combobox(
+            bar, state="readonly", width=20,
+            values=["Everything", "Info and above", "Warnings and above", "Errors only"])
+        self.log_filter.current(0)
+        self.log_filter.pack(side="left", padx=(6, 8))
+        self.log_filter.bind("<<ComboboxSelected>>", lambda _e: self._apply_log_filter())
+        tk.Button(bar, text="Save log…", command=self._export_log,
+                  bg="#202634", fg=FG, bd=0, padx=10, pady=3,
+                  activebackground="#2a3244", activeforeground=FG,
+                  cursor="hand2").pack(side="right")
+        tk.Button(bar, text="Copy all", command=self._copy_log,
+                  bg="#202634", fg=FG, bd=0, padx=10, pady=3,
+                  activebackground="#2a3244", activeforeground=FG,
+                  cursor="hand2").pack(side="right", padx=(0, 6))
+        tk.Label(bar, text=f"Session file: {self._log_file}", bg=PANEL,
+                 fg=MUTED, font=("Segoe UI", 8)).pack(side="right", padx=8)
         self.log_text = tk.Text(logf, bg="#0d1017", fg=FG, insertbackground=FG,
                                 font=("Consolas", 9), state="disabled", wrap="none",
                                 height=10)
@@ -265,30 +294,64 @@ class App:
         nb.add(diagf, text=" Diagnostics ")
         btns = tk.Frame(diagf, bg=PANEL)
         btns.pack(fill="x")
-        tk.Button(btns, text="Run full check", command=self.run_diagnostics,
-                  bg="#202634", fg=FG, bd=0, padx=14, pady=6,
-                  activebackground="#2a3244", activeforeground=FG,
-                  cursor="hand2").pack(side="left")
+        for text, cmd in (("Run full check", lambda: self.run_diagnostics("all")),
+                          ("DNS only", lambda: self.run_diagnostics("dns")),
+                          ("Tunnel only", lambda: self.run_diagnostics("tunnel")),
+                          ("System only", lambda: self.run_diagnostics("system"))):
+            tk.Button(btns, text=text, command=cmd,
+                      bg="#202634", fg=FG, bd=0, padx=12, pady=6,
+                      activebackground="#2a3244", activeforeground=FG,
+                      cursor="hand2").pack(side="left")
         tk.Button(btns, text="Clear DNS cache", command=self._clear_cache,
-                  bg="#202634", fg=FG, bd=0, padx=14, pady=6,
+                  bg="#202634", fg=FG, bd=0, padx=12, pady=6,
                   activebackground="#2a3244", activeforeground=FG,
                   cursor="hand2").pack(side="left", padx=8)
-        self.diag_text = tk.Text(diagf, bg="#0d1017", fg=FG, insertbackground=FG,
-                                 font=("Consolas", 9), height=14)
-        self.diag_text.pack(fill="both", expand=True, pady=(10, 0))
+        tk.Button(btns, text="Copy report", command=self._copy_diag_report,
+                  bg="#202634", fg=FG, bd=0, padx=12, pady=6,
+                  activebackground="#2a3244", activeforeground=FG,
+                  cursor="hand2").pack(side="right")
+        cols = ("check", "result", "details")
+        self.diag_tree = ttk.Treeview(diagf, columns=cols, show="headings", height=13)
+        for cid, text, w in (("check", "Check", 220), ("result", "Result", 90),
+                             ("details", "Details", 420)):
+            self.diag_tree.heading(cid, text=text)
+            self.diag_tree.column(cid, width=w, anchor="w")
+        self.diag_tree.tag_configure("section", font=("Segoe UI Semibold", 9),
+                                     background="#1b2130")
+        self.diag_tree.tag_configure("ok", foreground=OK)
+        self.diag_tree.tag_configure("fail", foreground=ERR)
+        self.diag_tree.tag_configure("warn", foreground=WARN)
+        self.diag_tree.tag_configure("info", foreground=MUTED)
+        self.diag_tree.pack(fill="both", expand=True, pady=(10, 0))
         self._diag_queue = []
         self._diag_lock = threading.Lock()
+        self._diag_results = []          # (section, check, result, details) for report
+        self._diag_running = False
         self.root.after(200, self._pump_diag)
+
+    # -- diagnostics helpers -------------------------------------------------
+    def _diag_section(self, title):
+        with self._diag_lock:
+            self._diag_queue.append(("section", title, "", ""))
+
+    def _diag_result(self, check, result, details="", tag="info"):
+        with self._diag_lock:
+            self._diag_queue.append(("result", check, result, details, tag))
 
     def _pump_diag(self):
         try:
             with self._diag_lock:
                 msgs = list(self._diag_queue)
                 self._diag_queue.clear()
-            if msgs:
-                for m in msgs:
-                    self.diag_text.insert("end", m + "\n")
-                self.diag_text.see("end")
+            for m in msgs:
+                if m[0] == "section":
+                    self._diag_results.append((m[1], "", "", ""))
+                    iid = self.diag_tree.insert("", "end", values=(m[1], "", ""), tags=("section",))
+                else:
+                    _, check, result, details, tag = m
+                    self._diag_results.append(("", check, result, details))
+                    iid = self.diag_tree.insert("", "end", values=(check, result, details), tags=(tag,))
+                self.diag_tree.see(iid)   # Treeview.see() needs an item id, not "end"
             self.root.after(200, self._pump_diag)
         except (tk.TclError, RuntimeError):
             return   # window closing
@@ -418,19 +481,70 @@ class App:
 
     def _pump_log(self):
         try:
-            new_entries = self.log.drain()
-            if new_entries:
-                self.log_text.configure(state="normal")
-                for level, ts, msg in new_entries:
-                    self.log_text.insert("end", f"[{ts}] {msg}\n", level)
-                self.log_text.configure(state="disabled")
-                self.log_text.see("end")
+            entries = self.log.drain()
+            if entries:
+                self._log_all.extend(entries)
+                if len(self._log_all) > 3000:
+                    self._log_all = self._log_all[-3000:]
+                new_entries = [e for e in entries
+                               if logutil.LEVEL_RANK.get(e[0], 1) >= self._log_min_rank]
+                if new_entries:
+                    self.log_text.configure(state="normal")
+                    for level, ts, msg in new_entries:
+                        self.log_text.insert("end", f"[{ts}] {msg}\n", level)
+                    self.log_text.configure(state="disabled")
+                    self.log_text.see("end")
             lines = int(self.log_text.index("end-1c").split(".")[0])
             if lines > 2500:
                 self.log_text.delete("1.0", f"{lines - 2000}.0")
             self.root.after(250, self._pump_log)
         except (tk.TclError, RuntimeError):
             return   # window closing
+
+    def _apply_log_filter(self):
+        names = ["Everything", "Info and above", "Warnings and above", "Errors only"]
+        ranks = [0, 1, 2, 3]
+        self._log_min_rank = ranks[names.index(self.log_filter.get())]
+        # re-render the visible log from the in-app history
+        try:
+            self.log_text.configure(state="normal")
+            self.log_text.delete("1.0", "end")
+            today = time.strftime("%Y-%m-%d")
+            for level, ts, msg in self._log_all:
+                if logutil.LEVEL_RANK.get(level, 1) >= self._log_min_rank:
+                    self.log_text.insert("end", f"[{ts}] {msg}\n", level)
+            self.log_text.configure(state="disabled")
+            self.log_text.see("end")
+        except tk.TclError:
+            pass
+
+    def _log_report_text(self, min_rank=None):
+        rank = self._log_min_rank if min_rank is None else min_rank
+        today = time.strftime("%Y-%m-%d")
+        lines = [f"HookIP {__version__} log — {today}"]
+        for level, ts, msg in self._log_all:
+            if logutil.LEVEL_RANK.get(level, 1) >= rank:
+                lines.append(f"[{today} {ts}] [{level.upper():5}] {msg}")
+        return "\n".join(lines)
+
+    def _export_log(self):
+        path = filedialog.asksaveasfilename(
+            defaultextension=".log",
+            initialfile=time.strftime("hookip_log_%Y%m%d_%H%M%S.log"),
+            filetypes=[("Log files", "*.log"), ("Text files", "*.txt")])
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(self._log_report_text(min_rank=0))
+            self.log.ok(f"Log exported to {path}")
+        except OSError as exc:
+            self.log.error(f"Log export failed: {exc}")
+
+    def _copy_log(self):
+        self.root.clipboard_clear()
+        self.root.clipboard_append(self._log_report_text(min_rank=0))
+        self.log.info("Log copied to clipboard.")
 
     def _refresh_dashboard(self):
         try:
@@ -492,63 +606,135 @@ class App:
         if self.proxy:
             self.proxy.resolver.clear_cache()
             self.log.info("DNS cache cleared.")
-            self._diag("DNS cache cleared.")
 
-    def _diag(self, msg):
-        with self._diag_lock:
-            self._diag_queue.append(msg)
-
-    def run_diagnostics(self):
-        self.diag_text.delete("1.0", "end")
-        self._diag(f"HookIP {__version__} — diagnostics\n" + "-" * 50)
+    def run_diagnostics(self, sections="all"):
+        """sections: 'all' | 'dns' | 'tunnel' | 'system'"""
+        if self._diag_running:
+            return
+        self._diag_running = True
+        for iid in self.diag_tree.get_children():
+            self.diag_tree.delete(iid)
+        self._diag_results = []
 
         def work():
-            cfg = self.cfg
             try:
-                frag = max(1, int(self.frag_var.get()))
-            except (ValueError, tk.TclError, RuntimeError):
-                frag = max(1, cfg.fragment_size)
-            # 1. system proxy state
-            cur = winproxy.read_current()
-            self._diag(f"\n[system proxy] {winproxy.describe(cur)}")
-            # 2. resolver checks
-            self._diag("\n[DoH resolvers]")
-            query = dnsmsg.encode_query("example.com")
-            for name, host, ip in RESOLVERS:
-                t0 = time.time()
-                try:
-                    conn = _DoHConn(ip, host, timeout=4, chunk=frag)
-                    try:
-                        resp = conn.request(host, query)
-                        rcode, answers = dnsmsg.parse_response(resp)
-                        ips = [v for (_n, t, _tl, v) in answers if t == 1]
-                        self._diag(f"  {name:<12} OK  {time.time()-t0:5.2f}s  rcode={rcode}  {ips[:2]}")
-                    finally:
-                        conn.close()
-                except Exception as exc:  # noqa: BLE001
-                    self._diag(f"  {name:<12} FAIL {time.time()-t0:5.2f}s  {exc}")
-            # 3. end-to-end tunnel test (only while running)
-            if self.running and self.proxy:
-                self._diag("\n[end-to-end tunnel through HookIP]")
-                for site in ("github.com", "wikipedia.org"):
-                    try:
-                        result = self._tunnel_test(site, 443)
-                        if result:
-                            self._diag(f"  {site}:443 → OK ({result})")
-                        else:
-                            self._diag(f"  {site}:443 → FAILED (no HTTP response)")
-                    except Exception as exc:  # noqa: BLE001
-                        self._diag(f"  {site}:443 → FAILED ({exc})")
-            else:
-                self._diag("\n[end-to-end tunnel] start the proxy first to test it.")
-            self._diag("\nDone.")
+                if sections in ("all", "system"):
+                    self._diag_system()
+                if sections in ("all", "dns"):
+                    self._diag_dns()
+                if sections in ("all", "tunnel"):
+                    self._diag_tunnel()
+                self._diag_result("Summary", "done", "", "info")
+            except Exception as exc:  # noqa: BLE001
+                self._diag_result("Diagnostics", "error", str(exc), "fail")
+            finally:
+                self._diag_running = False
 
         threading.Thread(target=work, daemon=True).start()
 
+    def _diag_system(self):
+        self._diag_section("System")
+        import platform
+        self._diag_result("Environment", "info",
+                          f"HookIP {__version__} · Python {sys.version.split()[0]} · "
+                          f"{platform.system()} {platform.release()} ({platform.machine()})")
+        cur = winproxy.read_current()
+        self._diag_result("System proxy", "info", winproxy.describe(cur))
+        self._diag_result("Crash protection",
+                          "active" if self.watchdog.alive() else "inactive",
+                          "watchdog process" if self.watchdog.alive() else "", "info")
+        # antivirus (helps interpret Defender false positives)
+        try:
+            ps = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "$s = Get-MpComputerStatus; "
+                 "Write-Output ('enabled=' + $s.AntivirusEnabled); "
+                 "Write-Output ('sig=' + $s.AntivirusSignatureVersion); "
+                 "Write-Output ('updated=' + $s.AntivirusSignatureLastUpdated); "
+                 "$d = Get-MpThreatDetection | Where-Object { $_.Resources -like '*HookIP*' }; "
+                 "Write-Output ('hookip_detections=' + ($d | Measure-Object).Count)"],
+                capture_output=True, text=True, timeout=20, creationflags=0x08000000)
+            info = dict(line.split("=", 1) for line in ps.stdout.strip().splitlines() if "=" in line)
+            if info.get("enabled") == "True":
+                det = info.get("hookip_detections", "0")
+                self._diag_result("Windows Defender", "info",
+                                  f"enabled · definitions {info.get('sig', '?')} "
+                                  f"(updated {info.get('updated', '?')}) · "
+                                  f"{det} past HookIP detection(s)")
+            else:
+                self._diag_result("Windows Defender", "info", "antivirus disabled or not found")
+        except (OSError, subprocess.SubprocessError) as exc:
+            self._diag_result("Windows Defender", "info", f"status unavailable ({type(exc).__name__})")
+
+    def _diag_dns(self):
+        self._diag_section("DNS resolvers (DNS-over-HTTPS)")
+        try:
+            frag = max(1, int(self.frag_var.get()))
+        except (ValueError, tk.TclError, RuntimeError):
+            frag = max(1, self.cfg.fragment_size)
+        query = dnsmsg.encode_query("example.com")
+        ok_count = 0
+        for name, host, ip in RESOLVERS:
+            t0 = time.time()
+            try:
+                conn = _DoHConn(ip, host, timeout=4, chunk=frag)
+                try:
+                    resp = conn.request(host, query)
+                    rcode, answers = dnsmsg.parse_response(resp)
+                    ips = dnsmsg.extract_ips(answers, 1)
+                    dt = time.time() - t0
+                    if rcode == 0 and ips:
+                        ok_count += 1
+                        self._diag_result(name, "OK", f"{dt:.2f}s · A records: {', '.join(ips[:2])}", "ok")
+                    else:
+                        self._diag_result(name, "WARN", f"{dt:.2f}s · rcode={rcode}", "warn")
+                finally:
+                    conn.close()
+            except Exception as exc:  # noqa: BLE001
+                self._diag_result(name, "FAIL",
+                                  f"{time.time()-t0:.2f}s · {type(exc).__name__}: {exc}", "fail")
+        tag = "ok" if ok_count else ("warn" if ok_count == 0 else "fail")
+        self._diag_result("DNS summary", f"{ok_count}/{len(RESOLVERS)} reachable", "", tag)
+
+    def _diag_tunnel(self):
+        self._diag_section("End-to-end tunnel through HookIP")
+        if not (self.running and self.proxy):
+            self._diag_result("Tunnel test", "skipped", "start the proxy first", "info")
+            return
+        ok_count = 0
+        sites = ("github.com", "wikipedia.org")
+        for site in sites:
+            t0 = time.time()
+            try:
+                result = self._tunnel_test(site, 443)
+                if result:
+                    ok_count += 1
+                    self._diag_result(f"{site}:443", "OK",
+                                      f"{time.time()-t0:.2f}s · {result}", "ok")
+                else:
+                    self._diag_result(f"{site}:443", "FAIL", "no HTTP response", "fail")
+            except Exception as exc:  # noqa: BLE001
+                self._diag_result(f"{site}:443", "FAIL",
+                                  f"{time.time()-t0:.2f}s · {exc}", "fail")
+        self._diag_result("Tunnel summary", f"{ok_count}/{len(sites)} reachable", "",
+                          "ok" if ok_count == len(sites) else ("warn" if ok_count else "fail"))
+
+    def _copy_diag_report(self):
+        lines = [f"HookIP {__version__} diagnostic report — {time.strftime('%Y-%m-%d %H:%M:%S')}"]
+        for section, check, result, details in self._diag_results:
+            if section and not check:
+                lines.append(f"\n== {section} ==")
+            elif check:
+                lines.append(f"  {check:<24} {result:<8} {details}")
+        text = "\n".join(lines)
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.log.info("Diagnostic report copied to clipboard.")
+
     def _tunnel_test(self, host, port):
         """Drive a real CONNECT + TLS handshake through our own proxy."""
-        port = self.cfg.port if self.running else int(self.port_var.get())
-        with socket.create_connection(("127.0.0.1", port), timeout=10) as s:
+        local_port = self.cfg.port if self.running else int(self.port_var.get())
+        with socket.create_connection(("127.0.0.1", local_port), timeout=10) as s:
             s.sendall(f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}\r\n\r\n".encode())
             resp = b""
             while b"\r\n\r\n" not in resp:
@@ -586,6 +772,7 @@ class App:
         try:
             if self.running:
                 self.stop_proxy()
+            self.log.close_file()
         finally:
             self.root.destroy()
 
