@@ -249,6 +249,10 @@ class App:
     def _find_free_port(self):
         """Pick a random verified-free port near the default range and fill
         the entry (same exclusive bind Start uses)."""
+        if self.running:
+            self.log.info("The proxy is running on its own port — stop it "
+                          "before changing the setting.")
+            return
         import random
         for _ in range(60):
             p = random.randint(9000, 9899)
@@ -287,6 +291,10 @@ class App:
         return out
 
     def _reset_excluded(self):
+        if self.running:
+            self.log.info("The proxy is running — stop it before changing "
+                          "excluded domains.")
+            return
         self.excl_text.delete("1.0", "end")
         self.excl_text.insert("1.0", "\n".join(DEFAULTS["excluded"]))
         self.log.info("Excluded domains reset to defaults (applied on next Start).")
@@ -614,6 +622,7 @@ class App:
                            activebackground="#2a3244", activeforeground=FG,
                            cursor="hand2")
         fp_btn.pack(side="left", padx=(6, 0))
+        self.set_widgets.append(fp_btn)   # disabled while the proxy runs
         Tooltip(fp_btn,
                 "Picks a random free port near the default (9000–9899),\n"
                 "verified with the same exclusive bind Start uses, and\n"
@@ -715,6 +724,7 @@ class App:
                        activebackground="#2a3244", activeforeground=FG,
                        cursor="hand2")
         rb.pack(side="right")
+        self.set_widgets.append(rb)   # disabled while the proxy runs
         Tooltip(rb, "Put the excluded list back to the default entries.")
         row.pack(fill="x", pady=(10, 2))
         self.excl_text = tk.Text(setf, bg="#0d1017", fg=FG, insertbackground=FG,
