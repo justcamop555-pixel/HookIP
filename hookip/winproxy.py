@@ -51,67 +51,6 @@ RUNONCE_NAME = "HookIP_Restore"
 WATCHDOG_FLAG = "--hookip-watchdog"
 BACKUP_PATH = os.path.join(_app_dir(), "proxy_backup.json")
 RESTORE_CMD = os.path.join(_app_dir(), "restore.cmd")
-WINHTTP_BACKUP = os.path.join(_app_dir(), "winhttp_backup.txt")
-
-
-def winhttp_state():
-    """Raw 'netsh winhttp show proxy' output (machine-wide proxy used by
-    Windows services: Store downloads, Delivery Optimization, Windows
-    Update, winget)."""
-    try:
-        r = subprocess.run(
-            ["netsh", "winhttp", "show", "proxy"],
-            capture_output=True, text=True, timeout=10,
-            creationflags=0x08000000)
-        return r.stdout or ""
-    except (OSError, subprocess.SubprocessError):
-        return ""
-
-
-def winhttp_points_at(port):
-    out = winhttp_state().lower()
-    return f"127.0.0.1:{port}" in out.replace(" ", "")
-
-
-def set_winhttp_proxy_elevated(port):
-    """Route Windows services through HookIP (needs one UAC approval).
-    Restricted/campus networks sometimes allow app downloads only through
-    the proxy — services like Delivery Optimization bypass the user proxy
-    unless the machine-wide WinHTTP proxy is set."""
-    os.makedirs(_app_dir(), exist_ok=True)
-    with open(WINHTTP_BACKUP, "w", encoding="utf-8") as fh:
-        fh.write(winhttp_state())
-    subprocess.Popen(
-        ["powershell", "-NoProfile", "-Command",
-         f"Start-Process netsh -Verb RunAs -ArgumentList "
-         f"'winhttp','set','proxy','127.0.0.1:{port}',\"bypass-list='<local>'\""],
-        creationflags=0x08000000)
-
-
-def restore_winhttp_elevated():
-    """Undo set_winhttp_proxy_elevated: restore the saved machine state
-    (direct access or the user's previous proxy)."""
-    try:
-        with open(WINHTTP_BACKUP, "r", encoding="utf-8") as fh:
-            saved = fh.read()
-        os.remove(WINHTTP_BACKUP)
-    except OSError:
-        return False
-    if "direct access" in saved.lower():
-        args = "'winhttp','reset','proxy'"
-    else:
-        # previous state was a real proxy — restore it
-        server = ""
-        for line in saved.splitlines():
-            if "proxy server" in line.lower() and ":" in line:
-                server = line.split(":", 1)[1].strip()
-                break
-        args = "'winhttp','set','proxy','" + server + "'"
-    subprocess.Popen(
-        ["powershell", "-NoProfile", "-Command",
-         f"Start-Process netsh -Verb RunAs -ArgumentList {args}"],
-        creationflags=0x08000000)
-    return True
 
 
 
