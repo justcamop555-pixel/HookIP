@@ -239,6 +239,8 @@ class Resolver:
         self._lock = threading.Lock()
         self._start_idx = 0
         self._lat = {}                          # resolver name -> EMA latency (s)
+        self._inflight = {}                     # host -> Event (lookup coalescing)
+        self._inflight_lock = threading.Lock()
         self.verbose_stats = {}               # resolver -> success count
         self._pool = {}                       # resolver name -> _DoHConn (keep-alive)
         self._pool_lock = threading.Lock()
@@ -278,6 +280,38 @@ class Resolver:
             if hit and hit[0] > now:
                 return list(hit[1])
 
+        # In-flight coalescing: browsers open many parallel connections to
+        # the same host — without this, each connection triggers its own
+        # full DoH resolver rotation. Follows wait for the first lookup.
+        ev = None
+        while True:
+            with self._inflight_lock:
+                ev = self._inflight.get(host)
+                if ev is None:
+                    self._inflight[host] = threading.Event()
+                    break
+            ev.wait(6.0)
+            now = time.time()
+            with self._lock:
+                neg = self._neg_cache.get(host)
+                if neg and neg > now:
+                    raise ResolveError(f"{host}: cached NXDOMAIN")
+                hit = self._cache.get(host)
+                if hit and hit[0] > now:
+                    return list(hit[1])
+            # wait expired with no result — loop and take over if needed
+
+        try:
+            return self._lookup_uncached(host, qtype, time.time())
+        finally:
+            with self._inflight_lock:
+                ev = self._inflight.pop(host, None)
+            if ev:
+                ev.set()
+
+    def _lookup_uncached(self, host, qtype, now):
+        """Full resolver chain (DoH → TCP → UDP → system) with caching.
+        Called at most once per host at a time (in-flight coalescing)."""
         ips = []
         ttl = 120
         verified_neg = None
@@ -294,7 +328,7 @@ class Resolver:
         if not ips and not verified_neg:
             ips, ttl = self._via_system(host, qtype)
         if not ips:
-            neg_ttl = 300 if verified_neg else 60
+            neg_ttl = 300 if verified_neg else 120
             with self._lock:
                 self._neg_cache[host] = now + neg_ttl
             if not verified_neg and self.cfg.doh_enabled:
@@ -322,7 +356,7 @@ class Resolver:
             self.log.debug(f"resolve {host}: dropped sinkhole answer(s) {', '.join(blocked)}")
             if not ips:
                 with self._lock:
-                    self._neg_cache[host] = now + 60
+                    self._neg_cache[host] = now + 120
                 raise ResolveError(f"no addresses for {host} (all resolvers returned a sinkhole)")
 
         ttl = min(300, max(10, int(ttl)))
@@ -415,7 +449,11 @@ class Resolver:
                 last_err = f"{name}: {exc}"
                 self.log.debug(f"DoH {name} failed: {exc}")
         if last_err:
-            self.log.warn(f"DoH failed for {host}: {last_err}")
+            # policy verdicts (sinkhole/empty) are expected for ad domains —
+            # DEBUG keeps the detail without spamming WARN on every retry
+            level = "debug" if ("sinkhole" in last_err or "rcode 0" in last_err
+                                or "no answer" in last_err) else "warn"
+            getattr(self.log, level)(f"DoH failed for {host}: {last_err}")
         return [], 120
 
     def _via_tcp_dns(self, host, qtype):
