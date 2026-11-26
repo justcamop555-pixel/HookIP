@@ -214,6 +214,7 @@ class Resolver:
         self._neg_cache = {}                  # name -> expiry
         self._lock = threading.Lock()
         self._start_idx = 0
+        self._lat = {}                          # resolver name -> EMA latency (s)
         self.verbose_stats = {}               # resolver -> success count
         self._pool = {}                       # resolver name -> _DoHConn (keep-alive)
         self._pool_lock = threading.Lock()
@@ -290,10 +291,24 @@ class Resolver:
         return list(ips)
 
     # -- strategies ------------------------------------------------------
+    def _note_latency(self, name, dt, ok=True):
+        """Exponential moving average so slow resolvers (e.g. ~1s AdGuard)
+        automatically drop to the back of the rotation."""
+        with self._lock:
+            prev = self._lat.get(name)
+            if prev is None:
+                self._lat[name] = max(0.01, dt)
+            elif ok:
+                self._lat[name] = 0.7 * prev + 0.3 * dt
+            else:
+                self._lat[name] = min(10.0, prev * 1.2 + 0.1)
+
     def _via_doh(self, host, qtype):
         n = len(RESOLVERS)
         order = [RESOLVERS[(self._start_idx + i) % n] for i in range(n)]
         self._start_idx = (self._start_idx + 1) % n
+        # fastest first — measured latency beats fixed rotation
+        order.sort(key=lambda r: self._lat.get(r[0], 1.0))
         query = dnsmsg.encode_query(host, qtype)
         last_err = None
         for name, dns_host, ip in order:
@@ -311,7 +326,9 @@ class Resolver:
                 if not resp:
                     raise ResolveError("empty response")
                 rcode, answers = dnsmsg.parse_response(resp)
-                self.log.debug(f"DoH {name}: {host} rcode={rcode} in {time.time()-t0:.2f}s")
+                dt = time.time() - t0
+                self._note_latency(name, dt, ok=True)
+                self.log.debug(f"DoH {name}: {host} rcode={rcode} in {dt:.2f}s")
                 if rcode == 3:
                     raise VerifiedNegative(f"{host}: NXDOMAIN (verified via DoH {name})")
                 if rcode != 0:
@@ -353,6 +370,7 @@ class Resolver:
             except VerifiedNegative:
                 raise
             except (OSError, ResolveError, ValueError, ssl.SSLError) as exc:
+                self._note_latency(name, time.time() - t0, ok=False)
                 last_err = f"{name}: {exc}"
                 self.log.debug(f"DoH {name} failed: {exc}")
         if last_err:

@@ -238,6 +238,13 @@ class App:
                            ("error", ERR), ("debug", MUTED)):
             self.log_text.tag_configure(tag, foreground=color)
         self.log_text.tag_configure("ts", foreground="#5a6478")
+        # semantic sub-colors so the debug stream stays scannable:
+        #   DoH lookups  = soft blue · resolved IPs = teal · fragment/relay
+        #   bookkeeping = dim gray · failures stay amber/red
+        self.log_text.tag_configure("doh", foreground="#8ab4f8")
+        self.log_text.tag_configure("res", foreground="#79c7c5")
+        self.log_text.tag_configure("dim", foreground="#4a5468")
+        self.log_text.tag_configure("connok", foreground="#6ea86e")
 
         # settings -------------------------------------------------------------
         setf = ttk.Frame(nb, style="Card.TFrame", padding=14)
@@ -545,6 +552,17 @@ class App:
     def _apply_settings_from_ui(self):
         pass  # read directly in start_proxy
 
+    @staticmethod
+    def _log_semantic_tag(msg):
+        """Extra color tag for known debug-stream patterns."""
+        if msg.startswith("DoH "):
+            return "doh"
+        if msg.startswith("resolve "):
+            return "res"
+        if ": smart fragment" in msg or "relay closed" in msg or ": attempt " in msg:
+            return "dim"
+        return None
+
     def _pump_log(self):
         try:
             entries = self.log.drain()
@@ -557,8 +575,10 @@ class App:
                 if new_entries:
                     self.log_text.configure(state="normal")
                     for level, ts, msg in new_entries:
+                        extra = self._log_semantic_tag(msg)
+                        tags = (level, extra) if extra else (level,)
                         self.log_text.insert("end", f"[{ts}] ", "ts")
-                        self.log_text.insert("end", f"{msg}\n", level)
+                        self.log_text.insert("end", f"{msg}\n", tags)
                     self.log_text.configure(state="disabled")
                     self.log_text.see("end")
             lines = int(self.log_text.index("end-1c").split(".")[0])
@@ -579,8 +599,10 @@ class App:
             today = time.strftime("%Y-%m-%d")
             for level, ts, msg in self._log_all:
                 if logutil.LEVEL_RANK.get(level, 1) >= self._log_min_rank:
+                    extra = self._log_semantic_tag(msg)
+                    tags = (level, extra) if extra else (level,)
                     self.log_text.insert("end", f"[{ts}] ", "ts")
-                    self.log_text.insert("end", f"{msg}\n", level)
+                    self.log_text.insert("end", f"{msg}\n", tags)
             self.log_text.configure(state="disabled")
             self.log_text.see("end")
         except tk.TclError:
