@@ -18,6 +18,7 @@ from . import logutil
 from .config import Config, SETTINGS_PATH
 from .logutil import Log
 from .proxy import ProxyServer, Stats
+from .tooltips import Tooltip
 from . import winproxy
 from .tray import TrayIcon
 from .doh import RESOLVERS, _DoHConn
@@ -71,11 +72,12 @@ class App:
         self._build()
         self._recover_stale_proxy()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close_request)
-        # system tray (optional, hides when minimized)
+        # system tray (X button hides to tray; minimize stays a normal
+        # minimize — hiding on minimize made double taskbar clicks "lose"
+        # the window, which is why there is no <Unmap> binding)
         self.tray = TrayIcon(f"{APP_NAME} — stopped")
         self.tray.start()
         if self.tray.available:
-            self.root.bind("<Unmap>", self._on_unmap)
             self.root.after(120, self._pump_tray)
         else:
             self.log.debug("System tray unavailable — window-only mode.")
@@ -107,17 +109,6 @@ class App:
 
             threading.Thread(target=watcher, daemon=True).start()
         except Exception:
-            pass
-
-    def _on_unmap(self, event):
-        """Minimize → hide to tray (when enabled). The tray icon is the way
-        back; the second-instance activation also restores it."""
-        if event.widget is not self.root:
-            return
-        try:
-            if self.root.state() == "iconic" and self.tray_var.get():
-                self.root.after(10, self.root.withdraw)   # after the iconic animation
-        except (tk.TclError, RuntimeError):
             pass
 
     def _pump_tray(self):
@@ -364,15 +355,26 @@ class App:
             values=["Everything", "Info and above", "Warnings and above", "Errors only"])
         self.log_filter.current(1)
         self.log_filter.pack(side="left", padx=(6, 8))
+        Tooltip(self.log_filter,
+                "Filter the on-screen log by importance.\n"
+                "'Everything' also reveals per-connection detail;\n"
+                "the log FILE on disk always keeps it all.")
         self.log_filter.bind("<<ComboboxSelected>>", lambda _e: self._apply_log_filter())
-        tk.Button(bar, text="Save log…", command=self._export_log,
-                  bg="#202634", fg=FG, bd=0, padx=10, pady=3,
-                  activebackground="#2a3244", activeforeground=FG,
-                  cursor="hand2").pack(side="right")
-        tk.Button(bar, text="Copy all", command=self._copy_log,
-                  bg="#202634", fg=FG, bd=0, padx=10, pady=3,
-                  activebackground="#2a3244", activeforeground=FG,
-                  cursor="hand2").pack(side="right", padx=(0, 6))
+        save_btn = tk.Button(bar, text="Save log…", command=self._export_log,
+                             bg="#202634", fg=FG, bd=0, padx=10, pady=3,
+                             activebackground="#2a3244", activeforeground=FG,
+                             cursor="hand2")
+        save_btn.pack(side="right")
+        Tooltip(save_btn,
+                "Save the complete log (every detail, no filter) to a file —\n"
+                "perfect for attaching to a bug report. The log is also always\n"
+                "written to disk automatically: %LOCALAPPDATA%\\HookIP\\logs.")
+        copy_btn = tk.Button(bar, text="Copy all", command=self._copy_log,
+                             bg="#202634", fg=FG, bd=0, padx=10, pady=3,
+                             activebackground="#2a3244", activeforeground=FG,
+                             cursor="hand2")
+        copy_btn.pack(side="right", padx=(0, 6))
+        Tooltip(copy_btn, "Copy the complete log to the clipboard.")
         tk.Label(bar, text=f"Session file: {self._log_file}", bg=PANEL,
                  fg=MUTED, font=("Segoe UI", 8)).pack(side="right", padx=8)
         self.log_text = tk.Text(logf, bg="#0d1017", fg=FG, insertbackground=FG,
@@ -407,26 +409,46 @@ class App:
         self.port_var = tk.StringVar(value=str(self.cfg.port))
         port_e = ttk.Entry(grid, textvariable=self.port_var, width=10)
         add_row("Local port", port_e, 0)
+        Tooltip(port_e,
+                "Local TCP port HookIP listens on (default 8890).\n"
+                "Windows is pointed here while the proxy runs.")
 
         self.frag_var = tk.StringVar(value=str(self.cfg.fragment_size))
         frag_e = ttk.Entry(grid, textvariable=self.frag_var, width=10)
         add_row("Fragment size (bytes)", frag_e, 1)
+        Tooltip(frag_e,
+                "Size of each TLS ClientHello fragment in bytes.\n"
+                "2 is the stealthiest (every byte split apart);\n"
+                "larger values are faster but easier to spot. Only change\n"
+                "this if a network has trouble with the default.")
 
         self.strategy_var = tk.StringVar(value=self.cfg.strategy)
         strat_c = ttk.Combobox(grid, textvariable=self.strategy_var, width=12,
                                state="readonly",
                                values=["smart", "chunk", "random"])
         add_row("Strategy", strat_c, 2)
+        Tooltip(strat_c,
+                "How the TLS ClientHello is split to slip past blocking:\n"
+                "smart = adaptive, chunk = fixed-size pieces,\n"
+                "random = random sizes. Try a different one if a site fails.")
 
         self.mode_var = tk.StringVar(value=self.cfg.proxy_mode)
         mode_c = ttk.Combobox(grid, textvariable=self.mode_var, width=12,
                               state="readonly", values=["manual", "pac"])
         add_row("System proxy mode", mode_c, 3)
+        Tooltip(mode_c,
+                "manual = point Windows straight at HookIP (most apps obey).\n"
+                "pac = hand apps a proxy-autoconfig script — use it if some\n"
+                "app ignores the manual proxy. Restore internet works with both.")
 
         self.doh_var = tk.BooleanVar(value=self.cfg.doh_enabled)
         doh_c = ttk.Checkbutton(grid, text="Use DNS-over-HTTPS (recommended)",
                                 variable=self.doh_var)
         add_row("Secure DNS", doh_c, 4)
+        Tooltip(doh_c,
+                "DNS-over-HTTPS: resolves names over an encrypted, fragmented\n"
+                "connection so DNS itself can't be blocked or tampered with.\n"
+                "Keep this on unless a network requires plain DNS.")
 
         self.verbose_var = tk.BooleanVar(value=self.cfg.verbose)
         verb_c = ttk.Checkbutton(grid, text="Verbose log", variable=self.verbose_var,
@@ -445,10 +467,14 @@ class App:
         add_row("Window", tray_c, 7)
 
         upd = tk.Frame(grid, bg=PANEL)
-        tk.Button(upd, text="Check for updates", command=self.check_updates,
-                  bg="#202634", fg=FG, bd=0, padx=10, pady=4,
-                  activebackground="#2a3244", activeforeground=FG,
-                  cursor="hand2").pack(side="left")
+        upd_btn = tk.Button(upd, text="Check for updates", command=self.check_updates,
+                            bg="#202634", fg=FG, bd=0, padx=10, pady=4,
+                            activebackground="#2a3244", activeforeground=FG,
+                            cursor="hand2")
+        upd_btn.pack(side="left")
+        Tooltip(upd_btn,
+                "Checks GitHub Releases for a newer HookIP version.\n"
+                "Also runs automatically ~15 s after launch and every 12 h.")
         self.update_label = tk.Label(upd, text="", bg=PANEL, fg=MUTED,
                                      font=("Segoe UI", 9))
         self.update_label.pack(side="left", padx=10)
@@ -463,6 +489,10 @@ class App:
         self.excl_text.insert("1.0", "\n".join(self.cfg.excluded))
         self.excl_text.pack(fill="x")
         self.set_widgets.append(self.excl_text)
+        Tooltip(self.excl_text,
+                "Domains that bypass HookIP entirely (one per line, wildcards\n"
+                "like *.example.com are allowed). Useful for banking apps or\n"
+                "anything that dislikes modified handshakes.")
         tk.Label(setf, text=f"Settings file: {SETTINGS_PATH}",
                  bg=PANEL, fg=MUTED).pack(anchor="w", pady=(8, 0))
 
@@ -471,14 +501,25 @@ class App:
         nb.add(diagf, text=" Diagnostics ")
         btns = tk.Frame(diagf, bg=PANEL)
         btns.pack(fill="x")
+        tips = {
+            "Run full check": "Runs every diagnostic below: system state, antivirus,\n"
+                              "DNS resolvers and a real end-to-end tunnel test.",
+            "DNS only": "Tests each DNS-over-HTTPS resolver with a real lookup.",
+            "Tunnel only": "Opens a real HTTPS connection through HookIP to two\n"
+                           "well-known sites (needs the proxy to be running).",
+            "System only": "Shows Windows/antivirus/proxy state and flags a stale\n"
+                           "proxy left behind by a crash.",
+        }
         for text, cmd in (("Run full check", lambda: self.run_diagnostics("all")),
                           ("DNS only", lambda: self.run_diagnostics("dns")),
                           ("Tunnel only", lambda: self.run_diagnostics("tunnel")),
                           ("System only", lambda: self.run_diagnostics("system"))):
-            tk.Button(btns, text=text, command=cmd,
-                      bg="#202634", fg=FG, bd=0, padx=12, pady=6,
-                      activebackground="#2a3244", activeforeground=FG,
-                      cursor="hand2").pack(side="left")
+            b = tk.Button(btns, text=text, command=cmd,
+                          bg="#202634", fg=FG, bd=0, padx=12, pady=6,
+                          activebackground="#2a3244", activeforeground=FG,
+                          cursor="hand2")
+            b.pack(side="left")
+            Tooltip(b, tips[text])
         tk.Button(btns, text="Clear DNS cache", command=self._clear_cache,
                   bg="#202634", fg=FG, bd=0, padx=12, pady=6,
                   activebackground="#2a3244", activeforeground=FG,
