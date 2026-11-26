@@ -636,10 +636,17 @@ class App:
             b.pack(side="left")
             Tooltip(b, tips[text])
             self._diag_buttons.append(b)
-        tk.Button(btns, text="Clear DNS cache", command=self._clear_cache,
-                  bg="#202634", fg=FG, bd=0, padx=12, pady=6,
-                  activebackground="#2a3244", activeforeground=FG,
-                  cursor="hand2").pack(side="left", padx=8)
+        cc_btn = tk.Button(btns, text="Clear DNS cache", command=self._clear_cache,
+                           bg="#202634", fg=FG, bd=0, padx=12, pady=6,
+                           activebackground="#2a3244", activeforeground=FG,
+                           cursor="hand2")
+        cc_btn.pack(side="left", padx=8)
+        Tooltip(cc_btn,
+                "DNS answers are cached in RAM inside the running proxy —\n"
+                "nothing is written to disk. The cache refills automatically\n"
+                "as you browse. Clearing drops every saved answer, so the\n"
+                "next connections do brand-new DoH lookups (use after a\n"
+                "network change, or if a site moved to a new server).")
         tk.Button(btns, text="Copy report", command=self._copy_diag_report,
                   bg="#202634", fg=FG, bd=0, padx=12, pady=6,
                   activebackground="#2a3244", activeforeground=FG,
@@ -1067,12 +1074,26 @@ class App:
         threading.excepthook = th_exc
 
     def _clear_cache(self):
-        if self.proxy:
-            self.proxy.resolver.clear_cache()
-            self.log.info("DNS cache cleared.")
-        else:
-            self.log.info("The DNS cache lives inside a running proxy — "
-                          "nothing to clear right now.")
+        if not self.proxy:
+            self.log.info("The DNS cache lives in RAM inside a running proxy "
+                          "(nothing is stored on disk) — start the proxy first.")
+            return
+        r = self.proxy.resolver
+        pos, neg = r.cache_stats()
+        if pos + neg == 0:
+            self.log.info("DNS cache is already empty — entries build up "
+                          "automatically as you browse.")
+            return
+        sample = ", ".join(r.cache_hosts()[:5])
+        more = f" (+{pos - 5} more)" if pos > 5 else ""
+        r.clear_cache()
+        pos2, neg2 = r.cache_stats()
+        self.log.ok(
+            f"DNS cache cleared: {pos} host entries and {neg} negative "
+            f"(blocked/NXDOMAIN) entries dropped"
+            f"{f' — e.g. {sample}{more}' if sample else ''}. "
+            f"Before: {pos}+{neg}, after: {pos2}+{neg2}. New lookups start "
+            "immediately as you browse.")
 
     def run_diagnostics(self, sections="all"):
         """sections: 'all' | 'dns' | 'tunnel' | 'system'"""

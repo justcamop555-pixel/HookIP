@@ -479,6 +479,18 @@ class Resolver:
         except OSError:
             return [], 120
 
+    def cache_stats(self):
+        """(positive entries, negative/NXDOMAIN entries) currently held."""
+        with self._lock:
+            now = time.time()
+            pos = sum(1 for e in self._cache.values() if e[0] > now)
+            neg = sum(1 for e in self._neg_cache.values() if e > now)
+        return pos, neg
+
+    def cache_hosts(self):
+        with self._lock:
+            return list(self._cache.keys())
+
     def clear_cache(self):
         with self._lock:
             self._cache.clear()
