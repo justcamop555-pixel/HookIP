@@ -67,6 +67,7 @@ class App:
             pass
         self._style()
         self._build()
+        self._recover_stale_proxy()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self._log_pos = 0  # kept for compatibility; pump now uses drain()
         self.root.after(250, self._pump_log)
@@ -171,6 +172,12 @@ class App:
                                    bg=OK, fg="white", activebackground="#46c06a",
                                    activeforeground="white", padx=26, pady=8)
         self.start_btn.pack(side="right")
+        self.restore_btn = tk.Button(head, text="↺  Restore internet",
+                                     command=self._manual_restore,
+                                     font=("Segoe UI", 10), bd=0, cursor="hand2",
+                                     bg="#202634", fg=FG, activebackground="#2a3244",
+                                     activeforeground=FG, padx=14, pady=8)
+        self.restore_btn.pack(side="right", padx=(0, 10))
 
         nb = ttk.Notebook(self.root)
         nb.pack(fill="both", expand=True, padx=16, pady=(0, 12))
@@ -373,6 +380,59 @@ class App:
         self.dash_vars[key] = val
 
     # ------------------------------------------------------------------
+    def _recover_stale_proxy(self):
+        """Startup recovery after an unexpected crash: if the app died while
+        the proxy was active, Windows still routes everything through a
+        HookIP port nobody listens on — the user 'can't connect'. The saved
+        backup surviving a clean stop means exactly that happened."""
+        try:
+            cur = winproxy.read_current()
+        except OSError:
+            return
+        if self.running or not winproxy._is_ours(cur):
+            return
+        if winproxy.has_backup():
+            # backup exists only when the last activation never stopped
+            # cleanly (clean stop deletes it) — restore the original settings
+            if winproxy.restore_from_file():
+                winproxy.clear_runonce()   # stale crash-cleanup entry
+                self.log.ok("Recovered from a crash: system proxy restored to "
+                            "your previous settings — internet should work again.")
+                return
+        # no backup, but the registry still points at our own port
+        port_s = f"127.0.0.1:{self.cfg.port}"
+        if port_s in str(cur.get("ProxyServer") or "") or \
+                port_s in str(cur.get("AutoConfigURL") or ""):
+            winproxy.remove_proxy()
+            self.log.ok("Recovered from a crash: stale HookIP proxy settings "
+                        "cleared — internet set to direct connection.")
+
+    def _manual_restore(self):
+        """'Restore internet' button: fix a system proxy left pointing at a
+        dead HookIP port (crash, watchdog failure, power loss)."""
+        if self.running:
+            self.stop_proxy()   # stopping already restores from backup
+            self.log.ok("Proxy stopped — internet restored to your previous settings.")
+            return
+        try:
+            cur = winproxy.read_current()
+        except OSError as exc:
+            self.log.error(f"Cannot read proxy settings: {exc}")
+            return
+        try:
+            if winproxy.has_backup() and winproxy.restore_from_file():
+                self.log.ok("Internet restored: system proxy set back to your "
+                            "previous settings.")
+            elif winproxy._is_ours(cur):
+                winproxy.remove_proxy()
+                self.log.ok("Internet restored: HookIP proxy settings cleared "
+                            "(direct connection).")
+            else:
+                self.log.info("Nothing to restore — system proxy is already "
+                              + winproxy.describe(cur))
+        except OSError as exc:
+            self.log.error(f"Restore failed: {exc}")
+
     def toggle(self):
         if self.running:
             self.stop_proxy()
@@ -674,6 +734,17 @@ class App:
                           f"{platform.system()} {platform.release()} ({platform.machine()})")
         cur = winproxy.read_current()
         self._diag_result("System proxy", "info", winproxy.describe(cur))
+        # stale-proxy detection: registry points at HookIP while we're off
+        if not self.running and winproxy._is_ours(cur):
+            port_s = f"127.0.0.1:{self.cfg.port}"
+            stale = (winproxy.has_backup() or
+                     port_s in str(cur.get("ProxyServer") or "") or
+                     port_s in str(cur.get("AutoConfigURL") or ""))
+            if stale:
+                self._diag_result("Stale proxy detected", "WARN",
+                                  "Windows still routes traffic through a HookIP "
+                                  "port nobody is listening on — press '↺ Restore "
+                                  "internet' to fix", "warn")
         self._diag_result("Crash protection",
                           "active" if self.watchdog.alive() else "inactive",
                           "watchdog process" if self.watchdog.alive() else "", "info")
