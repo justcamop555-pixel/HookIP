@@ -342,7 +342,8 @@ class App:
                     with urllib.request.urlopen(req2, timeout=10) as r2:
                         tag = r2.geturl().rsplit("/tag/", 1)[-1]
                         if tag and tag != "latest":
-                            latest, url = tag, f"https://github.com/{self.UPDATE_REPO}/releases/tag/{tag}"
+                            # the redirect fallback succeeded — we are NOT offline
+                            latest, url, offline = tag, f"https://github.com/{self.UPDATE_REPO}/releases/tag/{tag}", False
                 except OSError:
                     pass
         except OSError:
@@ -388,6 +389,7 @@ class App:
                 # one-click download straight from the release (public repo)
                 if asset:
                     self._update_asset_url = asset
+                    self._pending_ver = latest
                     self._dl_btn.configure(text=f"⬇ Download {latest}", state="normal")
                     self._dl_btn.pack(side="left", padx=(10, 0))
                     self.log.info("A one-click download is available in "
@@ -1392,15 +1394,20 @@ class App:
                 else:
                     self._wd_restarts = 0
             self._draw_spark()
-            top = self.stats.top_domains()
-            key = str(top)
-            if key != getattr(self, "_last_top", None):
-                self._last_top = key
-                for iid in self.dom_tree.get_children():
-                    self.dom_tree.delete(iid)
-                for host, conns, bup, bdown in top:
-                    self.dom_tree.insert("", "end", values=(
-                        host, conns, self._fmt_bytes(bup), self._fmt_bytes(bdown)))
+            if self.root.state() == "iconic":
+                # minimized: skip the expensive top-domains redraw (stats keep
+                # accumulating; the watchdog check above still ran)
+                pass
+            else:
+                top = self.stats.top_domains()
+                key = str(top)
+                if key != getattr(self, "_last_top", None):
+                    self._last_top = key
+                    for iid in self.dom_tree.get_children():
+                        self.dom_tree.delete(iid)
+                    for host, conns, bup, bdown in top:
+                        self.dom_tree.insert("", "end", values=(
+                            host, conns, self._fmt_bytes(bup), self._fmt_bytes(bdown)))
         except Exception as exc:  # noqa: BLE001 — one bad frame must not
             # permanently kill the dashboard (it would freeze silently)
             if getattr(self, "_closing", None) and self._closing.is_set():
@@ -1604,6 +1611,13 @@ class App:
         self._diag_result("Crash protection",
                           "active" if self.watchdog.alive() else "inactive",
                           "watchdog process" if self.watchdog.alive() else "", "info")
+        # runtime memory health: the bounded caches should show sane sizes
+        if self.proxy:
+            pos, neg = self.proxy.resolver.cache_stats()
+            self._diag_result("Runtime state", "info",
+                              f"DNS cache {pos}+{neg} entries · strategy memory "
+                              f"{len(self.proxy._strat_pref)} hosts · "
+                              f"{self.stats.totals()[1]} connections open")
         # antivirus (helps interpret Defender false positives)
         try:
             ps = subprocess.run(

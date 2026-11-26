@@ -104,88 +104,89 @@ class _DoHConn:
             self.sock.sendall(out)
 
     def request(self, host, payload, timeout=5.0):
-        with self._reqlock:
-            if not self.alive:
-                raise ResolveError("session closed")
-            self.sock.settimeout(timeout)
-            conn_hdr = "keep-alive" if self.keepalive else "close"
-            head = (
-                "POST /dns-query HTTP/1.1\r\n"
-                f"Host: {host}\r\n"
-                "Content-Type: application/dns-message\r\n"
-                "Accept: application/dns-message\r\n"
-                f"Content-Length: {len(payload)}\r\n"
-                f"Connection: {conn_hdr}\r\n\r\n"
-            ).encode("ascii")
-            self.ssl.write(head + payload)
-            self._flush_out()
-            buf = b""
-            body = None
-            clen = None
-            chunked = False
-            while True:
-                if chunked and body is not None:
-                    body = _dechunk(body)
-                    if body is not None:
-                        self.used = time.time()
-                        return self._validated(body, payload)
-                elif clen is not None and body is not None and len(body) >= clen:
+        # NOTE: the caller (Resolver pool checkout) holds self._reqlock for
+        # the duration of this call — locking here again would deadlock.
+        if not self.alive:
+            raise ResolveError("session closed")
+        self.sock.settimeout(timeout)
+        conn_hdr = "keep-alive" if self.keepalive else "close"
+        head = (
+            "POST /dns-query HTTP/1.1\r\n"
+            f"Host: {host}\r\n"
+            "Content-Type: application/dns-message\r\n"
+            "Accept: application/dns-message\r\n"
+            f"Content-Length: {len(payload)}\r\n"
+            f"Connection: {conn_hdr}\r\n\r\n"
+        ).encode("ascii")
+        self.ssl.write(head + payload)
+        self._flush_out()
+        buf = b""
+        body = None
+        clen = None
+        chunked = False
+        while True:
+            if chunked and body is not None:
+                body = _dechunk(body)
+                if body is not None:
                     self.used = time.time()
-                    return self._validated(body[:clen], payload)
+                    return self._validated(body, payload)
+            elif clen is not None and body is not None and len(body) >= clen:
+                self.used = time.time()
+                return self._validated(body[:clen], payload)
+            try:
+                chunk = self.ssl.read(65536)
+            except ssl.SSLWantReadError:
                 try:
-                    chunk = self.ssl.read(65536)
-                except ssl.SSLWantReadError:
-                    try:
-                        data = self.sock.recv(65536)
-                    except (socket.timeout, OSError):
-                        self.alive = False
-                        break
-                    if not data:
-                        self.alive = False
-                        break
-                    self._bio_in.write(data)
-                    continue
-                except ssl.SSLWantWriteError:
-                    self._flush_out()
-                    continue
-                except (ssl.SSLZeroReturnError, ssl.SSLEOFError):
+                    data = self.sock.recv(65536)
+                except (socket.timeout, OSError):
                     self.alive = False
                     break
-                if not chunk:
+                if not data:
                     self.alive = False
                     break
-                buf += chunk
-                if clen is None:
-                    sep = buf.find(b"\r\n\r\n")
-                    if sep < 0:
-                        if len(buf) > 65536:
-                            self.alive = False
-                            break
-                        continue
-                    headers = buf[:sep].decode("latin1", "replace")
-                    for line in headers.split("\r\n")[1:]:
-                        low = line.lower()
-                        if low.startswith("content-length:"):
-                            try:
-                                clen = int(line.split(":", 1)[1].strip())
-                            except ValueError:
-                                clen = None
-                        elif low.startswith("transfer-encoding:") and "chunked" in low:
-                            chunked = True
-                    body = buf[sep + 4:]
-                else:
-                    # accumulate the body — overwriting with `buf` would paste
-                    # the HTTP HEADERS back into the DNS message (this caused
-                    # 'truncated name' parse failures on multi-record
-                    # responses, e.g. Google DoH)
-                    body += chunk
-            # connection ended — anything short of the promised length is
-            # incomplete; raising triggers a fresh-session retry upstream
-            if body and clen is not None and len(body) < clen:
-                raise ResolveError("incomplete DoH response (connection cut)")
-            if not body:
-                return b""
-            return self._validated(body, payload)
+                self._bio_in.write(data)
+                continue
+            except ssl.SSLWantWriteError:
+                self._flush_out()
+                continue
+            except (ssl.SSLZeroReturnError, ssl.SSLEOFError):
+                self.alive = False
+                break
+            if not chunk:
+                self.alive = False
+                break
+            buf += chunk
+            if clen is None:
+                sep = buf.find(b"\r\n\r\n")
+                if sep < 0:
+                    if len(buf) > 65536:
+                        self.alive = False
+                        break
+                    continue
+                headers = buf[:sep].decode("latin1", "replace")
+                for line in headers.split("\r\n")[1:]:
+                    low = line.lower()
+                    if low.startswith("content-length:"):
+                        try:
+                            clen = int(line.split(":", 1)[1].strip())
+                        except ValueError:
+                            clen = None
+                    elif low.startswith("transfer-encoding:") and "chunked" in low:
+                        chunked = True
+                body = buf[sep + 4:]
+            else:
+                # accumulate the body — overwriting with `buf` would paste
+                # the HTTP HEADERS back into the DNS message (this caused
+                # 'truncated name' parse failures on multi-record
+                # responses, e.g. Google DoH)
+                body += chunk
+        # connection ended — anything short of the promised length is
+        # incomplete; raising triggers a fresh-session retry upstream
+        if body and clen is not None and len(body) < clen:
+            raise ResolveError("incomplete DoH response (connection cut)")
+        if not body:
+            return b""
+        return self._validated(body, payload)
 
     def _validated(self, body, payload):
         """Guard against transport garbage (HTTP headers, split bodies): a DNS
@@ -242,25 +243,61 @@ class Resolver:
         self._inflight = {}                     # host -> Event (lookup coalescing)
         self._inflight_lock = threading.Lock()
         self.verbose_stats = {}               # resolver -> success count
-        self._pool = {}                       # resolver name -> _DoHConn (keep-alive)
+        self._pool = {}                       # resolver name -> [_DoHConn, ...]
         self._pool_lock = threading.Lock()
+        self._pool_max = 3                    # conns per resolver (parallel lookups)
 
     def _doh_session(self, name, dns_host, ip):
-        """Return a pooled keep-alive connection, creating one if needed."""
-        with self._pool_lock:
-            conn = self._pool.get(name)
-            if conn is not None and conn.healthy():
+        """Check out a pooled keep-alive connection with its per-connection
+        lock HELD (release it after request() finishes via _release_doh).
+        Parallel lookups to different hosts use different connections in the
+        pool instead of serializing behind one TLS session; a new connection
+        is created while slots are free."""
+        while True:
+            with self._pool_lock:
+                conns = [c for c in self._pool.get(name, []) if c.healthy()]
+                # drop dead entries
+                for c in self._pool.get(name, []):
+                    if c not in conns:
+                        c.close()
+                self._pool[name] = conns
+                for conn in conns:
+                    if conn._reqlock.acquire(blocking=False):
+                        return conn
+                if len(conns) < self._pool_max:
+                    try:
+                        conn = _DoHConn(ip, dns_host,
+                                        chunk=max(1, self.chunk), keepalive=True)
+                    except (OSError, ResolveError, ssl.SSLError):
+                        raise
+                else:
+                    conn = None
+            if conn is None:
+                # all slots busy and pool full — wait for the first conn
+                with self._pool_lock:
+                    conns = self._pool.get(name, [])
+                    fallback = conns[0] if conns else None
+                if fallback is None or not fallback._reqlock.acquire(timeout=4):
+                    continue          # race: slot freed or conn died — re-scan
+                if not fallback.healthy():
+                    fallback._reqlock.release()
+                    self._drop_doh_session(name, fallback)
+                    continue
+                return fallback
+            if conn._reqlock.acquire(blocking=False):
+                with self._pool_lock:
+                    self._pool.setdefault(name, []).append(conn)
                 return conn
-            if conn is not None:
-                conn.close()
-            conn = _DoHConn(ip, dns_host, chunk=max(1, self.chunk), keepalive=True)
-            self._pool[name] = conn
-            return conn
+            conn.close()
+
+    def _release_doh(self, conn):
+        conn._reqlock.release()
 
     def _drop_doh_session(self, name, conn):
         with self._pool_lock:
-            if self._pool.get(name) is conn:
-                self._pool.pop(name, None)
+            pool = self._pool.get(name)
+            if pool and conn in pool:
+                pool.remove(conn)
         conn.close()
 
     # ------------------------------------------------------------------
@@ -370,6 +407,17 @@ class Resolver:
 
         ttl = min(300, max(10, int(ttl)))
         with self._lock:
+            if len(self._cache) > 4096:
+                # marathon sessions: drop expired entries first, then the
+                # oldest — the cache must never grow without bound
+                now2 = time.time()
+                alive = {h: e for h, e in self._cache.items() if e[0] > now2}
+                if len(alive) > 4096:
+                    alive = dict(sorted(alive.items(), key=lambda kv: kv[1][0])[:2048])
+                self._cache = alive
+            if len(self._neg_cache) > 2048:
+                now2 = time.time()
+                self._neg_cache = {h: e for h, e in self._neg_cache.items() if e > now2}
             self._cache[host] = (now + ttl, list(ips))
         self.log.debug(f"resolve {host} -> {', '.join(ips[:4])} (ttl {ttl}s)")
         return list(ips)
@@ -396,14 +444,19 @@ class Resolver:
         query = dnsmsg.encode_query(host, qtype)
         last_err = None
         for name, dns_host, ip in order:
+            conn = None
             try:
                 t0 = time.time()
                 conn = self._doh_session(name, dns_host, ip)
                 try:
                     resp = conn.request(dns_host, query)
                 except (OSError, ResolveError, ssl.SSLError, ValueError) as exc:
-                    # pooled session died (idle timeout, RST) — one fresh retry
+                    # pooled session died (idle timeout, RST) — one fresh retry.
+                    # Release the checkout BEFORE dropping so a waiter on the
+                    # dying connection's lock is freed instead of stalling.
+                    self._release_doh(conn)
                     self._drop_doh_session(name, conn)
+                    conn = None
                     self.log.debug(f"DoH {name}: session dropped ({exc}), reconnecting")
                     conn = self._doh_session(name, dns_host, ip)
                     resp = conn.request(dns_host, query)
@@ -438,6 +491,7 @@ class Resolver:
                             try:
                                 resp2 = conn.request(dns_host, follow)
                             except (OSError, ResolveError, ssl.SSLError, ValueError):
+                                self._release_doh(conn)
                                 self._drop_doh_session(name, conn)
                                 conn = self._doh_session(name, dns_host, ip)
                                 resp2 = conn.request(dns_host, follow)
@@ -457,6 +511,9 @@ class Resolver:
                 self._note_latency(name, time.time() - t0, ok=False)
                 last_err = f"{name}: {exc}"
                 self.log.debug(f"DoH {name} failed: {exc}")
+            finally:
+                if conn is not None:
+                    self._release_doh(conn)
         if last_err:
             # policy verdicts (sinkhole/empty) are expected for ad domains —
             # DEBUG keeps the detail without spamming WARN on every retry
@@ -543,8 +600,9 @@ class Resolver:
             self._cache.clear()
             self._neg_cache.clear()
         with self._pool_lock:
-            for conn in self._pool.values():
-                conn.close()
+            for pool in self._pool.values():
+                for conn in pool:
+                    conn.close()
             self._pool.clear()
 
 

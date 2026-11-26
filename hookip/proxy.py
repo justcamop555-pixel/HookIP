@@ -74,6 +74,13 @@ class Stats:
 
     def top_domains(self, k=15):
         with self.lock:
+            if len(self.domains) > 600:
+                # long sessions meet thousands of unique hosts; keeping every
+                # one grows memory and makes this sort (2×/s) grind. Drop the
+                # least-trafficked half when the table gets fat.
+                keep = sorted(self.domains.items(),
+                              key=lambda kv: -(kv[1][1] + kv[1][2]))[:300]
+                self.domains = dict(keep)
             items = sorted(self.domains.items(), key=lambda kv: -(kv[1][1] + kv[1][2]))
             return [(h, c, u, d) for h, (c, u, d) in items[:k]]
 
@@ -123,6 +130,7 @@ class ProxyServer:
         self.pac_token = pac_token
         self.resolver = Resolver(cfg, log, chunk=cfg.fragment_size)
         self._strat_pref = {}                 # host -> strategy that last worked
+        self._strat_cap = 512                 # keep the memory map bounded
         self.on_accept_death = None           # app hook: emergency restore
         self._blocked_seen = {}               # host -> last 'blocked/dead' log ts
         self._lsock = None
@@ -476,6 +484,9 @@ class ProxyServer:
         for attempt, strategy in enumerate(strategies):
             try:
                 ssock = self._tunnel_once(csock, host, port, strategy, first, excl)
+                if len(self._strat_pref) >= self._strat_cap and host not in self._strat_pref:
+                    # bounded memory: drop an arbitrary entry when full
+                    self._strat_pref.pop(next(iter(self._strat_pref)), None)
                 self._strat_pref[host] = strategy
                 return ssock
             except ResolveError as exc:
@@ -490,8 +501,6 @@ class ProxyServer:
                 self.log.debug(f"{host}: attempt {attempt+1} ({strategy}) failed: {exc}")
                 if excl:
                     break
-        if not first:
-            raise ClientAbortError(f"{host}:{port} client aborted (closed before sending any data)")
         # Only cap retries for infrastructural failures (timeout/refused/DNS
         # blocked/client gone). A DPI reset is exactly what fragmentation is
         # meant to defeat — keep full strategy retries for those.
