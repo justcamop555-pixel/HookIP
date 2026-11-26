@@ -78,7 +78,7 @@ class App:
             pass
         self._style()
         self._build()
-        self._recover_stale_proxy()
+        self._lock_window_style()
         self._recover_stale_proxy()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close_request)
         # thread-safe UI event queue: background threads NEVER call tk
@@ -197,6 +197,9 @@ class App:
             self.frag_e.configure(foreground=FG if ok_f else ERR)
             self.port_hint.configure(text="" if ok_p else "1–65535")
             self.frag_hint.configure(text="" if ok_f else "1–255")
+            # header badge follows the live entry while the proxy is off
+            if not self.running and ok_p:
+                self.port_badge.configure(text=f"127.0.0.1:{self.port_var.get()}")
         except tk.TclError:
             pass
         return ok_p and ok_f
@@ -224,6 +227,10 @@ class App:
         self.log.info("Excluded domains reset to defaults (applied on next Start).")
 
     def check_updates(self):
+        if getattr(self, "_update_running", False):
+            self.log.info("Update check already running.")
+            return
+        self._update_running = True
         self.update_label.configure(text="checking…", fg=MUTED)
         threading.Thread(target=self._update_worker, daemon=True).start()
 
@@ -259,7 +266,6 @@ class App:
         except OSError:
             pass
         self._ui_queue.put(("update", (latest, url)))
-
     @staticmethod
     def _ver_tuple(s):
         try:
@@ -268,6 +274,7 @@ class App:
             return (0,)
 
     def _update_result(self, latest, url):
+        self._update_running = False
         try:
             if not latest:
                 self.update_label.configure(
@@ -311,9 +318,28 @@ class App:
     def _show_self(self):
         try:
             self.root.deiconify()
+            self._lock_window_style()   # re-assert: no maximize/fullscreen
             self.root.lift()
             self.root.focus_force()
         except (tk.TclError, RuntimeError):
+            pass
+
+    def _lock_window_style(self):
+        """Fullscreen is disabled, forever: strip WS_MAXIMIZEBOX from the
+        window, which removes the maximize button and blocks Win+Up / title
+        double-click maximizing. The window stays freely resizable."""
+        try:
+            import ctypes
+            user32 = ctypes.windll.user32
+            GWL_STYLE = -16
+            WS_MAXIMIZEBOX = 0x00010000
+            hwnd = user32.GetParent(self.root.winfo_id())
+            if not hwnd:
+                return
+            style = user32.GetWindowLongW(hwnd, GWL_STYLE)
+            if style & WS_MAXIMIZEBOX:
+                user32.SetWindowLongW(hwnd, GWL_STYLE, style & ~WS_MAXIMIZEBOX)
+        except Exception:
             pass
 
     # ------------------------------------------------------------------
@@ -999,7 +1025,10 @@ class App:
     def _refresh_dashboard(self):
         try:
             total, active, up, down, failed, blocked = self.stats.totals()
-            port_txt = f"127.0.0.1:{self.cfg.port}"
+            live_port = self.cfg.port if self.running else (
+                self.port_var.get() if self.port_var.get().isdigit()
+                else str(self.cfg.port))
+            port_txt = f"127.0.0.1:{live_port}"
             if self.port_badge.cget("text") != port_txt:
                 self.port_badge.configure(text=port_txt)
             self.dash_vars["connections"].configure(text=str(total))
