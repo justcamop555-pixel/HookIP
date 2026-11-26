@@ -120,6 +120,16 @@ scanning (ESET, Kaspersky…) can undo the fragmentation — disable its SSL sca
 stay blocked. QUIC/HTTP-3 can't be fragmented, but browsers fall back to TCP automatically.
 Discord and friends read the proxy at startup — restart them after pressing Start.
 
+## 🛡️ Antivirus false positive
+
+Windows Defender's ML heuristic (`Behavior:Win32/Impact.A!ml`) may flag `HookIP.exe` because it
+changes proxy registry keys and runs a watchdog process — all legitimate, source-visible
+behavior (see code in this repo). A false-positive dispute has been filed with Microsoft:
+
+- **Submission ID:** `a5f1346c5-0af4-4a72-a46e-6cc35167a57a` (Nov 2026, status: *Submitted*)
+- If you see the warning: the file is safe to run — verify against the source here, and
+  "More info → Run anyway", or add a Defender exclusion for the folder.
+
 ## 📜 Disclaimer
 
 Published for educational and personal use, to help access content that is legally
