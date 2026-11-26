@@ -432,7 +432,11 @@ class ProxyServer:
         def esc(p):
             return p.replace("\\", "\\\\").replace("'", "\\'")
 
-        for pat in (self.cfg.excluded or []):
+        # On restricted networks (network proxy required) DIRECT is blocked,
+        # so user exclusions are deliberately NOT served as DIRECT —
+        # everything must go through the chain or it breaks.
+        net_up = str(getattr(self.cfg, "upstream_proxy", "") or "").strip()
+        for pat in (() if net_up else (self.cfg.excluded or [])):
             pat = esc(str(pat).strip().lower())
             if not pat:
                 continue
@@ -597,6 +601,61 @@ class ProxyServer:
         last = errors[-1] if errors else "timeout"
         raise OSError(f"all {len(candidates)} addresses failed ({last})")
 
+    def _via_upstream_plain(self):
+        """Open a connection to the network's own proxy for a plain-HTTP
+        request (the request itself carries the absolute-URI target)."""
+        up = str(getattr(self.cfg, "upstream_proxy", "") or "").strip()
+        phost, _, pport = up.rpartition(":")
+        pport_i = int(pport) if pport.isdigit() else 8080
+        phost = phost.strip("[]")
+        try:
+            infos = socket.getaddrinfo(phost, None, socket.AF_INET, socket.SOCK_STREAM)
+            ips = list(dict.fromkeys(i[4][0] for i in infos))[:4]
+        except OSError:
+            ips = [phost]
+        server = self._connect_parallel(ips, pport_i, timeout=5.0)
+        self.log.debug(f"plain HTTP through network proxy {up}")
+        return server
+
+    def _via_upstream(self, host, port, timeout=5.0):
+        """Restricted networks (offices/hotels/campuses) block direct internet
+        and require every connection to go through the network's own proxy.
+        Chain through it: CONNECT to the LAN proxy, then fragment our
+        ClientHello INSIDE that tunnel — the LAN proxy sees only a TLS
+        handshake to the target, its filtering cannot read the SNI either."""
+        up = str(getattr(self.cfg, "upstream_proxy", "") or "").strip()
+        phost, _, pport = up.rpartition(":")
+        pport_i = int(pport) if pport.isdigit() else 8080
+        phost = phost.strip("[]")
+        try:
+            infos = socket.getaddrinfo(phost, None, socket.AF_INET, socket.SOCK_STREAM)
+            ips = list(dict.fromkeys(i[4][0] for i in infos))[:4]
+        except OSError:
+            ips = [phost]
+        server = self._connect_parallel(ips, pport_i, timeout=timeout)
+        try:
+            server.settimeout(timeout)
+            server.sendall(f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n".encode())
+            resp = b""
+            while b"\r\n\r\n" not in resp and len(resp) < 16384:
+                part = server.recv(4096)
+                if not part:
+                    raise OSError("network proxy closed during CONNECT")
+                resp += part
+            line = resp.split(b"\r\n", 1)[0]
+            if b" 200 " not in line:
+                raise OSError(f"network proxy refused CONNECT to {host}:{port} "
+                              f"({line.decode(errors='replace')[:80]})")
+            server.settimeout(None)
+            self.log.debug(f"{host}:{port} chained through network proxy {up}")
+            return server
+        except OSError:
+            try:
+                server.close()
+            except OSError:
+                pass
+            raise
+
     def _tunnel_once(self, csock, host, port, strategy, first, exclude_frag=False):
         t0 = time.time()
         try:
@@ -607,12 +666,19 @@ class ProxyServer:
             raise
         dns_ms = (time.time() - t0) * 1000
         t1 = time.time()
-        try:
-            server = self._connect_parallel(ips, port, timeout=3.0)
-        except OSError as exc:
-            kind = "timed out" if "timed out" in str(exc) else "refused/unreachable"
-            raise OSError(
-                f"{host}:{port} could not connect ({len(ips)} address(es) tried, {kind})") from exc
+        upstream = str(getattr(self.cfg, "upstream_proxy", "") or "").strip()
+        if upstream:
+            try:
+                server = self._via_upstream(host, port)
+            except OSError as exc:
+                raise OSError(f"{host}:{port} through network proxy {upstream}: {exc}") from exc
+        else:
+            try:
+                server = self._connect_parallel(ips, port, timeout=3.0)
+            except OSError as exc:
+                kind = "timed out" if "timed out" in str(exc) else "refused/unreachable"
+                raise OSError(
+                    f"{host}:{port} could not connect ({len(ips)} address(es) tried, {kind})") from exc
         conn_ms = (time.time() - t1) * 1000
         server.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
@@ -755,42 +821,74 @@ class ProxyServer:
         host = host.strip("[]").lower()
         self.stats.conn_open(host)
         path = "/" + (rest[1].split("/", 1)[1] if "/" in rest[1] else "")
-        ips = self.resolver.resolve(host)
-        try:
-            server = self._connect_parallel(ips, port, timeout=3.0)
-        except OSError:
+        upstream = str(getattr(self.cfg, "upstream_proxy", "") or "").strip()
+        if upstream:
+            # plain HTTP through the network's own proxy: a proxy request IS
+            # the original absolute-URI head — forward it verbatim
             try:
-                csock.sendall(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n")
+                server = self._via_upstream_plain()
             except OSError:
-                pass
-            raise
-        server.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        server.settimeout(30)
-        # rebuild request without proxy headers
-        out = [f"{method} {path} HTTP/1.1"]
-        for k, v in headers.items():
-            if k in ("proxy-connection", "proxy-authorization"):
-                continue
-            if k == "connection":
-                continue
-            out.append(f"{k}: {v}")
-        out.append("Connection: close")
-        payload = head
-        # forward already-buffered remainder + any body that follows
-        sep = payload.find(b"\r\n\r\n") + 4
-        body = payload[sep:]
-        if headers.get("content-length"):
+                try:
+                    csock.sendall(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n")
+                except OSError:
+                    pass
+                raise
+            server.settimeout(30)
+            out = [l for l in head.split(b"\r\n")
+                   if l and not l.lower().startswith((b"proxy-connection:",
+                                                      b"proxy-authorization:"))]
+            payload = b"\r\n".join(out)
+            sep = head.find(b"\r\n\r\n") + 4
+            body = head[sep:]
+            if headers.get("content-length"):
+                try:
+                    need = int(headers["content-length"]) - len(body)
+                    while need > 0:
+                        part = csock.recv(min(65536, need))
+                        if not part:
+                            break
+                        body += part
+                        need -= len(part)
+                except (socket.timeout, OSError):
+                    pass
+            server.sendall(payload + b"\r\n\r\n" + body)
+        else:
+            ips = self.resolver.resolve(host)
             try:
-                need = int(headers["content-length"]) - len(body)
-                while need > 0:
-                    part = csock.recv(min(65536, need))
-                    if not part:
-                        break
-                    body += part
-                    need -= len(part)
-            except (socket.timeout, OSError):
-                pass
-        server.sendall(("\r\n".join(out) + "\r\n\r\n").encode("latin1") + body)
+                server = self._connect_parallel(ips, port, timeout=3.0)
+            except OSError:
+                try:
+                    csock.sendall(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n")
+                except OSError:
+                    pass
+                raise
+            server.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            server.settimeout(30)
+            # rebuild request without proxy headers
+            out = [f"{method} {path} HTTP/1.1"]
+            for k, v in headers.items():
+                if k in ("proxy-connection", "proxy-authorization"):
+                    continue
+                if k == "connection":
+                    continue
+                out.append(f"{k}: {v}")
+            out.append("Connection: close")
+            payload = head
+            # forward already-buffered remainder + any body that follows
+            sep = payload.find(b"\r\n\r\n") + 4
+            body = payload[sep:]
+            if headers.get("content-length"):
+                try:
+                    need = int(headers["content-length"]) - len(body)
+                    while need > 0:
+                        part = csock.recv(min(65536, need))
+                        if not part:
+                            break
+                        body += part
+                        need -= len(part)
+                except (socket.timeout, OSError):
+                    pass
+            server.sendall(("\r\n".join(out) + "\r\n\r\n").encode("latin1") + body)
         # relay response until close
         up = down = 0
         try:

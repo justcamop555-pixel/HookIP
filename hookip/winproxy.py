@@ -239,6 +239,49 @@ LOCAL_PROXY_OVERRIDE = ("localhost;127.*;192.168.*;10.*;172.16.*;172.17.*;172.18
                         "172.31.*;<local>")
 
 
+def _lan_address(addr):
+    """True when *addr* points at a real LAN proxy (not HookIP itself)."""
+    a = str(addr or "").lower()
+    return bool(a) and "127.0.0.1" not in a and "localhost" not in a and "[::1]" not in a
+
+
+def detect_network_proxy(vals):
+    """Restricted-network support: many Wi-Fi networks (offices, hotels,
+    campuses) block DIRECT internet and require all traffic to go through
+    the network's own proxy (WPAD/PAC or a manually configured one). When
+    HookIP replaces that setting, its own direct connects would all fail —
+    so detect the network's proxy BEFORE overwriting and tunnel through it.
+
+    Returns 'host:port' or ''.
+    """
+    # 1. manual proxy: '1.2.3.4:8080' or 'http=…;https=…' form
+    ps = str(vals.get("ProxyServer") or "")
+    if vals.get("ProxyEnable") and ps:
+        if "=" in ps:
+            # per-protocol form: prefer https, then any first segment
+            segs = [s.split("=", 1)[1].strip() for s in ps.split(";") if "=" in s]
+            for seg in segs:
+                if _lan_address(seg):
+                    return seg
+        elif _lan_address(ps):
+            return ps
+    # 2. PAC: fetch it (best effort) and take the first non-local PROXY entry
+    acu = str(vals.get("AutoConfigURL") or "")
+    if acu and _lan_address(acu):
+        try:
+            import re
+            import urllib.request
+            req = urllib.request.Request(acu, headers={"User-Agent": "HookIP"})
+            with urllib.request.urlopen(req, timeout=4) as r:
+                pac = r.read(65536).decode("latin1", "replace")
+            for cand in re.findall(r"PROXY\s+([^;\s]+:\d+)", pac, re.IGNORECASE):
+                if _lan_address(cand):
+                    return cand
+        except OSError:
+            pass
+    return ""
+
+
 def remove_proxy():
     """Last-resort cleanup: switch Windows back to a direct connection."""
     _write({"ProxyEnable": 0, "ProxyServer": None,

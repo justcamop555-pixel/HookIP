@@ -13,6 +13,7 @@ RESOLVERS = [
     ("Cloudflare", "cloudflare-dns.com", "1.1.1.1"),
     ("Google", "dns.google", "8.8.8.8"),
     ("AdGuard", "dns.adguard-dns.com", "94.140.14.14"),
+    ("Quad9", "dns.quad9.net", "9.9.9.9"),
 ]
 TCP_DNS_FALLBACKS = ["1.1.1.1", "8.8.8.8", "9.9.9.9"]
 UDP_DNS_LAST_RESORT = ["1.1.1.1", "8.8.8.8"]

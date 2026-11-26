@@ -18,6 +18,7 @@ DEFAULTS = {
     "remember": True,
     "minimize_to_tray": True,
     "pac_token": "",              # stable PAC URL token (generated once)
+    "upstream_proxy": "",         # network's own mandatory proxy (restricted Wi-Fi), "" = none
 }
 
 
@@ -51,6 +52,8 @@ class Config:
             clean["excluded"] = list(DEFAULTS["excluded"])
         if not isinstance(clean.get("pac_token"), str):
             clean["pac_token"] = DEFAULTS["pac_token"]
+        if not isinstance(clean.get("upstream_proxy"), str):
+            clean["upstream_proxy"] = DEFAULTS["upstream_proxy"]
         return clean
 
     # -- dict-style access ------------------------------------------------

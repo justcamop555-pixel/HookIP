@@ -1084,6 +1084,22 @@ class App:
             return
 
         self.log.info(f"Starting proxy on 127.0.0.1:{cfg.port} …")
+        # restricted-network support: if Windows already points at the
+        # network's own proxy (WPAD/PAC or manual), HookIP must tunnel
+        # THROUGH it — direct connects are blocked on such Wi-Fi
+        try:
+            prev = winproxy.read_current()
+        except OSError:
+            prev = {}
+        net_proxy = winproxy.detect_network_proxy(prev)
+        cfg.upstream_proxy = net_proxy
+        if net_proxy:
+            self.log.ok(f"This network requires its own proxy ({net_proxy}) — "
+                        "HookIP will tunnel through it automatically.")
+            notify.notify("HookIP — restricted network detected",
+                          f"Your Wi-Fi only allows traffic through its own "
+                          f"proxy ({net_proxy}). HookIP now chains through "
+                          "it, so sites keep working.", timeout_s=12)
         try:
             self.proxy = ProxyServer(cfg, self.log, self.stats, self.pac_token)
             self.proxy.on_accept_death = self._on_accept_death
@@ -1096,12 +1112,15 @@ class App:
         # system proxy + crash safety
         try:
             self.log.info("Current system proxy: " + winproxy.describe(winproxy.read_current()))
+            # on restricted networks DIRECT is blocked: keep excluded domains
+            # OUT of the bypass lists or they would break (round-2 finding)
+            bypass = None if net_proxy else cfg.excluded
             if cfg.proxy_mode == "manual":
-                winproxy.apply_manual(cfg.port, bypass=cfg.excluded)
+                winproxy.apply_manual(cfg.port, bypass=bypass)
             elif cfg.proxy_mode == "pac":
                 winproxy.apply_pac(cfg.port, self.pac_token)
             else:
-                winproxy.apply_both(cfg.port, self.pac_token, bypass=cfg.excluded)
+                winproxy.apply_both(cfg.port, self.pac_token, bypass=bypass)
             self.watchdog.start(cfg.port)
             winproxy.set_runonce()
             self.log.ok("System proxy configured. Crash protection active.")
@@ -1134,21 +1153,40 @@ class App:
             s = socket.create_connection(("www.msftconnecttest.com", 80), timeout=6)
             s.sendall(b"GET /connecttest.txt HTTP/1.1\r\nHost: "
                       b"www.msftconnecttest.com\r\nConnection: close\r\n\r\n")
-            resp = s.recv(4096).decode(errors="replace")
+            resp = b""
+            s.settimeout(6)
+            while b"\r\n\r\n" not in resp and len(resp) < 16384:
+                try:
+                    part = s.recv(4096)
+                except socket.timeout:
+                    break
+                if not part:
+                    break
+                resp += part
             s.close()
-            body = resp.split("\r\n\r\n", 1)[-1].strip()
-            if "Microsoft Connect Test" in body:
+            head, _, body = resp.partition(b"\r\n\r\n")
+            location = ""
+            for line in head.decode(errors="replace").split("\r\n")[1:]:
+                if line.lower().startswith("location:"):
+                    location = line.split(":", 1)[1].strip()
+            if b"Microsoft Connect Test" in body and not location:
                 self.log.debug("Restricted-network probe: direct unproxied "
                                "internet works.")
             else:
-                first = resp.split("\r\n", 1)[0].strip()
+                first = resp.split(b"\r\n", 1)[0].decode(errors="replace").strip()
+                portal = f" Portal login page: {location}" if location else ""
                 self.log.warn(
                     "This network looks RESTRICTED or behind a captive "
-                    "portal (probe answered: " + (first or "no data") + "). "
-                    "Log into the network's portal in a browser first — "
+                    "portal (probe answered: " + (first or "no data") + ")."
+                    + portal +
+                    " Log into the network's portal in a browser first — "
                     "until then app installs and Store downloads may "
                     "refuse to connect. Stopping HookIP also removes any "
                     "interference from our side.")
+                if location:
+                    notify.notify("HookIP — captive portal detected",
+                                  "This Wi-Fi wants you to log in first. "
+                                  "Open: " + location[:120], timeout_s=15)
         except OSError as exc:
             self.log.warn(
                 "Direct unproxied internet probe failed (" + str(exc) + "). "
@@ -1618,6 +1656,10 @@ class App:
                               f"DNS cache {pos}+{neg} entries · strategy memory "
                               f"{len(self.proxy._strat_pref)} hosts · "
                               f"{self.stats.totals()[1]} connections open")
+        net_up = str(getattr(self.cfg, "upstream_proxy", "") or "")
+        self._diag_result("Network proxy", "info",
+                          f"tunneling through the network's own proxy ({net_up})"
+                          if net_up else "none — direct connections allowed")
         # antivirus (helps interpret Defender false positives)
         try:
             ps = subprocess.run(
