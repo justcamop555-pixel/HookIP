@@ -16,6 +16,7 @@ DEFAULTS = {
     "proxy_mode": "manual",       # manual | pac
     "excluded": ["localhost", "*.local", "*.lan", "127.0.0.1"],
     "remember": True,
+    "minimize_to_tray": True,
 }
 
 

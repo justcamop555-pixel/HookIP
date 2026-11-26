@@ -1,5 +1,6 @@
 """HookIP desktop app (tkinter, dark theme)."""
 import os
+import queue
 import secrets
 import socket
 import ssl
@@ -18,6 +19,7 @@ from .config import Config, SETTINGS_PATH
 from .logutil import Log
 from .proxy import ProxyServer, Stats
 from . import winproxy
+from .tray import TrayIcon
 from .doh import RESOLVERS, _DoHConn
 
 BG = "#0f1115"
@@ -69,6 +71,16 @@ class App:
         self._build()
         self._recover_stale_proxy()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        # system tray (optional, hides when minimized)
+        self.tray = TrayIcon(f"{APP_NAME} — stopped")
+        self.tray.start()
+        if self.tray.available:
+            self.root.bind("<Unmap>", self._on_unmap)
+            self.root.after(120, self._pump_tray)
+        else:
+            self.log.debug("System tray unavailable — window-only mode.")
+        # update check (quiet at startup; manual button in Settings)
+        self.root.after(15000, self.check_updates)
         self._log_pos = 0  # kept for compatibility; pump now uses drain()
         self.root.after(250, self._pump_log)
         self.root.after(500, self._refresh_dashboard)
@@ -95,6 +107,115 @@ class App:
 
             threading.Thread(target=watcher, daemon=True).start()
         except Exception:
+            pass
+
+    def _on_unmap(self, event):
+        """Minimize → hide to tray (when enabled). The tray icon is the way
+        back; the second-instance activation also restores it."""
+        if event.widget is not self.root:
+            return
+        try:
+            if self.root.state() == "iconic" and self.tray_var.get():
+                self.root.after(10, self.root.withdraw)   # after the iconic animation
+        except (tk.TclError, RuntimeError):
+            pass
+
+    def _pump_tray(self):
+        try:
+            while True:
+                ev = self.tray.events.get_nowait()
+                kind = ev[0]
+                if kind == "show":
+                    self._show_self()
+                elif kind == "menu":
+                    self._tray_menu(ev[1], ev[2])
+                elif kind == "exit":
+                    self.on_close()
+                    return
+        except queue.Empty:
+            pass
+        except (tk.TclError, RuntimeError):
+            return
+        self.root.after(120, self._pump_tray)
+
+    def _tray_menu(self, x, y):
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label="Show HookIP", command=self._show_self)
+        menu.add_command(label=("⏹ Stop proxy" if self.running else "▶ Start proxy"),
+                         command=self.toggle)
+        menu.add_separator()
+        menu.add_command(label="Exit", command=self.on_close)
+        try:
+            menu.tk_popup(x, y)
+        finally:
+            menu.grab_release()
+
+    # -- update check ----------------------------------------------------
+    UPDATE_REPO = "justcamop555-pixel/HookIP"
+
+    def check_updates(self):
+        self.update_label.configure(text="checking…", fg=MUTED)
+        threading.Thread(target=self._update_worker, daemon=True).start()
+
+    def _update_worker(self):
+        import json as _json
+        import urllib.request
+        import urllib.error
+        latest, url = None, None
+        try:
+            req = urllib.request.Request(
+                f"https://api.github.com/repos/{self.UPDATE_REPO}/releases/latest",
+                headers={"User-Agent": "HookIP-updater", "Accept": "application/vnd.github+json"})
+            with urllib.request.urlopen(req, timeout=10) as r:
+                data = _json.loads(r.read().decode("utf-8"))
+                latest, url = data.get("tag_name", ""), data.get("html_url") or \
+                    f"https://github.com/{self.UPDATE_REPO}/releases"
+        except urllib.error.HTTPError as exc:
+            if exc.code != 404:
+                latest = None
+                url = f"https://github.com/{self.UPDATE_REPO}/releases"
+            # 404: private repo — try the redirect form (works once public)
+            if latest is None:
+                try:
+                    req2 = urllib.request.Request(
+                        f"https://github.com/{self.UPDATE_REPO}/releases/latest",
+                        headers={"User-Agent": "HookIP-updater"})
+                    with urllib.request.urlopen(req2, timeout=10) as r2:
+                        tag = r2.geturl().rsplit("/tag/", 1)[-1]
+                        if tag and tag != "latest":
+                            latest, url = tag, f"https://github.com/{self.UPDATE_REPO}/releases/tag/{tag}"
+                except OSError:
+                    pass
+        except OSError:
+            pass
+        self.root.after(0, lambda: self._update_result(latest, url))
+
+    @staticmethod
+    def _ver_tuple(s):
+        try:
+            return tuple(int(p) for p in s.lstrip("v").split(".")[:3])
+        except ValueError:
+            return (0,)
+
+    def _update_result(self, latest, url):
+        try:
+            if not latest:
+                self.update_label.configure(
+                    text="unavailable (private repo? — works once public)", fg=MUTED)
+                self.log.debug("Update check: no reachable release info (repo private or offline).")
+                return
+            if self._ver_tuple(latest) > self._ver_tuple(__version__):
+                self.update_label.configure(text=f"update available: {latest}", fg=WARN)
+                self.log.ok(f"Update available: {latest} — you are on v{__version__}.")
+                if messagebox.askyesno(
+                        APP_NAME,
+                        f"HookIP {latest} is available\n(you have v{__version__}).\n\n"
+                        f"Open the Releases page to download it?"):
+                    import webbrowser
+                    webbrowser.open(url or f"https://github.com/{self.UPDATE_REPO}/releases")
+            else:
+                self.update_label.configure(text=f"up to date (v{__version__})", fg=OK)
+        except (tk.TclError, RuntimeError):
             pass
 
     def _show_self(self):
@@ -294,6 +415,21 @@ class App:
                                 variable=self.remember_var)
         add_row("Persistence", rem_c, 6)
 
+        self.tray_var = tk.BooleanVar(value=self.cfg.minimize_to_tray)
+        tray_c = ttk.Checkbutton(grid, text="Minimize to system tray",
+                                 variable=self.tray_var)
+        add_row("Window", tray_c, 7)
+
+        upd = tk.Frame(grid, bg=PANEL)
+        tk.Button(upd, text="Check for updates", command=self.check_updates,
+                  bg="#202634", fg=FG, bd=0, padx=10, pady=4,
+                  activebackground="#2a3244", activeforeground=FG,
+                  cursor="hand2").pack(side="left")
+        self.update_label = tk.Label(upd, text="", bg=PANEL, fg=MUTED,
+                                     font=("Segoe UI", 9))
+        self.update_label.pack(side="left", padx=10)
+        add_row("Updates", upd, 8)
+
         tk.Label(setf, text="Excluded domains (one per line, wildcards allowed).\n"
                             "These sites connect without fragmentation — useful for\n"
                             "banking apps or anything that dislikes modified handshakes.",
@@ -466,6 +602,7 @@ class App:
             cfg.doh_enabled = self.doh_var.get()
             cfg.verbose = self.verbose_var.get()
             cfg.remember = self.remember_var.get()
+            cfg.minimize_to_tray = self.tray_var.get()
             cfg.excluded = [ln.strip() for ln in self.excl_text.get("1.0", "end").splitlines()
                             if ln.strip()]
             self.log.verbose = cfg.verbose
@@ -541,6 +678,8 @@ class App:
         self.status_pill.configure(
             text="● Running" if running else "● Stopped",
             fg=OK if running else MUTED)
+        if self.tray.available:
+            self.tray.set_tip(f"{APP_NAME} — {'running' if running else 'stopped'}")
         state = "disabled" if running else "normal"
         for w in self.set_widgets:
             try:
@@ -893,8 +1032,15 @@ class App:
         try:
             if self.running:
                 self.stop_proxy()
+            self.cfg.minimize_to_tray = self.tray_var.get()
+            if self.cfg.remember:
+                self.cfg.save()
             self.log.session_end()
             self.log.close_file()
+            try:
+                self.tray.stop()
+            except Exception:
+                pass
         finally:
             self.root.destroy()
 
