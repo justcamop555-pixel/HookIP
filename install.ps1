@@ -31,12 +31,14 @@ if (Get-Command gh -ErrorAction SilentlyContinue) {
     } catch { }
 }
 # 2) plain GitHub API (for public repos)
+$asset = $null
 if (-not $done) {
     try {
         $release = Invoke-RestMethod "https://api.github.com/repos/$repo/releases/latest"
         $asset = $release.assets | Where-Object name -eq "HookIP.exe"
         if (-not $asset) { throw "HookIP.exe asset not found in latest release." }
         Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $dest -UseBasicParsing
+        $done = $true
     } catch {
         throw @"
 
@@ -47,6 +49,34 @@ Fix either way:
     (then this installer uses your login automatically)
 "@
     }
+}
+
+# 3) verify SHA-256 checksum published alongside the exe (supply-chain safety)
+$hashFile = Join-Path $Destination "HookIP.exe.sha256"
+$expected = $null
+try {
+    if (Get-Command gh -ErrorAction SilentlyContinue) {
+        gh release download -R $repo -p "HookIP.exe.sha256" -O $hashFile --clobber 2>$null
+    }
+    if (-not (Test-Path $hashFile) -and $asset) {
+        $chk = Invoke-RestMethod "https://api.github.com/repos/$repo/releases/latest"
+        $chkAsset = $chk.assets | Where-Object name -eq "HookIP.exe.sha256"
+        if ($chkAsset) { Invoke-WebRequest -Uri $chkAsset.browser_download_url -OutFile $hashFile -UseBasicParsing }
+    }
+    if (Test-Path $hashFile) {
+        $expected = (Get-Content $hashFile -TotalCount 1).Split(" ")[0].Trim().ToLower()
+    }
+} catch { }
+if ($expected) {
+    $actual = (Get-FileHash $dest -Algorithm SHA256).Hash.ToLower()
+    Remove-Item $hashFile -ErrorAction SilentlyContinue
+    if ($actual -ne $expected) {
+        Remove-Item $dest -Force -ErrorAction SilentlyContinue
+        throw "SHA-256 MISMATCH for HookIP.exe! Download deleted. ($actual != $expected)"
+    }
+    Write-Host "✔ SHA-256 verified ($expected)" -ForegroundColor Green
+} else {
+    Write-Host "! checksum file not available — skipping verification" -ForegroundColor Yellow
 }
 
 Unblock-File $dest -ErrorAction SilentlyContinue

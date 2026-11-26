@@ -29,11 +29,9 @@ MUTED = "#8b949e"
 class App:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.cfg = Config.load()
-        if not self.cfg.remember:
-            saved = Config.load()
-            if saved.remember:
-                self.cfg = saved
+        saved = Config.load()
+        # "Remember settings" unchecked → start from defaults (settings were forgotten)
+        self.cfg = saved if saved.remember else Config()
         self.log = Log()
         self.log.verbose = self.cfg.verbose
         self.stats = Stats()
@@ -320,6 +318,13 @@ class App:
 
         if cfg.remember:
             cfg.save()
+        else:
+            # user chose not to remember — forget any previously stored settings
+            try:
+                if os.path.isfile(SETTINGS_PATH):
+                    os.remove(SETTINGS_PATH)
+            except OSError:
+                pass
         self.running = True
         self._set_running_ui(True)
 
@@ -371,14 +376,16 @@ class App:
 
     def _pump_log(self):
         try:
-            for level, ts, msg in self.log.drain():
+            new_entries = self.log.drain()
+            if new_entries:
                 self.log_text.configure(state="normal")
-                self.log_text.insert("end", f"[{ts}] {msg}\n", level)
+                for level, ts, msg in new_entries:
+                    self.log_text.insert("end", f"[{ts}] {msg}\n", level)
                 self.log_text.configure(state="disabled")
+                self.log_text.see("end")
             lines = int(self.log_text.index("end-1c").split(".")[0])
             if lines > 2500:
                 self.log_text.delete("1.0", f"{lines - 2000}.0")
-                self.log_text.see("end")
             self.root.after(250, self._pump_log)
         except (tk.TclError, RuntimeError):
             return   # window closing
