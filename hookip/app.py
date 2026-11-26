@@ -7,6 +7,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
@@ -49,6 +50,7 @@ class App:
         Log.prune_session_files(self._log_dir, keep=7)
         self._log_file = os.path.join(self._log_dir, time.strftime("hookip_%Y%m%d_%H%M%S.log"))
         self.log.attach_file(self._log_file)
+        self._hook_exception_logging()
         self.stats = Stats()
         self.pac_token = secrets.token_hex(8)
         self.proxy = None
@@ -203,12 +205,12 @@ class App:
         bar = tk.Frame(logf, bg=PANEL)
         bar.pack(fill="x", pady=(0, 6))
         tk.Label(bar, text="Show:", bg=PANEL, fg=MUTED).pack(side="left")
-        self._log_min_rank = 0
+        self._log_min_rank = 1
         self._log_all = []                       # full in-app history for filter/export
         self.log_filter = ttk.Combobox(
             bar, state="readonly", width=20,
             values=["Everything", "Info and above", "Warnings and above", "Errors only"])
-        self.log_filter.current(0)
+        self.log_filter.current(1)
         self.log_filter.pack(side="left", padx=(6, 8))
         self.log_filter.bind("<<ComboboxSelected>>", lambda _e: self._apply_log_filter())
         tk.Button(bar, text="Save log…", command=self._export_log,
@@ -228,6 +230,7 @@ class App:
         for tag, color in (("info", FG), ("ok", OK), ("warn", WARN),
                            ("error", ERR), ("debug", MUTED)):
             self.log_text.tag_configure(tag, foreground=color)
+        self.log_text.tag_configure("ts", foreground="#5a6478")
 
         # settings -------------------------------------------------------------
         setf = ttk.Frame(nb, style="Card.TFrame", padding=14)
@@ -359,11 +362,14 @@ class App:
     def _stat_card(self, parent, key, label, initial):
         card = tk.Frame(parent, bg="#1b2130", padx=14, pady=10)
         card.pack(side="left", padx=(0, 10))
+        colors = {"failed": (ERR, FG), "active": (OK, FG)}   # (lit color, normal)
+        lit, normal = colors.get(key, (FG, FG))
         val = tk.Label(card, text=str(initial), font=("Segoe UI Semibold", 15),
-                       bg="#1b2130", fg=FG)
+                       bg="#1b2130", fg=normal if initial == 0 else lit)
         val.pack()
         tk.Label(card, text=label, bg="#1b2130", fg=MUTED,
                  font=("Segoe UI", 9)).pack()
+        val._lit, val._normal = lit, normal
         self.dash_vars[key] = val
 
     # ------------------------------------------------------------------
@@ -491,7 +497,8 @@ class App:
                 if new_entries:
                     self.log_text.configure(state="normal")
                     for level, ts, msg in new_entries:
-                        self.log_text.insert("end", f"[{ts}] {msg}\n", level)
+                        self.log_text.insert("end", f"[{ts}] ", "ts")
+                        self.log_text.insert("end", f"{msg}\n", level)
                     self.log_text.configure(state="disabled")
                     self.log_text.see("end")
             lines = int(self.log_text.index("end-1c").split(".")[0])
@@ -512,7 +519,8 @@ class App:
             today = time.strftime("%Y-%m-%d")
             for level, ts, msg in self._log_all:
                 if logutil.LEVEL_RANK.get(level, 1) >= self._log_min_rank:
-                    self.log_text.insert("end", f"[{ts}] {msg}\n", level)
+                    self.log_text.insert("end", f"[{ts}] ", "ts")
+                    self.log_text.insert("end", f"{msg}\n", level)
             self.log_text.configure(state="disabled")
             self.log_text.see("end")
         except tk.TclError:
@@ -550,8 +558,10 @@ class App:
         try:
             total, active, up, down, failed = self.stats.totals()
             self.dash_vars["connections"].configure(text=str(total))
-            self.dash_vars["active"].configure(text=str(active))
-            self.dash_vars["failed"].configure(text=str(failed))
+            av = self.dash_vars["active"]
+            av.configure(text=str(active), fg=av._lit if active else av._normal)
+            fv = self.dash_vars["failed"]
+            fv.configure(text=str(failed), fg=fv._lit if failed else fv._normal)
             self.dash_vars["down"].configure(text=self._fmt_bytes(down))
             self.dash_vars["up"].configure(text=self._fmt_bytes(up))
             self._draw_spark()
@@ -602,6 +612,30 @@ class App:
         return f"{n:.1f} TB"
 
     # ------------------------------------------------------------------
+    def _hook_exception_logging(self):
+        """Persist every uncaught error to the session log — even after the
+        app closes or crashes, the file on disk shows what went wrong."""
+        def fmt(val):
+            return "".join(traceback.format_exception_only(type(val), val)).strip()
+
+        def tk_exc(_exc, val, _tb):
+            try:
+                self.log.error(f"Internal error: {fmt(val)}")
+            except Exception:
+                pass
+
+        def th_exc(args):
+            if args.exc_type is SystemExit:
+                return
+            name = args.thread.name if args.thread else "thread"
+            try:
+                self.log.error(f"Internal error in {name}: {fmt(args.exc_value)}")
+            except Exception:
+                pass
+
+        self.root.report_callback_exception = tk_exc
+        threading.excepthook = th_exc
+
     def _clear_cache(self):
         if self.proxy:
             self.proxy.resolver.clear_cache()
@@ -772,6 +806,7 @@ class App:
         try:
             if self.running:
                 self.stop_proxy()
+            self.log.session_end()
             self.log.close_file()
         finally:
             self.root.destroy()

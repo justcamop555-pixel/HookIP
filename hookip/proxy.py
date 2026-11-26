@@ -13,6 +13,12 @@ from .doh import Resolver, ResolveError
 MAX_CONNECTIONS = 256
 
 
+class ClientAbortError(OSError):
+    """Client opened a connection but sent nothing / hung up early.
+    Browsers do this constantly (speculative preconnects) — it is NOT a
+    proxy failure and must not be counted or alarmed as one."""
+
+
 class Stats:
     def __init__(self):
         self.lock = threading.Lock()
@@ -222,10 +228,15 @@ class ProxyServer:
                 ssock = self._plain_http(csock, head, method, target, headers)
             else:
                 csock.sendall(b"HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\n\r\n")
+        except ClientAbortError as exc:
+            # normal browser behaviour — inform, don't alarm, don't count
+            self.log.info(f"{exc}")
         except (OSError, ResolveError, ValueError) as exc:
             failed = True
-            if host:
-                self.log.warn(f"{host}: {exc}")
+            if isinstance(exc, ValueError):
+                self.log.warn(f"Malformed request from client: {exc or 'unparseable target'}")
+            else:
+                self.log.warn(f"{exc}")   # messages are host:port-complete by design
         finally:
             if opened:
                 self.stats.conn_close(failed)
@@ -309,8 +320,9 @@ class ProxyServer:
                 break
         csock.settimeout(None)
         if not first:
-            # client connected but sent nothing — close instead of relaying air
-            raise OSError("client sent no data")
+            # client connected but sent nothing — normal browser preconnect,
+            # not a proxy failure (do not count it in the Failed stat)
+            raise ClientAbortError(f"{host}:{port} client sent no data (browser preconnect)")
 
         last_err = None
         for attempt, strategy in enumerate(strategies):
@@ -321,7 +333,11 @@ class ProxyServer:
                 self.log.debug(f"{host}: attempt {attempt+1} ({strategy}) failed: {exc}")
                 if excl or not first:
                     break
-        raise OSError(f"{host}: tunnel failed ({last_err})")
+        if not first:
+            raise ClientAbortError(f"{host}:{port} client aborted (closed before sending any data)")
+        raise OSError(
+            f"{host}:{port} failed — all {len(strategies)} strategies "
+            f"tried ({', '.join(strategies)}); last error: {last_err}")
 
     def _connect_parallel(self, ips, port, timeout=3.0):
         """Race connection attempts to several addresses at once (Happy
@@ -365,8 +381,16 @@ class ProxyServer:
         raise OSError(f"all {len(candidates)} addresses failed ({last})")
 
     def _tunnel_once(self, csock, host, port, strategy, first, exclude_frag=False):
-        ips = self.resolver.resolve(host)
-        server = self._connect_parallel(ips, port, timeout=3.0)
+        try:
+            ips = self.resolver.resolve(host)
+        except ResolveError as exc:
+            raise OSError(f"{host}:{port} DNS lookup failed ({exc})") from exc
+        try:
+            server = self._connect_parallel(ips, port, timeout=3.0)
+        except OSError as exc:
+            kind = "timed out" if "timed out" in str(exc) else "refused/unreachable"
+            raise OSError(
+                f"{host}:{port} could not connect ({len(ips)} address(es) tried, {kind})") from exc
         server.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
         try:
@@ -390,7 +414,9 @@ class ProxyServer:
                 if r:
                     probe = server.recv(1, socket.MSG_PEEK)
                     if probe == b"":
-                        raise OSError(f"{host}: server closed after ClientHello")
+                        raise OSError(
+                            f"{host}:{port} server closed right after ClientHello "
+                            f"(possible DPI reset)")
         except OSError:
             try:
                 server.close()
@@ -439,8 +465,11 @@ class ProxyServer:
         # absolute-URI form: http://host/path
         rest = target.split("://", 1)
         if len(rest) != 2:
+            # count it so conn_close() stays balanced (otherwise 'Active now'
+            # would drift negative on malformed requests)
+            self.stats.conn_open("(malformed request)")
             csock.sendall(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n")
-            return None
+            raise ValueError(f"non-absolute URI target: {target[:80]}")
         hostport = rest[1].split("/", 1)[0]
         if ":" in hostport:
             host, _, port_s = hostport.rpartition(":")

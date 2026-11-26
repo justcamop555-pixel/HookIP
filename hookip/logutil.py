@@ -57,25 +57,26 @@ class Log:
         except OSError:
             pass
 
-    def _emit(self, level, ts, msg):
-        entry = (level, ts, msg)
-        with self._lock:
-            self._buf.append(entry)
-            if self._file:
+    def _emit(self, level, ts, msg, screen=True):
+        if self._file:
+            with self._lock:
                 try:
                     self._file.write(f"[{time.strftime('%Y-%m-%d')} {ts}] [{level.upper():5}] {msg}\n")
                     self._file.flush()
                 except OSError:
                     pass
-            subs = list(self._subs)
+        entry = (level, ts, msg)
+        with self._lock:
+            self._buf.append(entry)
+            subs = list(self._subs) if screen else []
         for cb in subs:
             try:
                 cb(*entry)
             except Exception:
                 pass
 
-    def write(self, level, msg):
-        self._emit(level, time.strftime("%H:%M:%S"), msg)
+    def write(self, level, msg, screen=True):
+        self._emit(level, time.strftime("%H:%M:%S"), msg, screen)
 
     def info(self, msg):
         self.write("info", msg)
@@ -90,8 +91,15 @@ class Log:
         self.write("error", msg)
 
     def debug(self, msg):
-        if self.verbose:
-            self.write("debug", msg)
+        # Always persisted to the session file (bug reports), shown on screen
+        # only when verbose mode is on or the filter is set to 'Everything'.
+        # The buffer keeps it so the 'Everything' filter can reveal it.
+        self._emit("debug", time.strftime("%H:%M:%S"), msg,
+                   screen=self.verbose)
+
+    def session_end(self):
+        """Write a footer so interrupted sessions are identifiable on disk."""
+        self.write("info", "— session log ended —")
 
     def drain(self):
         """Atomically return and clear all buffered entries."""
