@@ -721,6 +721,17 @@ class App:
                 "from reaching a loopback proxy — they can 'refuse to connect'\n"
                 "while HookIP is on. This exempts the Store and its sign-in\n"
                 "broker (asks for admin approval once).")
+        rs_btn = tk.Button(btns, text="Route services (admin)", command=self._route_services,
+                           bg="#202634", fg=FG, bd=0, padx=12, pady=6,
+                           activebackground="#2a3244", activeforeground=FG,
+                           cursor="hand2")
+        rs_btn.pack(side="left", padx=8)
+        Tooltip(rs_btn,
+                "On restricted/campus Wi-Fi, app downloads often only work\n"
+                "through the proxy — but Windows services (Store downloads,\n"
+                "Delivery Optimization, installers) bypass HookIP by default.\n"
+                "This routes them through HookIP machine-wide (one UAC); it\n"
+                "is removed again when you stop the proxy.")
         tk.Button(btns, text="Copy report", command=self._copy_diag_report,
                   bg="#202634", fg=FG, bd=0, padx=12, pady=6,
                   activebackground="#2a3244", activeforeground=FG,
@@ -844,6 +855,9 @@ class App:
                             "previous settings.")
                 notify.notify("HookIP — internet restored",
                               "Windows points at your original connection again.")
+            elif os.path.isfile(winproxy.WINHTTP_BACKUP) and winproxy.restore_winhttp_elevated():
+                self.log.ok("Internet restored: machine-wide services route "
+                            "removed (approve the UAC prompt if shown).")
             elif winproxy._is_ours(cur):
                 winproxy.remove_proxy()
                 self.log.ok("Internet restored: HookIP proxy settings cleared "
@@ -936,6 +950,38 @@ class App:
                       f"Proxy running on 127.0.0.1:{cfg.port}.\n"
                       "Close (X) hides to the tray; Stop restores your "
                       "internet.")
+        # restricted-network probe (captive portals, proxy-only Wi-Fi):
+        # direct, unproxied NCSI test — this is exactly the path app
+        # installers and Windows services use, so its failure predicts
+        # 'app install refuses to connect'
+        threading.Thread(target=self._captive_probe, daemon=True).start()
+
+    def _captive_probe(self):
+        try:
+            s = socket.create_connection(("www.msftconnecttest.com", 80), timeout=6)
+            s.sendall(b"GET /connecttest.txt HTTP/1.1\r\nHost: "
+                      b"www.msftconnecttest.com\r\nConnection: close\r\n\r\n")
+            resp = s.recv(4096).decode(errors="replace")
+            s.close()
+            body = resp.split("\r\n\r\n", 1)[-1].strip()
+            if "Microsoft Connect Test" in body:
+                self.log.debug("Restricted-network probe: direct unproxied "
+                               "internet works.")
+            else:
+                first = resp.split("\r\n", 1)[0].strip()
+                self.log.warn(
+                    "This network looks RESTRICTED or behind a captive "
+                    "portal (probe answered: " + (first or "no data") + "). "
+                    "Log into the network's portal in a browser first — "
+                    "until then app installs and Store downloads may "
+                    "refuse to connect.")
+        except OSError as exc:
+            self.log.warn(
+                "Direct unproxied internet probe failed (" + str(exc) + "). "
+                "On networks that only allow proxied traffic, Windows "
+                "services (Store downloads, installers) bypass HookIP and "
+                "will refuse to connect — use 'Route services (admin)' in "
+                "Diagnostics to fix that.")
 
     def _on_accept_death(self):
         """The listener died while Windows still points at it — without this
@@ -986,6 +1032,12 @@ class App:
         try:
             self.watchdog.stop()
             winproxy.clear_runonce()
+            # if system services were routed through us (restricted networks),
+            # remove that machine-wide route too (asks one UAC prompt)
+            if os.path.isfile(winproxy.WINHTTP_BACKUP):
+                if winproxy.restore_winhttp_elevated():
+                    self.log.info("Removing the system-services route — "
+                                  "approve the UAC prompt to finish.")
             if winproxy.restore_from_file():
                 self.log.ok("System proxy restored to previous settings.")
             else:
@@ -1409,6 +1461,43 @@ class App:
         except (OSError, subprocess.SubprocessError) as exc:
             self._diag_result("Windows Defender", "info", f"status unavailable ({type(exc).__name__})")
         self._diag_store_loopback()
+        self._diag_services()
+
+    def _diag_services(self):
+        """Machine-wide WinHTTP proxy: the path Store downloads, Delivery
+        Optimization, Windows Update and winget actually use. On restricted
+        networks these bypass the user proxy and refuse to connect unless
+        they are routed too."""
+        if not hasattr(self, "cfg"):
+            return
+        try:
+            if winproxy.winhttp_points_at(self.cfg.port):
+                if self.running:
+                    self._diag_result("System services (WinHTTP)", "OK",
+                                      "Store downloads / install services are "
+                                      "routed through HookIP", "ok")
+                else:
+                    self._diag_result("System services (WinHTTP)", "WARN",
+                                      "machine route still points at HookIP "
+                                      "while stopped — press '↺ Restore "
+                                      "internet' then approve the UAC prompt",
+                                      "warn")
+            elif os.path.isfile(winproxy.WINHTTP_BACKUP):
+                self._diag_result("System services (WinHTTP)", "WARN",
+                                  "route removal pending — approve the UAC "
+                                  "prompt to finish", "warn")
+            elif "direct access" in winproxy.winhttp_state().lower():
+                self._diag_result("System services (WinHTTP)", "info",
+                                  "direct — Store downloads bypass HookIP; on "
+                                  "restricted networks use 'Route services'",
+                                  "info")
+            else:
+                self._diag_result("System services (WinHTTP)", "info",
+                                  "machine proxy set to a third-party value "
+                                  "(not touched)", "info")
+        except (OSError, subprocess.SubprocessError) as exc:
+            self._diag_result("System services (WinHTTP)", "info",
+                              f"could not check ({type(exc).__name__})")
 
     def _diag_store_loopback(self):
         """UWP apps (Microsoft Store, mail, etc.) are AppContainers: by
@@ -1456,6 +1545,30 @@ class App:
                             "prompt(s), then re-run the check.")
             except OSError as exc:
                 self.log.error(f"Could not launch the fix: {exc}")
+
+    def _route_services(self):
+        """Restricted-network fix: route Windows services (Store downloads,
+        Delivery Optimization, winget, installers) through HookIP via the
+        machine-wide WinHTTP proxy. Restored automatically on stop."""
+        if not self.running:
+            messagebox.showinfo(
+                "Route services",
+                "Start the proxy first, then route services — the machine "
+                "proxy has to point somewhere alive.")
+            return
+        if messagebox.askyesno(
+                "Route services through HookIP",
+                "On restricted networks, app installs refuse to connect "
+                "because Windows services bypass the user proxy.\n\n"
+                "This sets the machine-wide WinHTTP proxy to HookIP "
+                "(one UAC prompt). It is removed again automatically "
+                "when you stop the proxy."):
+            try:
+                winproxy.set_winhttp_proxy_elevated(self.cfg.port)
+                self.log.ok("Routing system services through HookIP — approve "
+                            "the UAC prompt, then re-run the check.")
+            except OSError as exc:
+                self.log.error(f"Could not launch the route command: {exc}")
 
     def _diag_dns(self):
         self._diag_section("DNS resolvers (DNS-over-HTTPS)")
