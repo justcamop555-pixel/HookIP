@@ -215,12 +215,59 @@ class App:
             self.frag_e.configure(foreground=FG if ok_f else ERR)
             self.port_hint.configure(text="" if ok_p else "1–65535")
             self.frag_hint.configure(text="" if ok_f else "1–255")
+            # live availability probe — identical to Start's exclusive bind,
+            # so what it says here is exactly what Start will see
+            avail_txt, avail_fg = "", MUTED
+            if ok_p and not self.running:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                try:
+                    s.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+                    p_num = int(self.port_var.get())
+                    s.bind(("127.0.0.1", p_num))
+                    if p_num <= 1023:
+                        avail_txt, avail_fg = "well-known port — may clash", WARN
+                    else:
+                        avail_txt, avail_fg = "free", OK
+                except OSError:
+                    avail_txt, avail_fg = "in use — Start may fail", ERR
+                finally:
+                    try:
+                        s.close()
+                    except OSError:
+                        pass
+            try:
+                self.port_avail.configure(text=avail_txt, fg=avail_fg)
+            except (tk.TclError, AttributeError):
+                pass
             # header badge follows the live entry while the proxy is off
             if not self.running and ok_p:
                 self.port_badge.configure(text=f"127.0.0.1:{self.port_var.get()}")
-        except tk.TclError:
+        except (tk.TclError, AttributeError):
             pass
         return ok_p and ok_f
+
+    def _find_free_port(self):
+        """Pick a random verified-free port near the default range and fill
+        the entry (same exclusive bind Start uses)."""
+        import random
+        for _ in range(60):
+            p = random.randint(9000, 9899)
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+                s.bind(("127.0.0.1", p))
+            except OSError:
+                continue
+            finally:
+                try:
+                    s.close()
+                except OSError:
+                    pass
+            self.port_var.set(str(p))
+            self.log.info(f"Port {p} is free — filled into Settings "
+                          "(applies on next Start).")
+            return
+        self.log.error("No free port found in 9000–9899 — type one manually.")
 
     def _parse_excluded(self):
         """Read the excluded-domains box: trimmed, lowercased, deduped,
@@ -559,6 +606,18 @@ class App:
         self.port_hint = tk.Label(port_row, text="", bg=PANEL, fg=WARN,
                                   font=("Segoe UI", 8))
         self.port_hint.pack(side="left", padx=6)
+        self.port_avail = tk.Label(port_row, text="", bg=PANEL, fg=MUTED,
+                                   font=("Segoe UI", 8))
+        self.port_avail.pack(side="left", padx=(2, 0))
+        fp_btn = tk.Button(port_row, text="Find free", command=self._find_free_port,
+                           bg="#202634", fg=FG, bd=0, padx=6, pady=1,
+                           activebackground="#2a3244", activeforeground=FG,
+                           cursor="hand2")
+        fp_btn.pack(side="left", padx=(6, 0))
+        Tooltip(fp_btn,
+                "Picks a random free port near the default (9000–9899),\n"
+                "verified with the same exclusive bind Start uses, and\n"
+                "fills the field. Use when the current port is taken.")
         add_row("Local port", port_row, 0)
         self.set_widgets.append(port_e)   # the frame can't be disabled
         Tooltip(port_e,
