@@ -194,6 +194,7 @@ class App:
         self._stat_card(row, "down", "Data received", "0 B")
         self._stat_card(row, "up", "Data sent", "0 B")
         self._stat_card(row, "failed", "Failed", 0)
+        self._stat_card(row, "blocked", "Blocked", 0)
         tk.Label(dash, text="Throughput (last 3 min)", bg=PANEL, fg=MUTED).pack(anchor="w", pady=(14, 2))
         self.spark = tk.Canvas(dash, height=110, bg="#0d1017", highlightthickness=0)
         self.spark.pack(fill="x")
@@ -376,7 +377,7 @@ class App:
     def _stat_card(self, parent, key, label, initial):
         card = tk.Frame(parent, bg="#1b2130", padx=14, pady=10)
         card.pack(side="left", padx=(0, 10))
-        colors = {"failed": (ERR, FG), "active": (OK, FG)}   # (lit color, normal)
+        colors = {"failed": (ERR, FG), "active": (OK, FG), "blocked": (WARN, FG)}   # (lit color, normal)
         lit, normal = colors.get(key, (FG, FG))
         val = tk.Label(card, text=str(initial), font=("Segoe UI Semibold", 15),
                        bg="#1b2130", fg=normal if initial == 0 else lit)
@@ -638,12 +639,14 @@ class App:
 
     def _refresh_dashboard(self):
         try:
-            total, active, up, down, failed = self.stats.totals()
+            total, active, up, down, failed, blocked = self.stats.totals()
             self.dash_vars["connections"].configure(text=str(total))
             av = self.dash_vars["active"]
             av.configure(text=str(active), fg=av._lit if active else av._normal)
             fv = self.dash_vars["failed"]
             fv.configure(text=str(failed), fg=fv._lit if failed else fv._normal)
+            bv = self.dash_vars["blocked"]
+            bv.configure(text=str(blocked), fg=bv._lit if blocked else bv._normal)
             self.dash_vars["down"].configure(text=self._fmt_bytes(down))
             self.dash_vars["up"].configure(text=self._fmt_bytes(up))
             self._draw_spark()

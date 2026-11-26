@@ -25,6 +25,7 @@ class Stats:
         self.total_conns = 0
         self.active = 0
         self.failed = 0
+        self.blocked = 0
         self.up = 0
         self.down = 0
         self.domains = {}          # host -> [conns, up, down]
@@ -40,10 +41,12 @@ class Stats:
             d = self.domains.setdefault(host, [0, 0, 0])
             d[0] += 1
 
-    def conn_close(self, failed=False):
+    def conn_close(self, failed=False, blocked=False):
         with self.lock:
             self.active = max(0, self.active - 1)
-            if failed:
+            if blocked:
+                self.blocked += 1
+            elif failed:
                 self.failed += 1
 
     def add(self, host, up=0, down=0):
@@ -70,11 +73,12 @@ class Stats:
 
     def totals(self):
         with self.lock:
-            return (self.total_conns, self.active, self.up, self.down, self.failed)
+            return (self.total_conns, self.active, self.up, self.down,
+                    self.failed, self.blocked)
 
     def reset(self):
         with self.lock:
-            self.total_conns = self.active = self.failed = 0
+            self.total_conns = self.active = self.failed = self.blocked = 0
             self.up = self.down = 0
             self.domains.clear()
             self.samples.clear()
@@ -116,6 +120,8 @@ class ProxyServer:
         self._accept_thread = None
         self._ticker = None
         self._conns = set()
+        self._fails = {}                      # host -> expiry (recent full-failure)
+        self._fails_lock = threading.Lock()
         self._conns_lock = threading.Lock()
         self._conn_limit = threading.BoundedSemaphore(MAX_CONNECTIONS)
         self.running = False
@@ -189,6 +195,23 @@ class ProxyServer:
             self.stats.tick()
             time.sleep(1.0)
 
+    def _note_fail(self, host):
+        """Remember a fully-failed host for 60s so repeat connections skip the
+        3-strategy retry storm (log showed 8 retries x 3 strategies for one
+        ad domain within seconds)."""
+        with self._fails_lock:
+            if len(self._fails) > 256:
+                now = time.time()
+                for h, exp in list(self._fails.items()):
+                    if exp < now:
+                        del self._fails[h]
+            self._fails[host] = time.time() + 60
+
+    def _recent_fail(self, host):
+        with self._fails_lock:
+            exp = self._fails.get(host)
+            return exp is not None and exp > time.time()
+
     def _forget(self, csock):
         with self._conns_lock:
             self._conns.discard(csock)
@@ -198,6 +221,7 @@ class ProxyServer:
         ssock = None
         host = ""
         failed = False
+        blocked = False
         opened = False
         try:
             csock.settimeout(30)
@@ -232,20 +256,22 @@ class ProxyServer:
             # normal browser behaviour — inform, don't alarm, don't count
             self.log.info(f"{exc}")
         except (OSError, ResolveError, ValueError) as exc:
-            failed = True
-            if isinstance(exc, ValueError):
+            msg = f"{exc}"
+            if ("NXDOMAIN" in msg or "sinkhole" in msg or
+                    "no addresses for" in msg):
+                # the resolver deliberately sank this name (ad/tracker blocking,
+                # NODATA probes) — a feature working, not a proxy failure
+                blocked = True
+                self.log.info(f"{msg}")
+            elif isinstance(exc, ValueError):
+                failed = True
                 self.log.warn(f"Malformed request from client: {exc or 'unparseable target'}")
             else:
-                msg = f"{exc}"
-                if "no addresses for" in msg:
-                    # NODATA answers (e.g. Windows' ipv6.msftconnecttest.com
-                    # probes) are normal, not proxy failures
-                    self.log.info(f"{msg}")
-                else:
-                    self.log.warn(msg)   # messages are host:port-complete by design
+                failed = True
+                self.log.warn(msg)   # messages are host:port-complete by design
         finally:
             if opened:
-                self.stats.conn_close(failed)
+                self.stats.conn_close(failed, blocked)
             self._forget(csock)
             self._conn_limit.release()
             for s in (csock, ssock):
@@ -306,6 +332,10 @@ class ProxyServer:
                 strategies.append(alt)
         if excl:
             strategies = [strategies[0]]   # excluded hosts: single attempt, no retry noise
+        elif self._recent_fail(host):
+            # this host failed everything moments ago — one attempt instead of
+            # re-burning 3 full strategy cycles on every new connection
+            strategies = [strategies[0]]
 
         csock.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
         csock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -341,6 +371,7 @@ class ProxyServer:
                     break
         if not first:
             raise ClientAbortError(f"{host}:{port} client aborted (closed before sending any data)")
+        self._note_fail(host)
         raise OSError(
             f"{host}:{port} failed — all {len(strategies)} strategies "
             f"tried ({', '.join(strategies)}); last error: {last_err}")
