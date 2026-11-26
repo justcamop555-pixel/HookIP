@@ -511,8 +511,8 @@ class App:
                 "open the release page). '✓ vX' means you are up to date.")
         # flat-button hover feedback (header buttons)
         for btn, hot, cold in ((self.restore_btn, "#2a3244", "#202634"),):
-            btn.bind("<Enter>", lambda e, b=btn, c=hot: b.configure(bg=c))
-            btn.bind("<Leave>", lambda e, b=btn, c=cold: b.configure(bg=c))
+            btn.bind("<Enter>", lambda e, b=btn, c=hot: b.configure(bg=c), add="+")
+            btn.bind("<Leave>", lambda e, b=btn, c=cold: b.configure(bg=c), add="+")
 
         nb = ttk.Notebook(self.root)
         nb.pack(fill="both", expand=True, padx=16, pady=(0, 12))
@@ -533,6 +533,10 @@ class App:
         tk.Label(dash, text="Throughput (last 3 min)", bg=PANEL, fg=MUTED).pack(anchor="w", pady=(14, 2))
         self.spark = tk.Canvas(dash, height=110, bg="#0d1017", highlightthickness=0)
         self.spark.pack(fill="x")
+        Tooltip(self.spark,
+                "Down/up traffic per second over the last 3 minutes\n"
+                "(green = received, blue = sent). Shows 'now' and 'peak' "
+                "rates while running; a 'stopped' note when off.")
         tk.Label(dash, text="Top domains this session", bg=PANEL, fg=MUTED).pack(anchor="w", pady=(14, 2))
         cols = ("domain", "conns", "up", "down")
         self.dom_tree = ttk.Treeview(dash, columns=cols, show="headings", height=7)
@@ -541,6 +545,9 @@ class App:
             self.dom_tree.heading(cid, text=text)
             self.dom_tree.column(cid, width=w, anchor="w")
         self.dom_tree.pack(fill="both", expand=True)
+        Tooltip(self.dom_tree,
+                "The sites your apps used most this session, ranked by "
+                "traffic — updates live while the proxy runs.")
 
         # log ----------------------------------------------------------------
         logf = ttk.Frame(nb, style="Card.TFrame", padding=10)
@@ -575,12 +582,22 @@ class App:
                              cursor="hand2")
         copy_btn.pack(side="right", padx=(0, 6))
         Tooltip(copy_btn, "Copy the complete log to the clipboard.")
-        tk.Label(bar, text=f"Session file: {self._log_file}", bg=PANEL,
-                 fg=MUTED, font=("Segoe UI", 8)).pack(side="right", padx=8)
+        sf_lbl = tk.Label(bar, text=f"Session file: {self._log_file}", bg=PANEL,
+                          fg=MUTED, font=("Segoe UI", 8))
+        sf_lbl.pack(side="right", padx=8)
+        Tooltip(sf_lbl,
+                "The log file for this session (debug detail is always "
+                "written here, even with the on-screen filter set higher). "
+                "Logs are kept in %LOCALAPPDATA%\\HookIP\\logs and pruned "
+                "after 7 days.")
         self.log_text = tk.Text(logf, bg="#0d1017", fg=FG, insertbackground=FG,
                                 font=("Consolas", 9), state="disabled", wrap="none",
                                 height=10)
         self.log_text.pack(fill="both", expand=True)
+        Tooltip(self.log_text,
+                "Live log view — filtered by the 'Show' selector above. "
+                "Use 'Save log…' for the complete unfiltered file; colors: "
+                "blue = DNS, teal = resolves, dim = per-connection detail.")
         for tag, color in (("info", FG), ("ok", OK), ("warn", WARN),
                            ("error", ERR), ("debug", MUTED)):
             self.log_text.tag_configure(tag, foreground=color)
@@ -688,16 +705,29 @@ class App:
                                  command=lambda: setattr(self.log, "verbose",
                                                          self.verbose_var.get()))
         add_row("Logging", verb_c, 5)
+        Tooltip(verb_c,
+                "Shows per-connection detail on screen (DNS timings, ports,\n"
+                "fragment counts). The log FILE always keeps this detail\n"
+                "regardless of this switch.")
 
         self.remember_var = tk.BooleanVar(value=self.cfg.remember)
         rem_c = ttk.Checkbutton(grid, text="Remember settings for next launch",
                                 variable=self.remember_var)
         add_row("Persistence", rem_c, 6)
+        Tooltip(rem_c,
+                "Save port, fragment size, strategy, mode and the excluded\n"
+                "list to %LOCALAPPDATA%\\HookIP\\settings.json.\n"
+                "Off = forget everything when HookIP closes.")
 
         self.tray_var = tk.BooleanVar(value=self.cfg.minimize_to_tray)
-        tray_c = ttk.Checkbutton(grid, text="Minimize to system tray",
+        tray_c = ttk.Checkbutton(grid, text="Hide to tray when the window is closed (X)",
                                  variable=self.tray_var)
         add_row("Window", tray_c, 7)
+        Tooltip(tray_c,
+                "On: the X button hides HookIP to the system tray and the "
+                "proxy keeps running — the tray icon restores it.\n"
+                "Off: the X button really exits (stopping the proxy).\n"
+                "Minimize is always a normal minimize.")
 
         upd = tk.Frame(grid, bg=PANEL)
         upd_btn = tk.Button(upd, text="Check for updates", command=self.check_updates,
@@ -739,8 +769,12 @@ class App:
                 "*.example.com are allowed; lines starting with # are ignored.\n"
                 "Handy for banking apps, games with anti-cheat, or captive\n"
                 "portals that dislike modified handshakes.")
-        tk.Label(setf, text=f"Settings file: {SETTINGS_PATH}",
-                 bg=PANEL, fg=MUTED).pack(anchor="w", pady=(8, 0))
+        sf_set = tk.Label(setf, text=f"Settings file: {SETTINGS_PATH}",
+                          bg=PANEL, fg=MUTED)
+        sf_set.pack(anchor="w", pady=(8, 0))
+        Tooltip(sf_set,
+                "Where your settings live (saved when 'Remember settings' "
+                "is on). Safe to delete — HookIP recreates defaults.")
 
         # diagnostics ------------------------------------------------------------
         diagf = ttk.Frame(nb, style="Card.TFrame", padding=14)
@@ -780,10 +814,14 @@ class App:
                 "as you browse. Clearing drops every saved answer, so the\n"
                 "next connections do brand-new DoH lookups (use after a\n"
                 "network change, or if a site moved to a new server).")
-        tk.Button(btns, text="Copy report", command=self._copy_diag_report,
-                  bg="#202634", fg=FG, bd=0, padx=12, pady=6,
-                  activebackground="#2a3244", activeforeground=FG,
-                  cursor="hand2").pack(side="right")
+        cr_btn = tk.Button(btns, text="Copy report", command=self._copy_diag_report,
+                           bg="#202634", fg=FG, bd=0, padx=12, pady=6,
+                           activebackground="#2a3244", activeforeground=FG,
+                           cursor="hand2")
+        cr_btn.pack(side="right")
+        Tooltip(cr_btn,
+                "Copy everything above to the clipboard — perfect for "
+                "attaching to a bug report.")
         cols = ("check", "result", "details")
         self.diag_tree = ttk.Treeview(diagf, columns=cols, show="headings", height=13)
         for cid, text, w in (("check", "Check", 220), ("result", "Result", 90),
@@ -797,6 +835,9 @@ class App:
         self.diag_tree.tag_configure("warn", foreground=WARN)
         self.diag_tree.tag_configure("info", foreground=MUTED)
         self.diag_tree.pack(fill="both", expand=True, pady=(10, 0))
+        Tooltip(self.diag_tree,
+                "Diagnostic results: green = pass, amber = needs attention, "
+                "red = failed. Rows appear as each check finishes.")
         self._diag_queue = []
         self._diag_lock = threading.Lock()
         self._diag_results = []          # (section, check, result, details) for report
@@ -843,6 +884,18 @@ class App:
     def _stat_card(self, parent, key, label, initial):
         card = tk.Frame(parent, bg="#1b2130", padx=14, pady=10)
         card.pack(side="left", padx=(0, 10))
+        tips = {
+            "connections": "Total connections made through HookIP this "
+                           "session (counts attempts, good or bad).",
+            "active": "Connections open right now — normally a handful.",
+            "failed": "Attempts that failed after every strategy: real "
+                      "connectivity problems, not dead ad domains.",
+            "blocked": "Hosts refused at DNS level (dead or blocked "
+                       "ad/tracker endpoints) — expected and harmless.",
+            "up": "Total data sent through the proxy this session.",
+            "down": "Total data received through the proxy this session.",
+        }
+        Tooltip(card, tips.get(key, ""))
         colors = {"failed": (ERR, FG), "active": (OK, FG), "blocked": (WARN, FG)}   # (lit color, normal)
         lit, normal = colors.get(key, (FG, FG))
         val = tk.Label(card, text=str(initial), font=("Segoe UI Semibold", 15),
