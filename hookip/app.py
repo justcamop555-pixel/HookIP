@@ -1692,8 +1692,74 @@ class App:
             except Exception as exc:  # noqa: BLE001
                 self._diag_result(f"{site}:443", "FAIL",
                                   f"{time.time()-t0:.2f}s · {exc}", "fail")
-        self._diag_result("Tunnel summary", f"{ok_count}/{len(sites)} reachable", "",
-                          "ok" if ok_count == len(sites) else ("warn" if ok_count else "fail"))
+        # Steam-style patterns that used to break apps:
+        try:
+            result = self._big_head_test()
+            self._diag_result("Big-cookie request (Steam-style)", "OK",
+                              f"{result} — huge cookie heads no longer "
+                              "truncate", "ok")
+            ok_count += 1
+        except Exception as exc:  # noqa: BLE001
+            self._diag_result("Big-cookie request (Steam-style)", "FAIL",
+                              str(exc)[:120], "fail")
+        try:
+            result = self._ip_connect_test()
+            self._diag_result("IP-literal CONNECT (Steam CDN-style)", "OK",
+                              f"{result} — connecting by IP works", "ok")
+            ok_count += 1
+        except Exception as exc:  # noqa: BLE001
+            self._diag_result("IP-literal CONNECT (Steam CDN-style)", "FAIL",
+                              str(exc)[:120], "fail")
+        n = len(sites) + 2
+        self._diag_result("Tunnel summary", f"{ok_count}/{n} passed", "",
+                          "ok" if ok_count == n else ("warn" if ok_count else "fail"))
+
+    def _big_head_test(self):
+        """Plain-HTTP request with a Steam-sized Cookie head (~40 KB).
+        The old 32 KB read cap truncated this into a malformed upstream
+        request — the 'Steam sometimes refuses' bug."""
+        local_port = self.cfg.port if self.running else int(self.port_var.get())
+        cookie = "; ".join(f"session{i}=" + ("x" * 96) for i in range(500))
+        req = (f"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n"
+               f"Cookie: {cookie}\r\nConnection: close\r\n\r\n").encode()
+        assert len(req) > 40000, "test header not big enough"
+        with socket.create_connection(("127.0.0.1", local_port), timeout=15) as s:
+            s.sendall(req)
+            resp = b""
+            while b"\r\n\r\n" not in resp:
+                part = s.recv(4096)
+                if not part:
+                    break
+                resp += part
+            if not resp:
+                raise OSError("proxy closed without a response")
+            return resp.split(b"\r\n", 1)[0].decode(errors="replace")
+
+    def _ip_connect_test(self):
+        """Steam CDNs often CONNECT by literal IP with the SNI carrying the
+        name. Mimic that end-to-end: resolve via the proxy's DoH, CONNECT to
+        the IP, then TLS with the real hostname."""
+        local_port = self.cfg.port if self.running else int(self.port_var.get())
+        host = "github.com"
+        ips = self.proxy.resolver.resolve(host) if self.proxy else [socket.gethostbyname(host)]
+        with socket.create_connection(("127.0.0.1", local_port), timeout=10) as s:
+            s.sendall(f"CONNECT {ips[0]}:443 HTTP/1.1\r\nHost: {host}\r\n\r\n".encode())
+            resp = b""
+            while b"\r\n\r\n" not in resp:
+                part = s.recv(4096)
+                if not part:
+                    raise OSError("proxy closed")
+                resp += part
+            if b" 200 " not in resp.split(b"\r\n", 1)[0]:
+                raise OSError(resp.split(b"\r\n", 1)[0].decode(errors="replace"))
+            ctx = ssl.create_default_context()
+            tls = ctx.wrap_socket(s, server_hostname=host)
+            try:
+                tls.sendall(b"GET / HTTP/1.1\r\nHost: " + host.encode() +
+                            b"\r\nConnection: close\r\n\r\n")
+                return tls.recv(256).split(b"\r\n", 1)[0].decode(errors="replace")
+            finally:
+                tls.close()
 
     def _copy_diag_report(self):
         lines = [f"HookIP {__version__} diagnostic report — {time.strftime('%Y-%m-%d %H:%M:%S')}"]

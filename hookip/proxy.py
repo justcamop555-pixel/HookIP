@@ -286,9 +286,18 @@ class ProxyServer:
         opened = False
         try:
             csock.settimeout(30)
-            head = self._read_head(csock)
-            if head is None:
-                return
+            head, complete = self._read_head(csock)
+            if not complete:
+                if len(head) >= 262144:
+                    # headers too big to be a legitimate request — tell the
+                    # client instead of silently closing (which looks like a
+                    # dead proxy to apps like Steam)
+                    try:
+                        csock.sendall(b"HTTP/1.1 431 Request Header Fields Too Large\r\n"
+                                      b"Connection: close\r\n\r\n")
+                    except OSError:
+                        pass
+                return   # empty or timed-out preconnect — normal, stay silent
             method, target, headers = self._parse_head(head)
             if method is None:
                 return
@@ -360,16 +369,23 @@ class ProxyServer:
     # ------------------------------------------------------------------
     @staticmethod
     def _read_head(csock):
+        """Read one HTTP request head. Returns (data, complete).
+
+        The cap must be generous: Steam-style clients ship several KB of
+        session cookies on EVERY request, and cookie-heavy browsers push a
+        single request head well past 32 KB. The old 32 KB cap silently
+        truncated such requests (no terminator, parsed anyway, upstream saw
+        garbage) — that was the 'Steam sometimes refuses to connect' bug."""
         data = b""
         try:
-            while b"\r\n\r\n" not in data and len(data) < 32768:
-                part = csock.recv(8192)
+            while b"\r\n\r\n" not in data and len(data) < 262144:
+                part = csock.recv(16384)
                 if not part:
-                    return None
+                    return (data, b"\r\n\r\n" in data)
                 data += part
         except socket.timeout:
-            return None
-        return data
+            return (data, False)
+        return (data, b"\r\n\r\n" in data)
 
     @staticmethod
     def _parse_head(data):
@@ -381,7 +397,16 @@ class ProxyServer:
             for hl in rest.split("\r\n"):
                 if ":" in hl:
                     k, _, v = hl.partition(":")
-                    headers[k.strip().lower()] = v.strip()
+                    k = k.strip().lower()
+                    v = v.strip()
+                    # duplicate headers are LEGAL and meaningful: two Cookie:
+                    # lines carry different auth cookies (Steam does this) —
+                    # overwriting the first silently logged people out
+                    if k in headers:
+                        sep = "; " if k in ("cookie", "authorization") else ", "
+                        headers[k] = headers[k] + sep + v
+                    else:
+                        headers[k] = v
             return method.upper(), target, headers
         except ValueError:
             return None, "", {}
@@ -517,9 +542,11 @@ class ProxyServer:
             f"tried ({', '.join(strategies)}); last error: {last_err}")
 
     def _connect_parallel(self, ips, port, timeout=3.0):
-        """Race connection attempts to several addresses at once (Happy
-        Eyeballs). An unreachable first IP no longer costs its full serial
-        timeout — the fastest reachable address wins."""
+        """Happy Eyeballs (RFC 8305-style) with STAGGERED attempts: the first
+        address connects immediately, further candidates launch 150 ms apart.
+        The old version fired up to 6 SYNs at once, which CDN anti-flood
+        (Cloudflare & co.) sometimes answers with resets — Steam-style apps
+        then 'sometimes refuse to connect'."""
         socks = []
         errors = []
         lock = threading.Lock()
@@ -539,10 +566,17 @@ class ProxyServer:
                     errors.append(exc)
 
         candidates = ips[:6]
-        threads = [threading.Thread(target=attempt, args=(ip,), daemon=True) for ip in candidates]
-        for t in threads:
-            t.start()
+        threads = []
         deadline = time.time() + timeout + 0.5
+        for i, ip in enumerate(candidates):
+            with lock:
+                if won.is_set():
+                    break
+            t = threading.Thread(target=attempt, args=(ip,), daemon=True)
+            threads.append(t)
+            t.start()
+            if i < len(candidates) - 1:
+                time.sleep(0.15)   # stagger: no SYN burst
         while not won.is_set() and time.time() < deadline:
             time.sleep(0.02)
             if not any(t.is_alive() for t in threads) and not socks:
