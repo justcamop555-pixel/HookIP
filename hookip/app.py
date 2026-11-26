@@ -202,10 +202,13 @@ class App:
             if not latest:
                 self.update_label.configure(
                     text="unavailable (private repo? — works once public)", fg=MUTED)
+                self.update_pill.configure(text="", fg=MUTED)
                 self.log.debug("Update check: no reachable release info (repo private or offline).")
                 return
+            self._update_url = url
             if self._ver_tuple(latest) > self._ver_tuple(__version__):
                 self.update_label.configure(text=f"update available: {latest}", fg=WARN)
+                self.update_pill.configure(text=f"⬆ {latest} — click to update", fg=WARN)
                 self.log.ok(f"Update available: {latest} — you are on v{__version__}.")
                 if messagebox.askyesno(
                         APP_NAME,
@@ -215,8 +218,21 @@ class App:
                     webbrowser.open(url or f"https://github.com/{self.UPDATE_REPO}/releases")
             else:
                 self.update_label.configure(text=f"up to date (v{__version__})", fg=OK)
+                self.update_pill.configure(text=f"✓ v{__version__}", fg=MUTED)
         except (tk.TclError, RuntimeError):
             pass
+        # re-check every 12 h so a published update is noticed without a restart
+        try:
+            self.root.after(12 * 3600 * 1000, self.check_updates)
+        except (tk.TclError, RuntimeError):
+            pass
+
+    def _update_pill_click(self, _event=None):
+        if getattr(self, "_update_url", None) and "⬆" in self.update_pill.cget("text"):
+            import webbrowser
+            webbrowser.open(self._update_url)
+        else:
+            self.check_updates()
 
     def _show_self(self):
         try:
@@ -298,6 +314,14 @@ class App:
                                      bg="#202634", fg=FG, activebackground="#2a3244",
                                      activeforeground=FG, padx=14, pady=8)
         self.restore_btn.pack(side="right", padx=(0, 10))
+        self.update_pill = tk.Label(head, text="", font=("Segoe UI", 10),
+                                    bg=BG, fg=MUTED, cursor="hand2", padx=6)
+        self.update_pill.pack(side="right", padx=(0, 4))
+        self.update_pill.bind("<Button-1>", self._update_pill_click)
+        # flat-button hover feedback (header buttons)
+        for btn, hot, cold in ((self.restore_btn, "#2a3244", "#202634"),):
+            btn.bind("<Enter>", lambda e, b=btn, c=hot: b.configure(bg=c))
+            btn.bind("<Leave>", lambda e, b=btn, c=cold: b.configure(bg=c))
 
         nb = ttk.Notebook(self.root)
         nb.pack(fill="both", expand=True, padx=16, pady=(0, 12))
@@ -680,6 +704,11 @@ class App:
             fg=OK if running else MUTED)
         if self.tray.available:
             self.tray.set_tip(f"{APP_NAME} — {'running' if running else 'stopped'}")
+        try:
+            self.root.title(f"{APP_NAME} v{__version__} — "
+                            f"{'running' if running else 'stopped'}")
+        except (tk.TclError, RuntimeError):
+            pass
         state = "disabled" if running else "normal"
         for w in self.set_widgets:
             try:
@@ -784,6 +813,9 @@ class App:
     def _refresh_dashboard(self):
         try:
             total, active, up, down, failed, blocked = self.stats.totals()
+            port_txt = f"127.0.0.1:{self.cfg.port}"
+            if self.port_badge.cget("text") != port_txt:
+                self.port_badge.configure(text=port_txt)
             self.dash_vars["connections"].configure(text=str(total))
             av = self.dash_vars["active"]
             av.configure(text=str(active), fg=av._lit if active else av._normal)
