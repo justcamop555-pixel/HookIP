@@ -647,6 +647,16 @@ class App:
                 "as you browse. Clearing drops every saved answer, so the\n"
                 "next connections do brand-new DoH lookups (use after a\n"
                 "network change, or if a site moved to a new server).")
+        sf_btn = tk.Button(btns, text="Fix Store apps", command=self._fix_store_loopback,
+                           bg="#202634", fg=FG, bd=0, padx=12, pady=6,
+                           activebackground="#2a3244", activeforeground=FG,
+                           cursor="hand2")
+        sf_btn.pack(side="left", padx=8)
+        Tooltip(sf_btn,
+                "Microsoft Store (and other UWP apps) are blocked by Windows\n"
+                "from reaching a loopback proxy — they can 'refuse to connect'\n"
+                "while HookIP is on. This exempts the Store and its sign-in\n"
+                "broker (asks for admin approval once).")
         tk.Button(btns, text="Copy report", command=self._copy_diag_report,
                   bg="#202634", fg=FG, bd=0, padx=12, pady=6,
                   activebackground="#2a3244", activeforeground=FG,
@@ -1214,6 +1224,54 @@ class App:
                 self._diag_result("Windows Defender", "info", "antivirus disabled or not found")
         except (OSError, subprocess.SubprocessError) as exc:
             self._diag_result("Windows Defender", "info", f"status unavailable ({type(exc).__name__})")
+        self._diag_store_loopback()
+
+    def _diag_store_loopback(self):
+        """UWP apps (Microsoft Store, mail, etc.) are AppContainers: by
+        default Windows blocks them from reaching a loopback proxy. The
+        classic 'Store refuses to connect while a proxy is on' symptom."""
+        try:
+            ps = subprocess.run(
+                ["CheckNetIsolation", "LoopbackExempt", "-s"],
+                capture_output=True, text=True, timeout=10, creationflags=0x08000000)
+            out = (ps.stdout or "").lower()
+            exempt = "microsoft.windowsstore" in out or "windowsstore" in out
+            if exempt:
+                self._diag_result("UWP loopback (Store)", "OK",
+                                  "Microsoft Store is exempted — it can reach "
+                                  "the loopback proxy", "ok")
+            else:
+                self._diag_result("UWP loopback (Store)", "WARN",
+                                  "Microsoft Store is NOT loopback-exempt: it may "
+                                  "refuse to connect while the proxy is on. "
+                                  "Press 'Fix Store apps' to allow it (UAC prompt).",
+                                  "warn")
+        except (OSError, subprocess.SubprocessError) as exc:
+            self._diag_result("UWP loopback (Store)", "info",
+                              f"could not check ({type(exc).__name__})")
+
+    def _fix_store_loopback(self):
+        """One-click elevated fix: exempt the Store (+ its sign-in broker)
+        from UWP loopback isolation so they can use HookIP."""
+        if messagebox.askyesno(
+                "Fix Store apps",
+                "Windows blocks UWP apps (Microsoft Store, mail) from reaching "
+                "a loopback proxy like HookIP.\n\n"
+                "This runs one Windows command as administrator to exempt "
+                "the Store and its sign-in broker (a UAC prompt will appear)."):
+            try:
+                subprocess.Popen(
+                    ["powershell", "-NoProfile", "-Command",
+                     "Start-Process CheckNetIsolation -Verb RunAs -ArgumentList "
+                     "'LoopbackExempt','-a','-n=Microsoft.WindowsStore_8wekyb3d8bbwe'; "
+                     "Start-Sleep 2; "
+                     "Start-Process CheckNetIsolation -Verb RunAs -ArgumentList "
+                     "'LoopbackExempt','-a','-n=Microsoft.AAD.BrokerPlugin_cw5n1h2txyewy'"],
+                    creationflags=0x08000000)
+                self.log.ok("Store loopback fix requested — approve the UAC "
+                            "prompt(s), then re-run the check.")
+            except OSError as exc:
+                self.log.error(f"Could not launch the fix: {exc}")
 
     def _diag_dns(self):
         self._diag_section("DNS resolvers (DNS-over-HTTPS)")

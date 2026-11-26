@@ -86,7 +86,23 @@ def _write(vals):
 
 
 def notify_shell():
-    """Tell running apps that proxy settings changed."""
+    """Tell running apps that proxy settings changed.
+
+    Two mechanisms, because different apps listen to different things:
+    - wininet!InternetSetOptionW (SETTINGS_CHANGED + REFRESH): what WinINET
+      clients (Microsoft Store, mail, many desktop apps) actually need —
+      without it they keep their old proxy state and refuse to connect
+    - WM_SETTINGCHANGE broadcast: everything else
+    """
+    try:
+        wininet = ctypes.windll.wininet
+        INTERNET_OPTION_SETTINGS_CHANGED = 39
+        INTERNET_OPTION_REFRESH = 37
+        wininet.InternetSetOptionW(None, INTERNET_OPTION_SETTINGS_CHANGED, None, 0)
+        wininet.InternetSetOptionW(None, INTERNET_OPTION_REFRESH, None, 0)
+    except Exception:
+        pass
+
     def _send():
         try:
             ctypes.windll.user32.SendMessageTimeoutW(
