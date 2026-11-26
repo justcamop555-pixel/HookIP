@@ -12,3 +12,4 @@ restore.cmd
 # binaries go to GitHub Releases, not the repo
 HookIP.exe
 *.exe
+HookIP.exe.sha256
