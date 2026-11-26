@@ -58,15 +58,14 @@ class Log:
             pass
 
     def _emit(self, level, ts, msg, screen=True):
-        if self._file:
-            with self._lock:
+        entry = (level, ts, msg)
+        with self._lock:
+            if self._file:
                 try:
                     self._file.write(f"[{time.strftime('%Y-%m-%d')} {ts}] [{level.upper():5}] {msg}\n")
                     self._file.flush()
                 except OSError:
                     pass
-        entry = (level, ts, msg)
-        with self._lock:
             self._buf.append(entry)
             subs = list(self._subs) if screen else []
         for cb in subs:

@@ -72,7 +72,6 @@ class App:
         self._log_pos = 0  # kept for compatibility; pump now uses drain()
         self.root.after(250, self._pump_log)
         self.root.after(500, self._refresh_dashboard)
-        self.root.after(100, self._startup_restore_check)
         self._watch_activation()
         self.log.info(f"{APP_NAME} {__version__} ready. Press Start to turn the proxy on.")
 
@@ -369,7 +368,8 @@ class App:
                     _, check, result, details, tag = m
                     self._diag_results.append(("", check, result, details))
                     iid = self.diag_tree.insert("", "end", values=(check, result, details), tags=(tag,))
-                self.diag_tree.see(iid)   # Treeview.see() needs an item id, not "end"
+                if self.diag_tree.yview()[1] >= 0.99:
+                    self.diag_tree.see(iid)   # Treeview.see() needs an item id, not "end"
             self.root.after(200, self._pump_diag)
         except (tk.TclError, RuntimeError):
             return   # window closing
@@ -575,13 +575,18 @@ class App:
                                if logutil.LEVEL_RANK.get(e[0], 1) >= self._log_min_rank]
                 if new_entries:
                     self.log_text.configure(state="normal")
+                    # decide BEFORE inserting — insertion itself shifts the view
+                    at_bottom = self.log_text.yview()[1] >= 0.98
                     for level, ts, msg in new_entries:
                         extra = self._log_semantic_tag(msg)
                         tags = (level, extra) if extra else (level,)
                         self.log_text.insert("end", f"[{ts}] ", "ts")
                         self.log_text.insert("end", f"{msg}\n", tags)
                     self.log_text.configure(state="disabled")
-                    self.log_text.see("end")
+                    # follow new lines only when the reader was already at the
+                    # bottom — otherwise scrolling up gets yanked back down
+                    if at_bottom:
+                        self.log_text.see("end")
             lines = int(self.log_text.index("end-1c").split(".")[0])
             if lines > 2500:
                 self.log_text.delete("1.0", f"{lines - 2000}.0")
@@ -883,20 +888,6 @@ class App:
                 return data.split(b"\r\n", 1)[0].decode(errors="replace")
             finally:
                 tls.close()
-
-    # ------------------------------------------------------------------
-    def _startup_restore_check(self):
-        """Power-loss / crash leftovers: restore saved settings and inform.
-        The backup file only exists if we ran before, so a leftover
-        127.0.0.1 proxy is ours with near-certainty (could also be a stale
-        port from an older version)."""
-        if winproxy.has_backup():
-            cur = winproxy.read_current()
-            proxy_str = f"{cur.get('ProxyServer') or ''}{cur.get('AutoConfigURL') or ''}"
-            if "127.0.0.1" in proxy_str:
-                if winproxy.restore_from_file():
-                    winproxy.clear_runonce()
-                    self.log.ok("Recovered system-proxy settings from a previous session.")
 
     def on_close(self):
         try:

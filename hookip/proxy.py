@@ -371,7 +371,11 @@ class ProxyServer:
                     break
         if not first:
             raise ClientAbortError(f"{host}:{port} client aborted (closed before sending any data)")
-        self._note_fail(host)
+        # Only cap retries for infrastructural failures (timeout/refused/DNS
+        # blocked/client gone). A DPI reset is exactly what fragmentation is
+        # meant to defeat — keep full strategy retries for those.
+        if "ClientHello" not in str(last_err):
+            self._note_fail(host)
         raise OSError(
             f"{host}:{port} failed — all {len(strategies)} strategies "
             f"tried ({', '.join(strategies)}); last error: {last_err}")
