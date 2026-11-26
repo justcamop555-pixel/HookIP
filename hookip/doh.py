@@ -338,6 +338,12 @@ class Resolver:
                     ips, ttl = self._via_doh(host, dnsmsg.TYPE_AAAA)
                     if ips:
                         ips = [ip for ip in ips if not is_sinkhole(ip)]
+                        # the negative mark above is WRONG now (the name has
+                        # AAAA records) — clear it or resolve() would report
+                        # 'cached NXDOMAIN' for the next 120s while a working
+                        # address sits in the positive cache
+                        with self._lock:
+                            self._neg_cache.pop(host, None)
                 except (ResolveError, OSError):
                     ips = []
                 if not ips:
@@ -345,10 +351,13 @@ class Resolver:
                         ips, ttl = self._via_tcp_dns(host, dnsmsg.TYPE_AAAA)
                         if ips:
                             ips = [ip for ip in ips if not is_sinkhole(ip)]
+                            with self._lock:
+                                self._neg_cache.pop(host, None)
                     except (ResolveError, OSError):
                         ips = []
             if not ips:
-                raise ResolveError(verified_neg or f"no addresses for {host}")
+                raise ResolveError(verified_neg or
+                                   f"no addresses for {host} (DNS unreachable or dead domain)")
 
         blocked = [ip for ip in ips if is_sinkhole(ip)]
         if blocked:

@@ -310,11 +310,9 @@ class ProxyServer:
             self.log.info(f"{exc}")
         except (OSError, ResolveError, ValueError) as exc:
             msg = f"{exc}"
-            if ("NXDOMAIN" in msg or "sinkhole" in msg or
-                    "no addresses for" in msg or "rcode 2" in msg):
-                # the resolver deliberately sank this name (ad/tracker blocking,
-                # NODATA probes) or the name does not exist anywhere — a dead
-                # or blocked domain, a feature working, not a proxy failure
+            if ("NXDOMAIN" in msg or "sinkhole" in msg or "rcode 2" in msg):
+                # VERIFIED dead: resolvers confirm the name does not exist or
+                # is deliberately sunk — a feature working, not a proxy failure
                 blocked = True
                 key = host or msg[:80]
                 now_s = time.time()
@@ -326,6 +324,13 @@ class ProxyServer:
                 else:
                     # parallel connections to the same dead host: log once
                     self.log.debug(f"{msg} — blocked/dead upstream (repeat within 10s, suppressed)")
+            elif "no addresses for" in msg:
+                # UNVERIFIED: no resolver even answered NXDOMAIN — this is a
+                # network/DNS outage, not a dead domain. Never dress it up
+                # as 'blocked upstream' (that would be a false positive).
+                blocked = True
+                self.log.warn(f"{msg} — DNS could not resolve this name "
+                              "(network or DNS problem, or a very new domain)")
             elif isinstance(exc, ValueError):
                 failed = True
                 self.log.warn(f"Malformed request from client: {exc or 'unparseable target'}")
