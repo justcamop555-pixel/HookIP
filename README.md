@@ -52,6 +52,22 @@ All versions live under [**Releases**](https://github.com/justcamop555-pixel/Hoo
 one release per version, each with its built `HookIP.exe` and changelog. The repository
 itself is source-only.
 
+## ⚡ One-line install (PowerShell)
+
+```powershell
+irm https://raw.githubusercontent.com/justcamop555-pixel/HookIP/main/install.ps1 | iex
+```
+
+Downloads the latest `HookIP.exe` to your Desktop and launches it. Works anonymously once the
+repository is public; while the repo is **private**, use your GitHub CLI login instead:
+
+```powershell
+gh release download -R justcamop555-pixel/HookIP -p HookIP.exe -D "$env:USERPROFILE\Desktop" --clobber; Start-Process "$env:USERPROFILE\Desktop\HookIP.exe"
+```
+
+The installer (`install.ps1`) prefers the GitHub CLI when it is present, falls back to the
+public API, and prints friendly instructions if neither can reach a private repo.
+
 ## 🚀 Usage
 
 **Grab the latest `HookIP.exe` from [Releases](https://github.com/justcamop555-pixel/HookIP/releases/latest),**
