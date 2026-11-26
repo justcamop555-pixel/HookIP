@@ -142,6 +142,11 @@ class App:
                             b.configure(state="normal")
                         except tk.TclError:
                             pass
+                elif kind == "dl_done":
+                    try:
+                        self._dl_btn.configure(state="normal")
+                    except tk.TclError:
+                        pass
         except queue.Empty:
             pass
         except Exception as exc:  # noqa: BLE001 — never stop the UI pump;
@@ -299,11 +304,12 @@ class App:
         self.excl_text.insert("1.0", "\n".join(DEFAULTS["excluded"]))
         self.log.info("Excluded domains reset to defaults (applied on next Start).")
 
-    def check_updates(self):
+    def check_updates(self, manual=False):
         if getattr(self, "_update_running", False):
             self.log.info("Update check already running.")
             return
         self._update_running = True
+        self._update_manual = manual
         self.update_label.configure(text="checking…", fg=MUTED)
         threading.Thread(target=self._update_worker, daemon=True).start()
 
@@ -311,19 +317,22 @@ class App:
         import json as _json
         import urllib.request
         import urllib.error
-        latest, url = None, None
+        latest, url, offline, asset = None, None, False, None
         try:
             req = urllib.request.Request(
                 f"https://api.github.com/repos/{self.UPDATE_REPO}/releases/latest",
                 headers={"User-Agent": "HookIP-updater", "Accept": "application/vnd.github+json"})
             with urllib.request.urlopen(req, timeout=10) as r:
                 data = _json.loads(r.read().decode("utf-8"))
-                latest, url = data.get("tag_name", ""), data.get("html_url") or \
+                latest = data.get("tag_name", "")
+                url = data.get("html_url") or \
                     f"https://github.com/{self.UPDATE_REPO}/releases"
+                for a in data.get("assets") or []:
+                    if str(a.get("name", "")).lower().endswith(".exe"):
+                        asset = a.get("browser_download_url")
+                        break
         except urllib.error.HTTPError as exc:
-            if exc.code != 404:
-                latest = None
-                url = f"https://github.com/{self.UPDATE_REPO}/releases"
+            offline = exc.code in (403, 429, 500, 502, 503)
             # 404: private repo — try the redirect form (works once public)
             if latest is None:
                 try:
@@ -337,23 +346,35 @@ class App:
                 except OSError:
                     pass
         except OSError:
-            pass
-        self._ui_queue.put(("update", (latest, url)))
+            offline = True
+        except ValueError:
+            # malformed API response must not kill the worker (it used to
+            # leave the update check permanently stuck on 'already running')
+            offline = True
+        self._ui_queue.put(("update", (latest, url, offline, asset)))
     @staticmethod
     def _ver_tuple(s):
         try:
-            return tuple(int(p) for p in s.lstrip("v").split(".")[:3])
+            # tolerate pre-release tags: v1.2.0-beta compares as (1, 2, 0)
+            return tuple(int(p) for p in
+                         s.lstrip("v").split("-")[0].split(".")[:3])
         except ValueError:
             return (0,)
 
-    def _update_result(self, latest, url):
+    def _update_result(self, latest, url, offline=False, asset=None):
         self._update_running = False
         try:
             if not latest:
-                self.update_label.configure(
-                    text="unavailable (private repo? — works once public)", fg=MUTED)
+                if offline:
+                    self.update_label.configure(
+                        text="offline — will re-check later", fg=MUTED)
+                else:
+                    self.update_label.configure(
+                        text="private repo — works once public", fg=MUTED)
                 self.update_pill.configure(text="", fg=MUTED)
-                self.log.debug("Update check: no reachable release info (repo private or offline).")
+                self._dl_btn.pack_forget()
+                self.log.debug("Update check: no reachable release info "
+                               + ("(offline)." if offline else "(private repo)."))
                 return
             self._update_url = url
             if self._ver_tuple(latest) > self._ver_tuple(__version__):
@@ -364,15 +385,25 @@ class App:
                               f"{latest} is out (you have v{__version__}). "
                               "Click the banner in the app to get it.",
                               timeout_s=12)
-                if messagebox.askyesno(
-                        APP_NAME,
-                        f"HookIP {latest} is available\n(you have v{__version__}).\n\n"
-                        f"Open the Releases page to download it?"):
-                    import webbrowser
-                    webbrowser.open(url or f"https://github.com/{self.UPDATE_REPO}/releases")
+                # one-click download straight from the release (public repo)
+                if asset:
+                    self._update_asset_url = asset
+                    self._dl_btn.configure(text=f"⬇ Download {latest}", state="normal")
+                    self._dl_btn.pack(side="left", padx=(10, 0))
+                    self.log.info("A one-click download is available in "
+                                  "Settings → Updates.")
+                if getattr(self, "_update_manual", False):
+                    if messagebox.askyesno(
+                            APP_NAME,
+                            f"HookIP {latest} is available\n(you have "
+                            f"v{__version__}).\n\nOpen the Releases page?"):
+                        import webbrowser
+                        webbrowser.open(url or
+                                        f"https://github.com/{self.UPDATE_REPO}/releases")
             else:
                 self.update_label.configure(text=f"up to date (v{__version__})", fg=OK)
                 self.update_pill.configure(text=f"✓ v{__version__}", fg=MUTED)
+                self._dl_btn.pack_forget()
         except (tk.TclError, RuntimeError):
             pass
         # re-check every 12 h so a published update is noticed without a restart
@@ -381,12 +412,43 @@ class App:
         except (tk.TclError, RuntimeError):
             pass
 
+    def _download_update(self):
+        url = getattr(self, "_update_asset_url", None)
+        if not url:
+            return
+        self._dl_btn.configure(state="disabled", text="downloading…")
+        threading.Thread(target=self._download_worker, args=(url,), daemon=True).start()
+
+    def _download_worker(self, url):
+        import urllib.request
+        try:
+            dest_dir = os.path.join(os.path.expanduser("~"), "Downloads")
+            os.makedirs(dest_dir, exist_ok=True)
+            dest = os.path.join(dest_dir, f"HookIP_{getattr(self, '_pending_ver', 'update')}.exe")
+            req = urllib.request.Request(url, headers={"User-Agent": "HookIP-updater"})
+            with urllib.request.urlopen(req, timeout=30) as r, open(dest, "wb") as fh:
+                while True:
+                    chunk = r.read(65536)
+                    if not chunk:
+                        break
+                    fh.write(chunk)
+            self.log.ok(f"Update downloaded to {dest} — close HookIP, then run "
+                        "the new file to update.")
+            notify.notify("HookIP update downloaded",
+                          f"Saved to {dest}. Close HookIP, then run the new "
+                          "file to update.", timeout_s=12)
+            self._ui_queue.put(("dl_done", ()))
+        except OSError as exc:
+            self.log.error(f"Update download failed: {exc} — use 'click to "
+                           "update' to get it from the Releases page.")
+            self._ui_queue.put(("dl_done", ()))
+
     def _update_pill_click(self, _event=None):
         if getattr(self, "_update_url", None) and "⬆" in self.update_pill.cget("text"):
             import webbrowser
             webbrowser.open(self._update_url)
         else:
-            self.check_updates()
+            self.check_updates(manual=True)
 
     def _show_self(self):
         try:
@@ -730,17 +792,28 @@ class App:
                 "Minimize is always a normal minimize.")
 
         upd = tk.Frame(grid, bg=PANEL)
-        upd_btn = tk.Button(upd, text="Check for updates", command=self.check_updates,
+        upd_btn = tk.Button(upd, text="Check for updates", command=lambda: self.check_updates(manual=True),
                             bg="#202634", fg=FG, bd=0, padx=10, pady=4,
                             activebackground="#2a3244", activeforeground=FG,
                             cursor="hand2")
         upd_btn.pack(side="left")
         Tooltip(upd_btn,
                 "Checks GitHub Releases for a newer HookIP version.\n"
-                "Also runs automatically ~15 s after launch and every 12 h.")
+                "Also runs automatically ~15 s after launch and every 12 h.\n"
+                "When an update is out, a one-click download button "
+                "appears here.")
         self.update_label = tk.Label(upd, text="", bg=PANEL, fg=MUTED,
                                      font=("Segoe UI", 9))
         self.update_label.pack(side="left", padx=10)
+        self._dl_btn = tk.Button(upd, text="⬇ Download", state="disabled",
+                                 command=self._download_update,
+                                 bg="#202634", fg=FG, bd=0, padx=10, pady=4,
+                                 activebackground="#2a3244", activeforeground=FG,
+                                 cursor="hand2")
+        Tooltip(self._dl_btn,
+                "Downloads the new HookIP.exe straight from the release "
+                "into your Downloads folder. Close HookIP and run the new "
+                "file to update (settings are kept).")
         add_row("Updates", upd, 8)
 
         row = tk.Frame(setf, bg=PANEL)
