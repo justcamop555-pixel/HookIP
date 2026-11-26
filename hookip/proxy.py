@@ -469,7 +469,7 @@ class ProxyServer:
         # default, then the rest — connections after a DPI fight start with
         # what actually worked last time
         pref = self._strat_pref.get(host)
-        strategies = [s for s in (pref, self.cfg.strategy) if s]
+        strategies = [s for s in (pref, self.cfg.strategy) if s and s != "raw"]
         for alt in ("smart", "chunk", "random"):
             if alt not in strategies:
                 strategies.append(alt)
@@ -480,6 +480,8 @@ class ProxyServer:
             # re-burning 3 full strategy cycles on every new connection
             strategies = [strategies[0]]
 
+        last_err = None
+        attempt_errors = []
         try:
             csock.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
         except OSError as exc:
@@ -511,9 +513,22 @@ class ProxyServer:
             # client connected but sent nothing — normal browser preconnect,
             # not a proxy failure (do not count it in the Failed stat)
             raise ClientAbortError(f"{host}:{port} client sent no data (browser preconnect)")
+        # a host whose memory says "raw" only accepts unfragmented handshakes
+        # — go straight there (fragmented attempts would all fail)
+        if pref == "raw":
+            try:
+                ssock = self._tunnel_once(csock, host, port, "raw", first,
+                                          excl, force_no_frag=True)
+                return ssock
+            except ResolveError:
+                raise
+            except OSError as exc:
+                last_err = exc
+                attempt_errors.append(f"raw: {exc}")
+                self.log.debug(f"{host}: raw attempt failed: {exc}")
+                if excl:
+                    raise OSError(f"{host}:{port} failed (raw): {exc}")
 
-        last_err = None
-        attempt_errors = []
         for attempt, strategy in enumerate(strategies):
             try:
                 ssock = self._tunnel_once(csock, host, port, strategy, first, excl)
@@ -547,6 +562,28 @@ class ProxyServer:
             # DNS-level failure — strategies are irrelevant; surface the
             # resolver's own verdict (classified as blocked/dead upstream)
             raise last_err
+        # LAST RESORT: a few servers/middleboxes normalize or reset
+        # tiny-segment handshakes (TCP scrubbers dislike 1–2 byte segments).
+        # After every fragmented strategy died mid-handshake, try ONE plain,
+        # unfragmented ClientHello. On a filtered network it may be blocked,
+        # but the fragmented attempts have already failed — connectivity
+        # beats silence.
+        if last_err and "ClientHello" in str(last_err) and not excl:
+            try:
+                ssock = self._tunnel_once(csock, host, port, "raw", first,
+                                          excl, force_no_frag=True)
+                self.log.info(
+                    f"{host}:{port} fragmented handshakes kept dying — "
+                    "sent one unfragmented (server or middlebox dislikes "
+                    "tiny segments); protection was still active for the "
+                    "handshake attempt itself.")
+                if len(self._strat_pref) >= self._strat_cap and host not in self._strat_pref:
+                    self._strat_pref.pop(next(iter(self._strat_pref)), None)
+                self._strat_pref[host] = "raw"
+                return ssock
+            except (OSError, ResolveError) as exc2:
+                attempt_errors.append(f"unfragmented: {exc2}")
+                last_err = exc2
         raise OSError(
             f"{host}:{port} failed — all {len(strategies)} strategies tried "
             f"({'; '.join(attempt_errors)})")
@@ -656,7 +693,8 @@ class ProxyServer:
                 pass
             raise
 
-    def _tunnel_once(self, csock, host, port, strategy, first, exclude_frag=False):
+    def _tunnel_once(self, csock, host, port, strategy, first, exclude_frag=False,
+                     force_no_frag=False):
         t0 = time.time()
         try:
             ips = self.resolver.resolve(host)
@@ -683,7 +721,7 @@ class ProxyServer:
         server.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
         try:
-            frag = (first[:1] == b"\x16") and not exclude_frag
+            frag = (first[:1] == b"\x16") and not exclude_frag and not force_no_frag
             if frag:
                 chunks = tlsfrag.fragment(first, strategy, self.cfg.fragment_size)
             elif first:
