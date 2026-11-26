@@ -42,10 +42,20 @@ no-admin, user-space idea and pushes it further.
 | Crash safety | ✅ watchdog + RunOnce | ✅ same: registry backup, **detached watchdog**, `RunOnce` restore, sign-in recovery |
 | Portable, no install | ✅ | ✅ pure stdlib — **zero pip dependencies**, runs on x64 & ARM64 |
 
+## 📦 Downloads
+
+| Version | Download | Notes |
+|---|---|---|
+| **v1.0.0** | [`HookIP.exe`](https://github.com/justcamop555-pixel/HookIP/releases/latest) | portable, 14 MB, no Python needed |
+
+All versions live under [**Releases**](https://github.com/justcamop555-pixel/HookIP/releases) —
+one release per version, each with its built `HookIP.exe` and changelog. The repository
+itself is source-only.
+
 ## 🚀 Usage
 
-**Double-click `HookIP.exe`** (the pre-built portable binary in this folder — no Python
-needed), then press **Start**. Chrome, Steam, Discord, Spotify and most apps follow the
+**Grab the latest `HookIP.exe` from [Releases](https://github.com/justcamop555-pixel/HookIP/releases/latest),**
+double-click it, then press **Start**. Chrome, Steam, Discord, Spotify and most apps follow the
 Windows system proxy automatically. Press **Stop** or close the window to restore your
 settings.
 
