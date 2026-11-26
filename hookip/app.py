@@ -399,25 +399,43 @@ class App:
         self.status_pill = tk.Label(head, text="● Stopped", font=("Segoe UI Semibold", 11),
                                     bg=BG, fg=MUTED)
         self.status_pill.pack(side="left", padx=16)
+        Tooltip(self.status_pill,
+                "Proxy state: '● Running' means Windows traffic goes through "
+                "HookIP right now; '● Stopped' means direct connection.")
         self.port_badge = tk.Label(head, text=f"127.0.0.1:{self.cfg.port}",
                                    font=("Consolas", 10), bg="#202634", fg=MUTED,
                                    padx=10, pady=3)
         self.port_badge.pack(side="left")
+        Tooltip(self.port_badge,
+                "The local port Windows is (or will be) pointed at. Follows "
+                "the port field in Settings live while the proxy is off.")
         self.start_btn = tk.Button(head, text="▶  Start", command=self.toggle,
                                    font=("Segoe UI Semibold", 12), bd=0, cursor="hand2",
                                    bg=OK, fg="white", activebackground="#46c06a",
                                    activeforeground="white", padx=26, pady=8)
         self.start_btn.pack(side="right")
+        self.start_tip = Tooltip(
+            self.start_btn,
+            "▶ Turn the proxy on: fragments TLS handshakes so DPI can't read "
+            "the site name, and points Windows at HookIP.\n"
+            "Also sends a 'protecting you' notification.")
         self.restore_btn = tk.Button(head, text="↺  Restore internet",
                                      command=self._manual_restore,
                                      font=("Segoe UI", 10), bd=0, cursor="hand2",
                                      bg="#202634", fg=FG, activebackground="#2a3244",
                                      activeforeground=FG, padx=14, pady=8)
         self.restore_btn.pack(side="right", padx=(0, 10))
+        Tooltip(self.restore_btn,
+                "Rescue button. If HookIP crashed and Windows is still pointed "
+                "at it, this restores your previous connection — with a "
+                "confirmation notification. While running it stops the proxy.")
         self.update_pill = tk.Label(head, text="", font=("Segoe UI", 10),
                                     bg=BG, fg=MUTED, cursor="hand2", padx=6)
         self.update_pill.pack(side="right", padx=(0, 4))
         self.update_pill.bind("<Button-1>", self._update_pill_click)
+        Tooltip(self.update_pill,
+                "Update banner: '⬆ vX' means a newer HookIP is out (click to "
+                "open the release page). '✓ vX' means you are up to date.")
         # flat-button hover feedback (header buttons)
         for btn, hot, cold in ((self.restore_btn, "#2a3244", "#202634"),):
             btn.bind("<Enter>", lambda e, b=btn, c=hot: b.configure(bg=c))
@@ -524,6 +542,7 @@ class App:
                                   font=("Segoe UI", 8))
         self.port_hint.pack(side="left", padx=6)
         add_row("Local port", port_row, 0)
+        self.set_widgets.append(port_e)   # the frame can't be disabled
         Tooltip(port_e,
                 "Local TCP port HookIP listens on (default 8890).\n"
                 "Windows is pointed here while the proxy runs.\n"
@@ -538,6 +557,7 @@ class App:
                                   font=("Segoe UI", 8))
         self.frag_hint.pack(side="left", padx=6)
         add_row("Fragment size (bytes)", frag_row, 1)
+        self.set_widgets.append(frag_e)
         Tooltip(frag_e,
                 "Size of each TLS ClientHello fragment in bytes (1–255).\n"
                 "2 is the stealthiest (every byte split apart);\n"
@@ -783,7 +803,7 @@ class App:
         """'Restore internet' button: fix a system proxy left pointing at a
         dead HookIP port (crash, watchdog failure, power loss)."""
         if self.running:
-            self.stop_proxy()   # stopping already restores from backup
+            self.stop_proxy()   # stopping already restores from backup (+ toast)
             self.log.ok("Proxy stopped — internet restored to your previous settings.")
             return
         try:
@@ -795,10 +815,15 @@ class App:
             if winproxy.has_backup() and winproxy.restore_from_file():
                 self.log.ok("Internet restored: system proxy set back to your "
                             "previous settings.")
+                notify.notify("HookIP — internet restored",
+                              "Windows points at your original connection again.")
             elif winproxy._is_ours(cur):
                 winproxy.remove_proxy()
                 self.log.ok("Internet restored: HookIP proxy settings cleared "
                             "(direct connection).")
+                notify.notify("HookIP — internet restored",
+                              "Stale HookIP proxy settings cleared — direct "
+                              "connection is back.")
             else:
                 self.log.info("Nothing to restore — system proxy is already "
                               + winproxy.describe(cur))
@@ -879,8 +904,12 @@ class App:
                 pass
         self.running = True
         self._set_running_ui(True)
+        notify.notify("HookIP is protecting you",
+                      f"Proxy running on 127.0.0.1:{cfg.port}.\n"
+                      "Close (X) hides to the tray; Stop restores your "
+                      "internet.")
 
-    def stop_proxy(self):
+    def stop_proxy(self, tell_user=True):
         if not self.running:
             return
         self.running = False
@@ -905,12 +934,23 @@ class App:
         except OSError as exc:
             self.log.error(f"Restore failed: {exc}")
         self._set_running_ui(False)
+        if tell_user:
+            notify.notify("HookIP — internet restored",
+                          "Proxy stopped. Your normal connection is back.")
 
     def _set_running_ui(self, running):
         self.start_btn.configure(
             text="⏹  Stop" if running else "▶  Start",
             bg=ERR if running else OK,
             activebackground="#ff6b6b" if running else "#46c06a")
+        if getattr(self, "start_tip", None):
+            self.start_tip.set_text(
+                "⏹ Stop the proxy and restore your previous internet "
+                "settings (you will get a confirmation notification)."
+                if running else
+                "▶ Turn the proxy on: fragments TLS handshakes so DPI can't "
+                "read the site name, and points Windows at HookIP.\n"
+                "Also sends a 'protecting you' notification.")
         self.status_pill.configure(
             text="● Running" if running else "● Stopped",
             fg=OK if running else MUTED)
@@ -1409,7 +1449,7 @@ class App:
         try:
             self._closing.set()
             if self.running:
-                self.stop_proxy()
+                self.stop_proxy(tell_user=False)   # no toast during exit
             self.cfg.minimize_to_tray = self.tray_var.get()
             if self.cfg.remember:
                 self.cfg.save()
