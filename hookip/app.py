@@ -136,6 +136,12 @@ class App:
                     self._show_self()
                 elif kind == "update":
                     self._update_result(*args)
+                elif kind == "diag_done":
+                    for b in self._diag_buttons:
+                        try:
+                            b.configure(state="normal")
+                        except tk.TclError:
+                            pass
         except queue.Empty:
             pass
         except (tk.TclError, RuntimeError):
@@ -174,6 +180,26 @@ class App:
 
     # -- update check ----------------------------------------------------
     UPDATE_REPO = "justcamop555-pixel/HookIP"
+
+    def _validate_numeric_fields(self, *_):
+        """Live port/fragment validation: invalid entries turn red and show
+        the valid range right next to the field."""
+        try:
+            ok_p = 1 <= int(self.port_var.get()) <= 65535
+        except (ValueError, tk.TclError):
+            ok_p = False
+        try:
+            ok_f = 1 <= int(self.frag_var.get()) <= 255
+        except (ValueError, tk.TclError):
+            ok_f = False
+        try:
+            self.port_e.configure(foreground=FG if ok_p else ERR)
+            self.frag_e.configure(foreground=FG if ok_f else ERR)
+            self.port_hint.configure(text="" if ok_p else "1–65535")
+            self.frag_hint.configure(text="" if ok_f else "1–255")
+        except tk.TclError:
+            pass
+        return ok_p and ok_f
 
     def _parse_excluded(self):
         """Read the excluded-domains box: trimmed, lowercased, deduped,
@@ -464,17 +490,30 @@ class App:
             self.set_widgets.append(widget)
 
         self.port_var = tk.StringVar(value=str(self.cfg.port))
-        port_e = ttk.Entry(grid, textvariable=self.port_var, width=10)
-        add_row("Local port", port_e, 0)
+        port_row = tk.Frame(grid, bg=PANEL)
+        port_e = ttk.Entry(port_row, textvariable=self.port_var, width=10)
+        port_e.pack(side="left")
+        self.port_e = port_e
+        self.port_hint = tk.Label(port_row, text="", bg=PANEL, fg=WARN,
+                                  font=("Segoe UI", 8))
+        self.port_hint.pack(side="left", padx=6)
+        add_row("Local port", port_row, 0)
         Tooltip(port_e,
                 "Local TCP port HookIP listens on (default 8890).\n"
-                "Windows is pointed here while the proxy runs.")
+                "Windows is pointed here while the proxy runs.\n"
+                "Valid range: 1–65535; must be free when you press Start.")
 
         self.frag_var = tk.StringVar(value=str(self.cfg.fragment_size))
-        frag_e = ttk.Entry(grid, textvariable=self.frag_var, width=10)
-        add_row("Fragment size (bytes)", frag_e, 1)
+        frag_row = tk.Frame(grid, bg=PANEL)
+        frag_e = ttk.Entry(frag_row, textvariable=self.frag_var, width=10)
+        frag_e.pack(side="left")
+        self.frag_e = frag_e
+        self.frag_hint = tk.Label(frag_row, text="", bg=PANEL, fg=WARN,
+                                  font=("Segoe UI", 8))
+        self.frag_hint.pack(side="left", padx=6)
+        add_row("Fragment size (bytes)", frag_row, 1)
         Tooltip(frag_e,
-                "Size of each TLS ClientHello fragment in bytes.\n"
+                "Size of each TLS ClientHello fragment in bytes (1–255).\n"
                 "2 is the stealthiest (every byte split apart);\n"
                 "larger values are faster but easier to spot. Only change\n"
                 "this if a network has trouble with the default.")
@@ -484,6 +523,9 @@ class App:
                                state="readonly",
                                values=["smart", "chunk", "random"])
         add_row("Strategy", strat_c, 2)
+        self.port_var.trace_add("write", self._validate_numeric_fields)
+        self.frag_var.trace_add("write", self._validate_numeric_fields)
+        self._validate_numeric_fields()
         Tooltip(strat_c,
                 "How the TLS ClientHello is split to slip past blocking:\n"
                 "smart = adaptive, chunk = fixed-size pieces,\n"
@@ -572,9 +614,11 @@ class App:
         nb.add(diagf, text=" Diagnostics ")
         btns = tk.Frame(diagf, bg=PANEL)
         btns.pack(fill="x")
+        self._diag_buttons = []
         tips = {
-            "Run full check": "Runs every diagnostic below: system state, antivirus,\n"
-                              "DNS resolvers and a real end-to-end tunnel test.",
+            "Run full check": "Runs every diagnostic: settings sanity, system state,\n"
+                              "antivirus, DNS resolvers and a real end-to-end\n"
+                              "tunnel test (start the proxy for the tunnel part).",
             "DNS only": "Tests each DNS-over-HTTPS resolver with a real lookup.",
             "Tunnel only": "Opens a real HTTPS connection through HookIP to two\n"
                            "well-known sites (needs the proxy to be running).",
@@ -591,6 +635,7 @@ class App:
                           cursor="hand2")
             b.pack(side="left")
             Tooltip(b, tips[text])
+            self._diag_buttons.append(b)
         tk.Button(btns, text="Clear DNS cache", command=self._clear_cache,
                   bg="#202634", fg=FG, bd=0, padx=12, pady=6,
                   activebackground="#2a3244", activeforeground=FG,
@@ -731,9 +776,11 @@ class App:
         try:
             port = int(self.port_var.get())
             if not (1 <= port <= 65535):
-                raise ValueError
+                raise ValueError(port)
             cfg.port = port
-            frag = max(1, int(self.frag_var.get()))
+            frag = int(self.frag_var.get())
+            if not (1 <= frag <= 255):
+                raise ValueError(frag)
             cfg.fragment_size = frag
             cfg.strategy = self.strategy_var.get()
             if cfg.strategy not in ("smart", "chunk", "random"):
@@ -745,8 +792,13 @@ class App:
             cfg.minimize_to_tray = self.tray_var.get()
             cfg.excluded = self._parse_excluded()
             self.log.verbose = cfg.verbose
-        except ValueError:
-            self.log.error("Invalid port or fragment size.")
+        except ValueError as exc:
+            bad = exc.args[0] if exc.args else None
+            if isinstance(bad, int) and not (1 <= bad <= 255) and 1 <= bad <= 65535:
+                self.log.error(f"Fragment size must be 1–255 (you typed {bad}).")
+            else:
+                self.log.error("Local port must be a number from 1 to 65535.")
+            self.log.info("Check the red-highlighted field in Settings.")
             return
 
         self.log.info(f"Starting proxy on 127.0.0.1:{cfg.port} …")
@@ -1018,20 +1070,29 @@ class App:
         if self.proxy:
             self.proxy.resolver.clear_cache()
             self.log.info("DNS cache cleared.")
+        else:
+            self.log.info("The DNS cache lives inside a running proxy — "
+                          "nothing to clear right now.")
 
     def run_diagnostics(self, sections="all"):
         """sections: 'all' | 'dns' | 'tunnel' | 'system'"""
         if self._diag_running:
+            self.log.info("Diagnostics are already running — one moment.")
             return
         self._diag_running = True
         for iid in self.diag_tree.get_children():
             self.diag_tree.delete(iid)
         self._diag_results = []
+        for b in self._diag_buttons:
+            b.configure(state="disabled")
+        self._diag_result("Diagnostics", "running", time.strftime("%H:%M:%S"), "info")
 
         def work():
             try:
                 if sections in ("all", "system"):
                     self._diag_system()
+                if sections == "all":
+                    self._diag_settings()
                 if sections in ("all", "dns"):
                     self._diag_dns()
                 if sections in ("all", "tunnel"):
@@ -1041,8 +1102,52 @@ class App:
                 self._diag_result("Diagnostics", "error", str(exc), "fail")
             finally:
                 self._diag_running = False
+                self._ui_queue.put(("diag_done", ()))
 
         threading.Thread(target=work, daemon=True).start()
+
+    def _diag_settings(self):
+        """Sanity of the numeric settings + port availability."""
+        self._diag_section("Settings")
+        try:
+            port = int(self.port_var.get())
+            ok = 1 <= port <= 65535
+            self._diag_result("Local port", "OK" if ok else "FAIL",
+                              f"{port}" if ok else f"{port} is not in 1–65535",
+                              "ok" if ok else "fail")
+            if ok:
+                if self.running and port == self.cfg.port:
+                    self._diag_result("Port availability", "OK",
+                                      "in use by HookIP itself (running)", "ok")
+                else:
+                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    try:
+                        s.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+                        s.bind(("127.0.0.1", port))
+                        self._diag_result("Port availability", "OK", f"{port} is free", "ok")
+                    except OSError as exc:
+                        self._diag_result("Port availability", "WARN",
+                                          f"{port} is already in use — Start would "
+                                          f"refuse it ({exc})", "warn")
+                    finally:
+                        s.close()
+        except (ValueError, tk.TclError):
+            self._diag_result("Local port", "FAIL", "not a number (1–65535)", "fail")
+        try:
+            frag = int(self.frag_var.get())
+            ok = 1 <= frag <= 255
+            self._diag_result("Fragment size", "OK" if ok else "FAIL",
+                              f"{frag} bytes" if ok else f"{frag} is not in 1–255",
+                              "ok" if ok else "fail")
+        except (ValueError, tk.TclError):
+            self._diag_result("Fragment size", "FAIL", "not a number (1–255)", "fail")
+        pats = self._parse_excluded()
+        self._diag_result("Excluded domains", "OK", f"{len(pats)} valid pattern(s)", "ok")
+        try:
+            Config.save(self.cfg)
+            self._diag_result("Settings file", "OK", SETTINGS_PATH, "ok")
+        except OSError as exc:
+            self._diag_result("Settings file", "WARN", f"cannot save: {exc}", "warn")
 
     def _diag_system(self):
         self._diag_section("System")
@@ -1116,7 +1221,8 @@ class App:
             except Exception as exc:  # noqa: BLE001
                 self._diag_result(name, "FAIL",
                                   f"{time.time()-t0:.2f}s · {type(exc).__name__}: {exc}", "fail")
-        tag = "ok" if ok_count else ("warn" if ok_count == 0 else "fail")
+        tag = ("ok" if ok_count == len(RESOLVERS)
+               else ("warn" if ok_count else "fail"))
         self._diag_result("DNS summary", f"{ok_count}/{len(RESOLVERS)} reachable", "", tag)
 
     def _diag_tunnel(self):
