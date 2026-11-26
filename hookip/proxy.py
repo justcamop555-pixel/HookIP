@@ -135,8 +135,21 @@ class ProxyServer:
     # ------------------------------------------------------------------
     def start(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind(("127.0.0.1", self.cfg.port))
+        # Exclusive bind: WITHOUT this, Windows lets a second process bind the
+        # same port and a stale/zombie listener silently steals the traffic
+        # (clients connect to the old socket and hang or get dropped).
+        # SO_REUSEADDR must NOT be used here for that reason.
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        except (AttributeError, OSError):
+            pass
+        try:
+            sock.bind(("127.0.0.1", self.cfg.port))
+        except OSError as exc:
+            sock.close()
+            raise OSError(
+                f"port {self.cfg.port} is already in use by another program "
+                f"({exc}) — change the port in Settings or close the other app") from exc
         sock.listen(128)
         self._lsock = sock
         self.running = True
@@ -271,11 +284,12 @@ class ProxyServer:
         except (OSError, ResolveError, ValueError) as exc:
             msg = f"{exc}"
             if ("NXDOMAIN" in msg or "sinkhole" in msg or
-                    "no addresses for" in msg):
+                    "no addresses for" in msg or "rcode 2" in msg):
                 # the resolver deliberately sank this name (ad/tracker blocking,
-                # NODATA probes) — a feature working, not a proxy failure
+                # NODATA probes) or the name does not exist anywhere — a dead
+                # or blocked domain, a feature working, not a proxy failure
                 blocked = True
-                self.log.info(f"{msg}")
+                self.log.info(f"{msg} — blocked/dead upstream, not a HookIP failure")
             elif isinstance(exc, ValueError):
                 failed = True
                 self.log.warn(f"Malformed request from client: {exc or 'unparseable target'}")
@@ -386,6 +400,13 @@ class ProxyServer:
         for attempt, strategy in enumerate(strategies):
             try:
                 return self._tunnel_once(csock, host, port, strategy, first, excl)
+            except ResolveError as exc:
+                # DNS-level failure (NXDOMAIN / SERVFAIL / sinkhole-only):
+                # re-fragmenting the ClientHello cannot make a name resolve,
+                # so retrying strategies is pure waste — stop after one
+                last_err = exc
+                self.log.debug(f"{host}: attempt {attempt+1} ({strategy}) failed: {exc}")
+                break
             except (OSError, ResolveError) as exc:
                 last_err = exc
                 self.log.debug(f"{host}: attempt {attempt+1} ({strategy}) failed: {exc}")
@@ -400,6 +421,10 @@ class ProxyServer:
             self._note_fail(host, dpi=False)
         else:
             self._note_fail(host, dpi=True)
+        if isinstance(last_err, ResolveError):
+            # DNS-level failure — strategies are irrelevant; surface the
+            # resolver's own verdict (classified as blocked/dead upstream)
+            raise last_err
         raise OSError(
             f"{host}:{port} failed — all {len(strategies)} strategies "
             f"tried ({', '.join(strategies)}); last error: {last_err}")
@@ -448,8 +473,10 @@ class ProxyServer:
     def _tunnel_once(self, csock, host, port, strategy, first, exclude_frag=False):
         try:
             ips = self.resolver.resolve(host)
-        except ResolveError as exc:
-            raise OSError(f"{host}:{port} DNS lookup failed ({exc})") from exc
+        except ResolveError:
+            # re-raise unwrapped: DNS-level failures cannot be fixed by
+            # re-fragmenting, so _tunnel must see them to skip the retries
+            raise
         try:
             server = self._connect_parallel(ips, port, timeout=3.0)
         except OSError as exc:

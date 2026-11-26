@@ -23,7 +23,15 @@ SINKHOLE_ADDRESSES = {"0.0.0.0", "::"}
 def is_sinkhole(ip):
     """Ad/tracker-blocking resolvers answer blocked names with a sinkhole
     address (0.0.0.0, ::) — treat those as 'no answer', not as a real
-    destination."""
+    destination. Canonicalizes first so every textual form of :: or 0.0.0.0
+    is caught (e.g. 0:0:0:0:0:0:0:0)."""
+    try:
+        import socket as _s
+        if ":" in ip:
+            return _s.inet_pton(_s.AF_INET6, ip) == _s.inet_pton(_s.AF_INET6, "::")
+        return _s.inet_pton(_s.AF_INET, ip) == _s.inet_pton(_s.AF_INET, "0.0.0.0")
+    except (OSError, ValueError):
+        pass
     return ip in SINKHOLE_ADDRESSES or ip.startswith("127.") or ip == "::1"
 
 

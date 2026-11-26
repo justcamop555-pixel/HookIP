@@ -68,22 +68,25 @@ def parse_response(data):
 
 
 def _compact_v6(groups):
-    # naive compression of the longest zero run
-    out = []
+    # RFC 5952: compress the longest run of zero groups (>= 2) with "::"
+    nums = [int(g, 16) for g in groups]
+    best_i, best_len = -1, 1
     i = 0
-    while i < len(groups):
-        if groups[i] == "00":
+    while i < 8:
+        if nums[i] == 0:
             j = i
-            while j < len(groups) and groups[j] == "00":
+            while j < 8 and nums[j] == 0:
                 j += 1
-            if j - i > 1:
-                out.append("")
-                i = j
-                continue
-        out.append(groups[i].lstrip("0") or "0")
-        i += 1
-    text = ":".join(out)
-    return text.replace("::", "::", 1) if "::" in text else text
+            if j - i > best_len:
+                best_i, best_len = i, j - i
+            i = j
+        else:
+            i += 1
+    if best_i < 0:
+        return ":".join(format(n, "x") for n in nums)
+    head = ":".join(format(n, "x") for n in nums[:best_i])
+    tail = ":".join(format(n, "x") for n in nums[best_i + best_len:])
+    return f"{head}::{tail}"
 
 
 def extract_ips(answers, qtype):
