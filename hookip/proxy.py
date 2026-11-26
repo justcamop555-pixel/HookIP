@@ -19,6 +19,12 @@ class ClientAbortError(OSError):
     proxy failure and must not be counted or alarmed as one."""
 
 
+class UpstreamDied(OSError):
+    """The upstream server accepted the connection but died before ever
+    sending anything back (mid-handshake reset after our 1.5s probe window).
+    Retrying with a different fragmentation strategy can defeat it."""
+
+
 class Stats:
     def __init__(self):
         self.lock = threading.Lock()
@@ -337,7 +343,13 @@ class ProxyServer:
             # re-burning 3 full strategy cycles on every new connection
             strategies = [strategies[0]]
 
-        csock.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+        try:
+            csock.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+        except OSError as exc:
+            # client hung up before we could even acknowledge — WinError
+            # 10053/10054 here used to be miscounted as a proxy failure
+            raise ClientAbortError(
+                f"{host}:{port} client aborted (gone before connect)") from exc
         csock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
         # Sniff the client's first flight (normally the TLS ClientHello) ONCE.
@@ -349,6 +361,9 @@ class ProxyServer:
                 part = csock.recv(65536)
             except socket.timeout:
                 break
+            except OSError as exc:
+                raise ClientAbortError(
+                    f"{host}:{port} client aborted during handshake ({exc})") from exc
             if not part:
                 break
             first += part
@@ -367,7 +382,7 @@ class ProxyServer:
             except (OSError, ResolveError) as exc:
                 last_err = exc
                 self.log.debug(f"{host}: attempt {attempt+1} ({strategy}) failed: {exc}")
-                if excl or not first:
+                if excl:
                     break
         if not first:
             raise ClientAbortError(f"{host}:{port} client aborted (closed before sending any data)")
@@ -474,32 +489,62 @@ class ProxyServer:
         sockets = [csock, server]
         _set_keepalive(csock)
         _set_keepalive(server)
+        outcome = "ok"
         try:
             while self.running:
                 r, _, _ = select.select(sockets, [], [], 30)
                 if not r:
                     continue
+                stop = False
                 for s in r:
+                    peer = server if s is csock else csock
                     try:
                         data = s.recv(65536)
                     except (OSError, ConnectionError):
-                        return
+                        # upstream dying here is a real failure; the client
+                        # quitting is the client's own choice
+                        outcome = "server" if s is server else "client"
+                        stop = True
+                        break
                     if not data:
-                        return
-                    other = server if s is csock else csock
+                        if s is server:
+                            # request sent but zero bytes ever came back and
+                            # the upstream closed → died mid-handshake;
+                            # anything else is a normal end of stream
+                            outcome = "server" if (up and not down) else "ok"
+                        else:
+                            outcome = "client"
+                        stop = True
+                        break
                     try:
-                        other.sendall(data)
+                        peer.sendall(data)
                     except OSError:
-                        return
+                        outcome = "client" if peer is csock else "server"
+                        stop = True
+                        break
                     if s is csock:
                         up += len(data)
                     else:
                         down += len(data)
+                if stop:
+                    break
         finally:
             self.stats.add(host, up=up, down=down)
             self.log.debug(
                 f"{host} relay closed after {time.time()-started:.1f}s "
-                f"({up} B up, {down} B down)")
+                f"({up} B up, {down} B down) [{outcome}]")
+        if outcome == "server" and not down:
+            # let the strategy loop retry — a mid-HANDSHAKE reset can be
+            # defeated by a different fragmentation pattern. (A mid-transfer
+            # death must NOT be retried: requests may already have been
+            # processed upstream and a retry would duplicate them.)
+            raise UpstreamDied(
+                f"{host} upstream died mid-connection "
+                f"({up} B sent, {down} B received back)")
+        if outcome == "server":
+            self.log.warn(f"{host} upstream cut the connection mid-transfer "
+                          f"({down} B received before the cut)")
+        return outcome
 
     # ------------------------------------------------------------------
     def _plain_http(self, csock, head, method, target, headers):

@@ -273,7 +273,24 @@ class Resolver:
             neg_ttl = 300 if verified_neg else 60
             with self._lock:
                 self._neg_cache[host] = now + neg_ttl
-            raise ResolveError(verified_neg or f"no addresses for {host}")
+            if not verified_neg and self.cfg.doh_enabled:
+                # IPv6-only host? one AAAA pass before giving up — connecting
+                # through the tunnel to an IPv6 address works fine
+                try:
+                    ips, ttl = self._via_doh(host, dnsmsg.TYPE_AAAA)
+                    if ips:
+                        ips = [ip for ip in ips if not is_sinkhole(ip)]
+                except (ResolveError, OSError):
+                    ips = []
+                if not ips:
+                    try:
+                        ips, ttl = self._via_tcp_dns(host, dnsmsg.TYPE_AAAA)
+                        if ips:
+                            ips = [ip for ip in ips if not is_sinkhole(ip)]
+                    except (ResolveError, OSError):
+                        ips = []
+            if not ips:
+                raise ResolveError(verified_neg or f"no addresses for {host}")
 
         blocked = [ip for ip in ips if is_sinkhole(ip)]
         if blocked:
