@@ -120,10 +120,10 @@ class _DoHConn:
                     body = _dechunk(body)
                     if body is not None:
                         self.used = time.time()
-                        return body
+                        return self._validated(body, payload)
                 elif clen is not None and body is not None and len(body) >= clen:
                     self.used = time.time()
-                    return body[:clen]
+                    return self._validated(body[:clen], payload)
                 try:
                     chunk = self.ssl.read(65536)
                 except ssl.SSLWantReadError:
@@ -166,9 +166,25 @@ class _DoHConn:
                             chunked = True
                     body = buf[sep + 4:]
                 else:
-                    body = buf
-            # connection ended — result only complete if clen/chunked matched
-            return body if body is not None else b""
+                    # accumulate the body — overwriting with `buf` would paste
+                    # the HTTP HEADERS back into the DNS message (this caused
+                    # 'truncated name' parse failures on multi-record
+                    # responses, e.g. Google DoH)
+                    body += chunk
+            # connection ended — anything short of the promised length is
+            # incomplete; raising triggers a fresh-session retry upstream
+            if body and clen is not None and len(body) < clen:
+                raise ResolveError("incomplete DoH response (connection cut)")
+            if not body:
+                return b""
+            return self._validated(body, payload)
+
+    def _validated(self, body, payload):
+        """Guard against transport garbage (HTTP headers, split bodies): a DNS
+        response must echo the query's transaction ID."""
+        if len(body) >= 12 and body[:2] == payload[:2]:
+            return body
+        raise ResolveError("response is not a DNS message")
 
     def close(self):
         self.alive = False

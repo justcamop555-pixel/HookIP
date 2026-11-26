@@ -70,7 +70,7 @@ class App:
         self._style()
         self._build()
         self._recover_stale_proxy()
-        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close_request)
         # system tray (optional, hides when minimized)
         self.tray = TrayIcon(f"{APP_NAME} — stopped")
         self.tray.start()
@@ -1027,6 +1027,20 @@ class App:
                 return data.split(b"\r\n", 1)[0].decode(errors="replace")
             finally:
                 tls.close()
+
+    def _on_close_request(self):
+        """X button: hide to tray when tray mode is on — the proxy keeps
+        running and the tray icon is the way back. Real exit lives in the
+        tray menu (or on the X when tray is disabled)."""
+        try:
+            if self.tray.available and self.tray_var.get():
+                self.root.withdraw()
+                self.log.info("Hidden to tray — right-click the tray icon "
+                              "to restore, start/stop the proxy, or exit.")
+                return
+        except (tk.TclError, RuntimeError):
+            pass
+        self.on_close()
 
     def on_close(self):
         try:

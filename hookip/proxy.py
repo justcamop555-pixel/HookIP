@@ -201,22 +201,29 @@ class ProxyServer:
             self.stats.tick()
             time.sleep(1.0)
 
-    def _note_fail(self, host):
-        """Remember a fully-failed host for 60s so repeat connections skip the
-        3-strategy retry storm (log showed 8 retries x 3 strategies for one
-        ad domain within seconds)."""
+    def _note_fail(self, host, dpi=False):
+        """Remember a fully-failed host so repeat connections skip the
+        3-strategy retry storm. Infrastructural failures (timeout/refused/DNS
+        blocked/client gone) cap immediately; a DPI reset gets ONE more full
+        cycle (fragmentation may defeat it) before capping."""
         with self._fails_lock:
+            prev = self._fails.get(host)
+            count = prev[1] + 1 if (prev and prev[0] > time.time()) else 1
+            capped = (not dpi) or count >= 2
             if len(self._fails) > 256:
                 now = time.time()
-                for h, exp in list(self._fails.items()):
-                    if exp < now:
+                for h, entry in list(self._fails.items()):
+                    if entry[0] < now:
                         del self._fails[h]
-            self._fails[host] = time.time() + 60
+            self._fails[host] = (time.time() + 60, count, capped)
+        if capped:
+            self.log.debug(f"{host}: marked as repeat-failure — "
+                           "next connections will try a single strategy")
 
     def _recent_fail(self, host):
         with self._fails_lock:
-            exp = self._fails.get(host)
-            return exp is not None and exp > time.time()
+            entry = self._fails.get(host)
+            return bool(entry and entry[0] > time.time() and entry[2])
 
     def _forget(self, csock):
         with self._conns_lock:
@@ -390,7 +397,9 @@ class ProxyServer:
         # blocked/client gone). A DPI reset is exactly what fragmentation is
         # meant to defeat — keep full strategy retries for those.
         if "ClientHello" not in str(last_err):
-            self._note_fail(host)
+            self._note_fail(host, dpi=False)
+        else:
+            self._note_fail(host, dpi=True)
         raise OSError(
             f"{host}:{port} failed — all {len(strategies)} strategies "
             f"tried ({', '.join(strategies)}); last error: {last_err}")
