@@ -176,12 +176,24 @@ def bypass_patterns(excluded):
     return parts
 
 
+def _dedupe_override(override, extra):
+    """Merge user bypass entries into the built-in list without duplicates
+    (the default list already contains 'localhost' — the user's excluded
+    list added it again, producing 'localhost;…;<local>;localhost')."""
+    seen = []
+    for part in override.split(";") + list(extra):
+        p = part.strip().lower()
+        if p and p not in seen:
+            seen.append(p)
+    return ";".join(seen)
+
+
 def apply_manual(port, bypass=None):
     backup()
     override = LOCAL_PROXY_OVERRIDE
     extra = bypass_patterns(bypass)
     if extra:
-        override += ";" + ";".join(extra)
+        override = _dedupe_override(override, extra)
     vals = {
         "ProxyEnable": 1,
         "ProxyServer": f"127.0.0.1:{port}",
@@ -211,7 +223,7 @@ def apply_both(port, token, bypass=None):
     override = LOCAL_PROXY_OVERRIDE
     extra = bypass_patterns(bypass)
     if extra:
-        override += ";" + ";".join(extra)
+        override = _dedupe_override(override, extra)
     vals = {
         "ProxyEnable": 1,
         "ProxyServer": f"127.0.0.1:{port}",

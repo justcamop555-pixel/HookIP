@@ -1766,7 +1766,8 @@ class App:
             tls = ctx.wrap_socket(s, server_hostname=host)
             try:
                 tls.sendall(b"GET / HTTP/1.1\r\nHost: " + host.encode() +
-                            b"\r\nConnection: close\r\n\r\n")
+                            b"\r\nUser-Agent: Mozilla/5.0 HookIP-diag\r\n"
+                            b"Connection: close\r\n\r\n")
                 return tls.recv(256).split(b"\r\n", 1)[0].decode(errors="replace")
             finally:
                 tls.close()
@@ -1807,7 +1808,8 @@ class App:
             t_tls = time.time() - t1
             try:
                 tls.sendall(b"GET / HTTP/1.1\r\nHost: " + host.encode() +
-                            b"\r\nConnection: close\r\n\r\n")
+                            b"\r\nUser-Agent: Mozilla/5.0 HookIP-diag\r\n"
+                            b"Connection: close\r\n\r\n")
                 data = tls.recv(512)
                 t_ttfb = time.time() - t1
                 line = data.split(b"\r\n", 1)[0].decode(errors="replace")
