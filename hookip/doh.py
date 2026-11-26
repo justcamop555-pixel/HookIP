@@ -1,0 +1,363 @@
+"""DNS resolution: DNS-over-HTTPS with a hand-driven, fragmented TLS
+handshake (so DoH itself cannot be SNI-blocked), falling back to
+DNS-over-TCP, DNS-over-UDP and finally the system resolver."""
+import socket
+import ssl
+import struct
+import threading
+import time
+
+from . import dnsmsg
+
+RESOLVERS = [
+    ("Cloudflare", "cloudflare-dns.com", "1.1.1.1"),
+    ("Google", "dns.google", "8.8.8.8"),
+    ("AdGuard", "dns.adguard-dns.com", "94.140.14.14"),
+]
+TCP_DNS_FALLBACKS = ["1.1.1.1", "8.8.8.8", "9.9.9.9"]
+UDP_DNS_LAST_RESORT = ["1.1.1.1", "8.8.8.8"]
+
+
+class ResolveError(Exception):
+    pass
+
+
+class VerifiedNegative(ResolveError):
+    """NXDOMAIN confirmed over a trusted channel (DoH / DNS-over-TCP).
+    Falling back to plaintext/system DNS would risk serving poisoned data."""
+    pass
+
+
+class _DoHConn:
+    """A single DoH HTTPS connection with a fragmented ClientHello."""
+
+    def __init__(self, ip, host, timeout=4.0, chunk=2):
+        self.sock = socket.create_connection((ip, 443), timeout=timeout)
+        self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        self.sock.settimeout(timeout)
+        ctx = ssl.create_default_context()
+        self._bio_in = ssl.MemoryBIO()
+        self._bio_out = ssl.MemoryBIO()
+        self.ssl = ctx.wrap_bio(self._bio_in, self._bio_out, server_hostname=host)
+        self._handshake(chunk)
+        self.ok = True
+
+    def _frag_send(self, data, chunk):
+        if chunk <= 1:
+            self.sock.sendall(data)
+            return
+        i = 0
+        while i < len(data):
+            size = min(chunk, len(data) - i)
+            self.sock.sendall(data[i:i + size])
+            i += size
+
+    def _handshake(self, chunk):
+        first = True
+        while True:
+            try:
+                self.ssl.do_handshake()
+                return
+            except ssl.SSLWantReadError:
+                out = self._bio_out.read()
+                if out:
+                    self._frag_send(out, chunk if first else 0)
+                    first = False
+                d = self.sock.recv(16384)
+                if not d:
+                    raise ResolveError("connection closed during DoH handshake")
+                self._bio_in.write(d)
+            except ssl.SSLWantWriteError:
+                out = self._bio_out.read()
+                if out:
+                    self._frag_send(out, chunk if first else 0)
+                    first = False
+
+    def _flush_out(self):
+        while True:
+            out = self._bio_out.read()
+            if not out:
+                break
+            self.sock.sendall(out)
+
+    def request(self, host, payload, timeout=5.0):
+        self.sock.settimeout(timeout)
+        head = (
+            "POST /dns-query HTTP/1.1\r\n"
+            f"Host: {host}\r\n"
+            "Content-Type: application/dns-message\r\n"
+            "Accept: application/dns-message\r\n"
+            f"Content-Length: {len(payload)}\r\n"
+            "Connection: close\r\n\r\n"
+        ).encode("ascii")
+        self.ssl.write(head + payload)
+        self._flush_out()
+        buf = b""
+        body = None
+        clen = None
+        chunked = False
+        while True:
+            if chunked and body is not None:
+                body = _dechunk(body)
+                if body is not None:
+                    return body
+            elif clen is not None and body is not None and len(body) >= clen:
+                return body[:clen]
+            try:
+                chunk = self.ssl.read(65536)
+            except ssl.SSLWantReadError:
+                data = self.sock.recv(65536)
+                if not data:
+                    break
+                self._bio_in.write(data)
+                continue
+            except ssl.SSLWantWriteError:
+                self._flush_out()
+                continue
+            except (ssl.SSLZeroReturnError, ssl.SSLEOFError):
+                break
+            if not chunk:
+                break
+            buf += chunk
+            if clen is None:
+                sep = buf.find(b"\r\n\r\n")
+                if sep < 0:
+                    if len(buf) > 65536:
+                        break
+                    continue
+                headers = buf[:sep].decode("latin1", "replace")
+                for line in headers.split("\r\n")[1:]:
+                    low = line.lower()
+                    if low.startswith("content-length:"):
+                        try:
+                            clen = int(line.split(":", 1)[1].strip())
+                        except ValueError:
+                            clen = None
+                    elif low.startswith("transfer-encoding:") and "chunked" in low:
+                        chunked = True
+                body = buf[sep + 4:]
+            else:
+                body = buf
+        return body if body is not None else b""
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+def _dechunk(data):
+    """Decode a chunked body; return the full payload once the final chunk
+    (0-length) has arrived, else None (need more data)."""
+    out = bytearray()
+    i = 0
+    while True:
+        nl = data.find(b"\r\n", i)
+        if nl < 0:
+            return None
+        try:
+            size = int(data[i:nl].split(b";")[0], 16)
+        except ValueError:
+            return bytes(out)
+        if size == 0:
+            return bytes(out)
+        if len(data) < nl + 2 + size + 2:
+            return None
+        out += data[nl + 2: nl + 2 + size]
+        i = nl + 2 + size + 2
+
+
+class Resolver:
+    """Cached, fault-tolerant resolver shared by the proxy threads."""
+
+    def __init__(self, cfg, log, chunk=2):
+        self.cfg = cfg
+        self.log = log
+        self.chunk = chunk
+        self._cache = {}                      # name -> (expiry, ips)
+        self._neg_cache = {}                  # name -> expiry
+        self._lock = threading.Lock()
+        self._start_idx = 0
+        self.verbose_stats = {}               # resolver -> success count
+
+    # ------------------------------------------------------------------
+    def resolve(self, host, qtype=dnsmsg.TYPE_A):
+        host = host.strip("[]").lower()
+        if not host:
+            raise ResolveError("empty host")
+        if _is_ip(host):
+            return [host]
+
+        now = time.time()
+        with self._lock:
+            neg = self._neg_cache.get(host)
+            if neg and neg > now:
+                raise ResolveError(f"{host}: cached NXDOMAIN")
+            hit = self._cache.get(host)
+            if hit and hit[0] > now:
+                return list(hit[1])
+
+        ips = []
+        ttl = 120
+        verified_neg = None
+        try:
+            if self.cfg.doh_enabled:
+                ips, ttl = self._via_doh(host, qtype)
+            if not ips:
+                ips, ttl = self._via_tcp_dns(host, qtype)
+        except VerifiedNegative as exc:
+            verified_neg = str(exc)
+            ips, ttl = [], ttl
+        if not ips and not verified_neg:
+            ips, ttl = self._via_udp_dns(host, qtype)
+        if not ips and not verified_neg:
+            ips, ttl = self._via_system(host, qtype)
+        if not ips:
+            neg_ttl = 300 if verified_neg else 60
+            with self._lock:
+                self._neg_cache[host] = now + neg_ttl
+            raise ResolveError(verified_neg or f"no addresses for {host}")
+
+        ttl = min(300, max(10, int(ttl)))
+        with self._lock:
+            self._cache[host] = (now + ttl, list(ips))
+        self.log.debug(f"resolve {host} -> {', '.join(ips[:4])} (ttl {ttl}s)")
+        return list(ips)
+
+    # -- strategies ------------------------------------------------------
+    def _via_doh(self, host, qtype):
+        n = len(RESOLVERS)
+        order = [RESOLVERS[(self._start_idx + i) % n] for i in range(n)]
+        self._start_idx = (self._start_idx + 1) % n
+        query = dnsmsg.encode_query(host, qtype)
+        last_err = None
+        for name, dns_host, ip in order:
+            try:
+                t0 = time.time()
+                conn = _DoHConn(ip, dns_host, chunk=max(1, self.chunk))
+                try:
+                    resp = conn.request(dns_host, query)
+                finally:
+                    conn.close()
+                if not resp:
+                    raise ResolveError("empty response")
+                rcode, answers = dnsmsg.parse_response(resp)
+                self.log.debug(f"DoH {name}: {host} rcode={rcode} in {time.time()-t0:.2f}s")
+                if rcode == 3:
+                    raise VerifiedNegative(f"{host}: NXDOMAIN (verified via DoH {name})")
+                if rcode != 0:
+                    last_err = f"{name}: rcode {rcode}"
+                    continue
+                ips = dnsmsg.extract_ips(answers, qtype)
+                ttl = _min_ttl(answers) or 120
+                if not ips and answers:
+                    # CNAME chain: retry once against the final alias
+                    for (_n, t, _ttl, v) in answers:
+                        if t == 5:
+                            follow = dnsmsg.encode_query(v, qtype)
+                            conn2 = _DoHConn(ip, dns_host, chunk=max(1, self.chunk))
+                            try:
+                                resp2 = conn2.request(dns_host, follow)
+                            finally:
+                                conn2.close()
+                            _rc, ans2 = dnsmsg.parse_response(resp2)
+                            if _rc == 3:
+                                raise VerifiedNegative(f"{host}: NXDOMAIN (verified via DoH {name})")
+                            ips = dnsmsg.extract_ips(ans2, qtype)
+                            ttl = _min_ttl(ans2) or ttl
+                            break
+                with self._lock:
+                    self.verbose_stats[name] = self.verbose_stats.get(name, 0) + 1
+                if ips:
+                    return ips, ttl
+            except VerifiedNegative:
+                raise
+            except (OSError, ResolveError, ValueError, ssl.SSLError) as exc:
+                last_err = f"{name}: {exc}"
+                self.log.debug(f"DoH {name} failed: {exc}")
+        if last_err:
+            self.log.warn(f"DoH failed for {host}: {last_err}")
+        return [], 120
+
+    def _via_tcp_dns(self, host, qtype):
+        query = dnsmsg.encode_query(host, qtype)
+        for ip in TCP_DNS_FALLBACKS:
+            try:
+                with socket.create_connection((ip, 53), timeout=4) as s:
+                    s.sendall(struct.pack(">H", len(query)) + query)
+                    ln = s.recv(2)
+                    if len(ln) < 2:
+                        continue
+                    need = int.from_bytes(ln, "big")
+                    resp = b""
+                    while len(resp) < need:
+                        part = s.recv(4096)
+                        if not part:
+                            break
+                        resp += part
+                rcode, answers = dnsmsg.parse_response(resp)
+                if rcode == 3:
+                    raise VerifiedNegative(f"{host}: NXDOMAIN (verified via TCP DNS {ip})")
+                ips = dnsmsg.extract_ips(answers, qtype)
+                if ips:
+                    self.log.debug(f"TCP DNS {ip}: {host} -> {ips[0]}")
+                    return ips, (_min_ttl(answers) or 120)
+            except (OSError, ValueError) as exc:
+                self.log.debug(f"TCP DNS {ip} failed: {exc}")
+        return [], 120
+
+    def _via_udp_dns(self, host, qtype):
+        query = dnsmsg.encode_query(host, qtype)
+        for ip in UDP_DNS_LAST_RESORT:
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.settimeout(3)
+                s.sendto(query, (ip, 53))
+                resp, _ = s.recvfrom(4096)
+                s.close()
+                rcode, answers = dnsmsg.parse_response(resp)
+                # NXDOMAIN over plaintext UDP is NOT trusted (may be injected)
+                if rcode != 0:
+                    continue
+                ips = dnsmsg.extract_ips(answers, qtype)
+                if ips:
+                    self.log.debug(f"UDP DNS {ip}: {host} -> {ips[0]}")
+                    return ips, (_min_ttl(answers) or 120)
+            except OSError as exc:
+                self.log.debug(f"UDP DNS {ip} failed: {exc}")
+        return [], 120
+
+    def _via_system(self, host, qtype):
+        try:
+            family = socket.AF_INET6 if qtype == dnsmsg.TYPE_AAAA else socket.AF_INET
+            infos = socket.getaddrinfo(host, None, family, socket.SOCK_STREAM)
+            seen = []
+            for info in infos:
+                ip = info[4][0]
+                if ip not in seen:
+                    seen.append(ip)
+            return seen, 60
+        except OSError:
+            return [], 120
+
+    def clear_cache(self):
+        with self._lock:
+            self._cache.clear()
+            self._neg_cache.clear()
+
+
+def _min_ttl(answers):
+    """Smallest TTL among A/AAAA records in a parsed answer set."""
+    ttls = [ttl for (_n, t, ttl, _v) in answers if t in (dnsmsg.TYPE_A, dnsmsg.TYPE_AAAA)]
+    return min(ttls) if ttls else None
+
+
+def _is_ip(host):
+    for family in (socket.AF_INET, socket.AF_INET6):
+        try:
+            socket.inet_pton(family, host)
+            return True
+        except (OSError, ValueError):
+            continue
+    return False

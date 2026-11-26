@@ -1,0 +1,10 @@
+# build artifacts
+build/
+dist/
+*.spec
+__pycache__/
+*.pyc
+
+# runtime data
+proxy_backup.json
+restore.cmd
