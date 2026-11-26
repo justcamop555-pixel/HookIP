@@ -142,12 +142,34 @@ def restore_from_file(path=BACKUP_PATH):
     return True
 
 
-def apply_manual(port):
+def bypass_patterns(excluded):
+    """Translate HookIP excluded patterns into WinINET ProxyOverride
+    entries: bare dotted domains match both the domain and its subdomains."""
+    parts = []
+    for p in (excluded or []):
+        p = str(p).strip().lower().rstrip(".")
+        if not p or p.startswith("#") or "/" in p:
+            continue
+        if p.startswith("*."):
+            parts.append(p)
+        elif "." in p and not p.replace(".", "").isdigit():
+            parts.append(p)
+            parts.append(f"*.{p}")
+        else:
+            parts.append(p)
+    return parts
+
+
+def apply_manual(port, bypass=None):
     backup()
+    override = LOCAL_PROXY_OVERRIDE
+    extra = bypass_patterns(bypass)
+    if extra:
+        override += ";" + ";".join(extra)
     vals = {
         "ProxyEnable": 1,
         "ProxyServer": f"127.0.0.1:{port}",
-        "ProxyOverride": LOCAL_PROXY_OVERRIDE,
+        "ProxyOverride": override,
         "AutoConfigURL": None,
     }
     _write(vals)
@@ -164,16 +186,20 @@ def apply_pac(port, token):
     _write(vals)
 
 
-def apply_both(port, token):
+def apply_both(port, token, bypass=None):
     """Manual proxy AND PAC at once: every app that honours either
     mechanism now goes through HookIP. Both point at the same local
     listener, so there is no conflict — this simply widens coverage to
     apps that ignore one of the two settings."""
     backup()
+    override = LOCAL_PROXY_OVERRIDE
+    extra = bypass_patterns(bypass)
+    if extra:
+        override += ";" + ";".join(extra)
     vals = {
         "ProxyEnable": 1,
         "ProxyServer": f"127.0.0.1:{port}",
-        "ProxyOverride": LOCAL_PROXY_OVERRIDE,
+        "ProxyOverride": override,
         "AutoConfigURL": f"http://127.0.0.1:{port}/{token}.pac",
     }
     _write(vals)

@@ -1,6 +1,7 @@
 """HookIP desktop app (tkinter, dark theme)."""
 import os
 import queue
+import re
 import secrets
 import socket
 import ssl
@@ -15,7 +16,7 @@ from tkinter import ttk, messagebox, filedialog
 from . import __version__, APP_NAME
 from . import dnsmsg
 from . import logutil
-from .config import Config, SETTINGS_PATH
+from .config import Config, SETTINGS_PATH, DEFAULTS
 from .logutil import Log
 from .proxy import ProxyServer, Stats
 from .tooltips import Tooltip
@@ -173,6 +174,28 @@ class App:
 
     # -- update check ----------------------------------------------------
     UPDATE_REPO = "justcamop555-pixel/HookIP"
+
+    def _parse_excluded(self):
+        """Read the excluded-domains box: trimmed, lowercased, deduped,
+        tolerant of pasted URLs (https://sub.example.com/ → sub.example.com)
+        and of comment lines."""
+        out, seen = [], set()
+        for ln in self.excl_text.get("1.0", "end").splitlines():
+            ln = ln.strip().lower()
+            if not ln or ln.startswith("#"):
+                continue
+            ln = re.sub(r"^[a-z0-9+.-]+://", "", ln)      # strip scheme
+            ln = ln.split("/")[0].split("?")[0].split("@")[-1]
+            ln = ln.strip(". ")                            # stray dots
+            if ln and ln not in seen:
+                seen.add(ln)
+                out.append(ln)
+        return out
+
+    def _reset_excluded(self):
+        self.excl_text.delete("1.0", "end")
+        self.excl_text.insert("1.0", "\n".join(DEFAULTS["excluded"]))
+        self.log.info("Excluded domains reset to defaults (applied on next Start).")
 
     def check_updates(self):
         self.update_label.configure(text="checking…", fg=MUTED)
@@ -516,19 +539,31 @@ class App:
         self.update_label.pack(side="left", padx=10)
         add_row("Updates", upd, 8)
 
-        tk.Label(setf, text="Excluded domains (one per line, wildcards allowed).\n"
-                            "These sites connect without fragmentation — useful for\n"
-                            "banking apps or anything that dislikes modified handshakes.",
-                 bg=PANEL, fg=MUTED, justify="left").pack(anchor="w", pady=(10, 2))
+        row = tk.Frame(setf, bg=PANEL)
+        tk.Label(row, text="Excluded domains (one per line, wildcards allowed).\n"
+                           "These sites skip HookIP completely — useful for\n"
+                           "banking apps or anything that dislikes modified\n"
+                           "handshakes.",
+                 bg=PANEL, fg=MUTED, justify="left").pack(side="left")
+        rb = tk.Button(row, text="Reset defaults", command=self._reset_excluded,
+                       bg="#202634", fg=FG, bd=0, padx=8, pady=2,
+                       activebackground="#2a3244", activeforeground=FG,
+                       cursor="hand2")
+        rb.pack(side="right")
+        Tooltip(rb, "Put the excluded list back to the default entries.")
+        row.pack(fill="x", pady=(10, 2))
         self.excl_text = tk.Text(setf, bg="#0d1017", fg=FG, insertbackground=FG,
                                  font=("Consolas", 9), height=5)
         self.excl_text.insert("1.0", "\n".join(self.cfg.excluded))
         self.excl_text.pack(fill="x")
         self.set_widgets.append(self.excl_text)
         Tooltip(self.excl_text,
-                "Domains that bypass HookIP entirely (one per line, wildcards\n"
-                "like *.example.com are allowed). Useful for banking apps or\n"
-                "anything that dislikes modified handshakes.")
+                "Domains that skip HookIP completely, in every proxy mode:\n"
+                "they are added to the Windows bypass list (manual) or served\n"
+                "as DIRECT (PAC/both). One per line; wildcards like\n"
+                "*.example.com are allowed; lines starting with # are ignored.\n"
+                "Handy for banking apps, games with anti-cheat, or captive\n"
+                "portals that dislike modified handshakes.")
         tk.Label(setf, text=f"Settings file: {SETTINGS_PATH}",
                  bg=PANEL, fg=MUTED).pack(anchor="w", pady=(8, 0))
 
@@ -708,8 +743,7 @@ class App:
             cfg.verbose = self.verbose_var.get()
             cfg.remember = self.remember_var.get()
             cfg.minimize_to_tray = self.tray_var.get()
-            cfg.excluded = [ln.strip() for ln in self.excl_text.get("1.0", "end").splitlines()
-                            if ln.strip()]
+            cfg.excluded = self._parse_excluded()
             self.log.verbose = cfg.verbose
         except ValueError:
             self.log.error("Invalid port or fragment size.")
@@ -728,11 +762,11 @@ class App:
         try:
             self.log.info("Current system proxy: " + winproxy.describe(winproxy.read_current()))
             if cfg.proxy_mode == "manual":
-                winproxy.apply_manual(cfg.port)
+                winproxy.apply_manual(cfg.port, bypass=cfg.excluded)
             elif cfg.proxy_mode == "pac":
                 winproxy.apply_pac(cfg.port, self.pac_token)
             else:
-                winproxy.apply_both(cfg.port, self.pac_token)
+                winproxy.apply_both(cfg.port, self.pac_token, bypass=cfg.excluded)
             self.watchdog.start(cfg.port)
             winproxy.set_runonce()
             self.log.ok("System proxy configured. Crash protection active.")
