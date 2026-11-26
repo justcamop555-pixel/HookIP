@@ -88,10 +88,14 @@ def _load_app_icon():
     except Exception:
         pass
     try:
-        paths = [os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        proj = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        paths = [os.path.join(proj, "assets", "hookip.ico"),
+                 os.path.join(proj, "hookip.ico"),          # legacy layout
+                 os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               "hookip.ico")]
         if getattr(sys, "frozen", False):
             paths.insert(0, os.path.join(sys._MEIPASS, "hookip.ico"))
+            paths.insert(0, os.path.join(sys._MEIPASS, "assets", "hookip.ico"))
         for p in paths:
             IMAGE_ICON, LR_LOADFROMFILE = 1, 0x0010
             _user32.LoadImageW.restype = wintypes.HANDLE

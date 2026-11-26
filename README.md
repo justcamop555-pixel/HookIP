@@ -91,6 +91,20 @@ python run_hookip.py
 Run `packaging\build_exe.bat` (or `python -m PyInstaller --onefile --windowed run_hookip.py`) —
 PyInstaller bundles everything into a single portable binary.
 
+### Project layout
+
+```
+HookIP/
+├── HookIP.exe              ← the runnable build (only on machines that built it)
+├── run_hookip.py           ← entry point (source)
+├── hookip/                 ← the application package (proxy, DoH, UI, tray, …)
+├── assets/                 ← icon + artwork
+├── packaging/              ← PyInstaller build script + version info
+├── install.ps1             ← one-line installer
+├── LICENSE                 ← MIT
+└── README.md
+```
+
 ## 🔧 Settings
 
 | Setting | Default | What it does |

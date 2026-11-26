@@ -1,6 +1,6 @@
 @echo off
 rem Builds the portable HookIP_<arch>.exe with PyInstaller.
-rem Make sure hookip.ico exists in the project root before building.
+rem Make sure assets\hookip.ico exists before building.
 setlocal
 cd /d "%~dp0.."
 
@@ -12,9 +12,9 @@ if /i "%PROCESSOR_ARCHITECTURE%"=="ARM64" set ARCH=ARM64
 
 python -m PyInstaller --onefile --windowed --clean ^
   --name "HookIP_%ARCH%" ^
-  --icon hookip.ico ^
+  --icon assets\hookip.ico ^
   --version-file packaging\version_info.txt ^
-  --add-data "hookip.ico;." ^
+  --add-data "assets\hookip.ico;assets" ^
   --hidden-import hookip ^
   --hidden-import hookip.app ^
   --hidden-import hookip.config ^

@@ -73,7 +73,7 @@ class App:
         root.minsize(760, 560)
         root.configure(bg=BG)
         try:
-            root.iconbitmap(resource_path("hookip.ico"))
+            root.iconbitmap(resource_path(os.path.join("assets", "hookip.ico")))
         except (tk.TclError, OSError):
             pass
         self._style()
