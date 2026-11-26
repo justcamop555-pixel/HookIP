@@ -144,9 +144,19 @@ class App:
                             pass
         except queue.Empty:
             pass
+        except Exception as exc:  # noqa: BLE001 — never stop the UI pump;
+            # only a real shutdown may end it (a stray RuntimeError used to
+            # kill the pump silently — the app then looked alive but deaf)
+            if getattr(self, "_closing", None) and self._closing.is_set():
+                return
+            try:
+                self.log.error(f"UI pump error: {exc}")
+            except Exception:
+                pass
+        try:
+            self.root.after(150, self._pump_ui)
         except (tk.TclError, RuntimeError):
             return
-        self.root.after(150, self._pump_ui)
 
     def _pump_tray(self):
         try:
@@ -162,9 +172,17 @@ class App:
                     return
         except queue.Empty:
             pass
+        except Exception as exc:  # noqa: BLE001 — never stop the tray pump
+            if getattr(self, "_closing", None) and self._closing.is_set():
+                return
+            try:
+                self.log.error(f"tray pump error: {exc}")
+            except Exception:
+                pass
+        try:
+            self.root.after(120, self._pump_tray)
         except (tk.TclError, RuntimeError):
             return
-        self.root.after(120, self._pump_tray)
 
     def _tray_menu(self, x, y):
         menu = tk.Menu(self.root, tearoff=0)
@@ -751,8 +769,17 @@ class App:
                 if self.diag_tree.yview()[1] >= 0.99:
                     self.diag_tree.see(iid)   # Treeview.see() needs an item id, not "end"
             self.root.after(200, self._pump_diag)
-        except (tk.TclError, RuntimeError):
-            return   # window closing
+        except Exception as exc:  # noqa: BLE001 — never stop the diag pump
+            if getattr(self, "_closing", None) and self._closing.is_set():
+                return
+            try:
+                self.log.error(f"diagnostics pump error: {exc}")
+            except Exception:
+                pass
+            try:
+                self.root.after(200, self._pump_diag)
+            except (tk.TclError, RuntimeError):
+                return
 
     def _stat_card(self, parent, key, label, initial):
         card = tk.Frame(parent, bg="#1b2130", padx=14, pady=10)
@@ -872,6 +899,7 @@ class App:
         self.log.info(f"Starting proxy on 127.0.0.1:{cfg.port} …")
         try:
             self.proxy = ProxyServer(cfg, self.log, self.stats, self.pac_token)
+            self.proxy.on_accept_death = self._on_accept_death
             self.proxy.start()
         except OSError as exc:
             self.log.error(f"Cannot bind port {cfg.port}: {exc}")
@@ -908,6 +936,45 @@ class App:
                       f"Proxy running on 127.0.0.1:{cfg.port}.\n"
                       "Close (X) hides to the tray; Stop restores your "
                       "internet.")
+
+    def _on_accept_death(self):
+        """The listener died while Windows still points at it — without this
+        hook the user's internet would be broken and the app would still say
+        'Running'. Emergency: restore the original proxy settings NOW."""
+        try:
+            self.log.error("Proxy listener died unexpectedly — restoring your "
+                           "internet immediately.")
+            notify.notify("HookIP — proxy crashed",
+                          "The proxy stopped unexpectedly; your original "
+                          "internet settings were restored.", timeout_s=12)
+            self._emergency_restore()
+        except Exception:
+            pass
+
+    def _emergency_restore(self):
+        """Stop everything and put Windows back on the user's own settings,
+        even if the proxy object is half-dead."""
+        self.running = False
+        try:
+            if self.proxy:
+                try:
+                    self.proxy.stop()
+                except Exception:
+                    pass
+            self.proxy = None
+            try:
+                self.watchdog.stop()
+                winproxy.clear_runonce()
+            except Exception:
+                pass
+            if winproxy.has_backup():
+                winproxy.restore_from_file()
+            else:
+                winproxy.remove_proxy()
+            self.log.ok("Emergency restore done — internet is back.")
+        except Exception as exc:
+            self.log.error(f"Emergency restore failed: {exc}")
+        self._set_running_ui(False)
 
     def stop_proxy(self, tell_user=True):
         if not self.running:
@@ -1011,8 +1078,19 @@ class App:
             if lines > 2500:
                 self.log_text.delete("1.0", f"{lines - 2000}.0")
             self.root.after(250, self._pump_log)
-        except (tk.TclError, RuntimeError):
-            return   # window closing
+        except Exception as exc:  # noqa: BLE001 — never stop the log pump;
+            # only a real shutdown may end it (stray RuntimeErrors used to
+            # kill the pump silently, freezing the log)
+            if getattr(self, "_closing", None) and self._closing.is_set():
+                return
+            try:
+                self.log.error(f"log pump error: {exc}")
+            except Exception:
+                pass
+            try:
+                self.root.after(250, self._pump_log)
+            except (tk.TclError, RuntimeError):
+                return
 
     def _apply_log_filter(self):
         names = ["Everything", "Info and above", "Warnings and above", "Errors only"]
@@ -1080,6 +1158,21 @@ class App:
             bv.configure(text=str(blocked), fg=bv._lit if blocked else bv._normal)
             self.dash_vars["down"].configure(text=self._fmt_bytes(down))
             self.dash_vars["up"].configure(text=self._fmt_bytes(up))
+            # crash protection must never silently vanish: the watchdog is a
+            # separate process and can die without anyone noticing
+            if self.running:
+                if not self.watchdog.alive():
+                    self._wd_restarts = getattr(self, "_wd_restarts", 0) + 1
+                    if self._wd_restarts <= 3:
+                        try:
+                            self.watchdog.start(self.cfg.port)
+                            self.log.warn("Watchdog died — restarted "
+                                          "automatically (crash protection "
+                                          "was unprotected).")
+                        except OSError:
+                            pass
+                else:
+                    self._wd_restarts = 0
             self._draw_spark()
             top = self.stats.top_domains()
             key = str(top)
@@ -1090,16 +1183,30 @@ class App:
                 for host, conns, bup, bdown in top:
                     self.dom_tree.insert("", "end", values=(
                         host, conns, self._fmt_bytes(bup), self._fmt_bytes(bdown)))
+        except Exception as exc:  # noqa: BLE001 — one bad frame must not
+            # permanently kill the dashboard (it would freeze silently)
+            if getattr(self, "_closing", None) and self._closing.is_set():
+                return
+            try:
+                self.log.error(f"dashboard refresh error: {exc}")
+            except Exception:
+                pass
+        try:
+            self.root.after(500, self._refresh_dashboard)
         except (tk.TclError, RuntimeError):
-            return   # window closing
-        self.root.after(500, self._refresh_dashboard)
+            return
 
     def _draw_spark(self):
         self.spark.delete("all")
         w = max(50, self.spark.winfo_width() - 8)
         h = self.spark.winfo_height() - 8
         samples = list(self.stats.samples)[-180:]
-        if len(samples) < 2:
+        if not self.running:
+            self.spark.create_text(
+                w // 2, max(12, h // 2), text="stopped — live traffic appears here",
+                fill=MUTED, font=("Segoe UI", 9))
+            return
+        if len(samples) < 2 or h <= 14:
             return
         peak = max((max(u, d) for u, d in samples), default=1.0) or 1.0
         step = w / max(1, len(samples) - 1)
@@ -1116,7 +1223,15 @@ class App:
 
         line(0, ACCENT)     # up
         line(1, OK)         # down
-        self.spark.create_text(10, 12, anchor="w", text=f"peak {self._fmt_bytes(peak)}/s",
+        # live rate right now (last sample)
+        if samples:
+            u_now, d_now = samples[-1]
+            self.spark.create_text(
+                10, 12, anchor="w",
+                text=f"now ↓{self._fmt_bytes(d_now)}/s  ↑{self._fmt_bytes(u_now)}/s",
+                fill=FG, font=("Segoe UI", 8))
+        self.spark.create_text(w - 10, 12, anchor="e",
+                               text=f"peak {self._fmt_bytes(peak)}/s",
                                fill=MUTED, font=("Segoe UI", 8))
 
     @staticmethod

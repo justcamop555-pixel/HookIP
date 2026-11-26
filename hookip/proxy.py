@@ -123,6 +123,7 @@ class ProxyServer:
         self.pac_token = pac_token
         self.resolver = Resolver(cfg, log, chunk=cfg.fragment_size)
         self._strat_pref = {}                 # host -> strategy that last worked
+        self.on_accept_death = None           # app hook: emergency restore
         self._blocked_seen = {}               # host -> last 'blocked/dead' log ts
         self._lsock = None
         self._accept_thread = None
@@ -185,31 +186,55 @@ class ProxyServer:
 
     # ------------------------------------------------------------------
     def _accept_loop(self):
-        while self.running:
-            try:
-                csock, _addr = self._lsock.accept()
-            except OSError:
-                # transient errors (e.g. a client resetting mid-connect) must
-                # not kill the accept loop; only stop when we closed the listener
-                if self.running and self._lsock and self._lsock.fileno() != -1:
-                    time.sleep(0.05)
-                    continue
-                break
-            with self._conns_lock:
-                self._conns.add(csock)
-            if not self._conn_limit.acquire(blocking=False):
-                with self._conns_lock:
-                    self._conns.discard(csock)
+        # HARDENED: the listener dying silently is the worst failure mode —
+        # Windows keeps pointing traffic at a port nobody serves and the
+        # user's internet breaks while the app looks 'Running'. Per-connection
+        # errors are contained; anything that kills the loop anyway triggers
+        # the emergency callback so the system proxy is restored at once.
+        try:
+            while self.running:
                 try:
-                    csock.sendall(b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n")
+                    csock, _addr = self._lsock.accept()
                 except OSError:
-                    pass
+                    # transient errors (e.g. a client resetting mid-connect)
+                    # must not kill the accept loop; only stop when we closed
+                    # the listener
+                    if self.running and self._lsock and self._lsock.fileno() != -1:
+                        time.sleep(0.05)
+                        continue
+                    break
                 try:
-                    csock.close()
-                except OSError:
+                    with self._conns_lock:
+                        self._conns.add(csock)
+                    if not self._conn_limit.acquire(blocking=False):
+                        with self._conns_lock:
+                            self._conns.discard(csock)
+                        try:
+                            csock.sendall(b"HTTP/1.1 503 Service Unavailable\r\n"
+                                          b"Connection: close\r\n\r\n")
+                        except OSError:
+                            pass
+                        try:
+                            csock.close()
+                        except OSError:
+                            pass
+                        continue
+                    threading.Thread(target=self._handle, args=(csock,),
+                                     daemon=True).start()
+                except Exception as exc:      # noqa: BLE001 — never kill the loop
+                    self.log.error(f"connection accept failed: {exc}")
+                    with self._conns_lock:
+                        self._conns.discard(csock)
+                    try:
+                        csock.close()
+                    except OSError:
+                        pass
+        finally:
+            if self.running and self.on_accept_death:
+                try:
+                    self.on_accept_death()
+                except Exception:
                     pass
-                continue
-            threading.Thread(target=self._handle, args=(csock,), daemon=True).start()
 
     def _tick_loop(self):
         while self.running:
