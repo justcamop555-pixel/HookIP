@@ -31,6 +31,8 @@ _k32.OpenProcess.restype = wt.HANDLE
 _k32.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
 _k32.SetEvent.argtypes = [wt.HANDLE]
 _k32.SetEvent.restype = wt.BOOL
+_k32.ResetEvent.argtypes = [wt.HANDLE]
+_k32.ResetEvent.restype = wt.BOOL
 _k32.WaitForSingleObject.argtypes = [wt.HANDLE, wt.DWORD]
 _k32.WaitForSingleObject.restype = wt.DWORD
 _k32.CloseHandle.argtypes = [wt.HANDLE]
@@ -375,8 +377,17 @@ class Watchdog:
     def start(self, port):
         self.stop()
         pid = os.getpid()
-        self.event_name = f"HookIP_Stop_{pid}_{port}"
+        # BUGFIX: the stop-event is manual-reset and a clean stop() SIGNALS
+        # it. CreateEventW on the same name returned that still-signaled
+        # event, so every watchdog spawned AFTER a stop→start cycle saw the
+        # stop flag at birth and exited instantly — crash protection was
+        # silently gone for the whole session. Unique name per start + an
+        # explicit reset both prevent it.
+        self._start_count = getattr(self, "_start_count", 0) + 1
+        self.event_name = f"HookIP_Stop_{pid}_{port}_{self._start_count}"
         self._event = _k32.CreateEventW(None, True, False, self.event_name)
+        if self._event:
+            _k32.ResetEvent(self._event)
         backup, ppid, event = BACKUP_PATH, str(pid), self.event_name
         if getattr(sys, "frozen", False):
             # packaged exe: the exe itself understands --hookip-watchdog

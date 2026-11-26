@@ -13,7 +13,7 @@ RESOLVERS = [
     ("Cloudflare", "cloudflare-dns.com", "1.1.1.1"),
     ("Google", "dns.google", "8.8.8.8"),
     ("AdGuard", "dns.adguard-dns.com", "94.140.14.14"),
-    ("Quad9", "dns.quad9.net", "9.9.9.9"),
+    ("ControlD", "freedns.controld.com", "76.76.2.11"),
 ]
 TCP_DNS_FALLBACKS = ["1.1.1.1", "8.8.8.8", "9.9.9.9"]
 UDP_DNS_LAST_RESORT = ["1.1.1.1", "8.8.8.8"]
@@ -116,6 +116,7 @@ class _DoHConn:
             f"Host: {host}\r\n"
             "Content-Type: application/dns-message\r\n"
             "Accept: application/dns-message\r\n"
+            "Accept-Encoding: identity\r\n"
             f"Content-Length: {len(payload)}\r\n"
             f"Connection: {conn_hdr}\r\n\r\n"
         ).encode("ascii")
