@@ -139,6 +139,9 @@ class ProxyServer:
         self._conns = set()
         self._fails = {}                      # host -> expiry (recent full-failure)
         self._fails_lock = threading.Lock()
+        self._tunnel_detail = {}              # host -> (strategy, dns_ms, conn_ms, segs, total_ms)
+        self._detail_lock = threading.Lock()
+        self._cut_seen = {}                   # host -> ts (mid-transfer cut dedupe)
         self._conns_lock = threading.Lock()
         self._conn_limit = threading.BoundedSemaphore(MAX_CONNECTIONS)
         self.running = False
@@ -506,6 +509,7 @@ class ProxyServer:
             raise ClientAbortError(f"{host}:{port} client sent no data (browser preconnect)")
 
         last_err = None
+        attempt_errors = []
         for attempt, strategy in enumerate(strategies):
             try:
                 ssock = self._tunnel_once(csock, host, port, strategy, first, excl)
@@ -519,10 +523,12 @@ class ProxyServer:
                 # re-fragmenting the ClientHello cannot make a name resolve,
                 # so retrying strategies is pure waste — stop after one
                 last_err = exc
+                attempt_errors.append(f"{strategy}: {exc}")
                 self.log.debug(f"{host}: attempt {attempt+1} ({strategy}) failed: {exc}")
                 break
             except (OSError, ResolveError) as exc:
                 last_err = exc
+                attempt_errors.append(f"{strategy}: {exc}")
                 self.log.debug(f"{host}: attempt {attempt+1} ({strategy}) failed: {exc}")
                 if excl:
                     break
@@ -538,8 +544,8 @@ class ProxyServer:
             # resolver's own verdict (classified as blocked/dead upstream)
             raise last_err
         raise OSError(
-            f"{host}:{port} failed — all {len(strategies)} strategies "
-            f"tried ({', '.join(strategies)}); last error: {last_err}")
+            f"{host}:{port} failed — all {len(strategies)} strategies tried "
+            f"({'; '.join(attempt_errors)})")
 
     def _connect_parallel(self, ips, port, timeout=3.0):
         """Happy Eyeballs (RFC 8305-style) with STAGGERED attempts: the first
@@ -592,29 +598,33 @@ class ProxyServer:
         raise OSError(f"all {len(candidates)} addresses failed ({last})")
 
     def _tunnel_once(self, csock, host, port, strategy, first, exclude_frag=False):
+        t0 = time.time()
         try:
             ips = self.resolver.resolve(host)
         except ResolveError:
             # re-raise unwrapped: DNS-level failures cannot be fixed by
             # re-fragmenting, so _tunnel must see them to skip the retries
             raise
+        dns_ms = (time.time() - t0) * 1000
+        t1 = time.time()
         try:
             server = self._connect_parallel(ips, port, timeout=3.0)
         except OSError as exc:
             kind = "timed out" if "timed out" in str(exc) else "refused/unreachable"
             raise OSError(
                 f"{host}:{port} could not connect ({len(ips)} address(es) tried, {kind})") from exc
+        conn_ms = (time.time() - t1) * 1000
         server.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
         try:
             frag = (first[:1] == b"\x16") and not exclude_frag
             if frag:
                 chunks = tlsfrag.fragment(first, strategy, self.cfg.fragment_size)
-                self.log.debug(f"{host}: {strategy} fragment, {len(chunks)} segments")
             elif first:
                 chunks = [first]
             else:
                 chunks = []
+            t2 = time.time()
             for chunk in chunks:
                 server.sendall(chunk)
 
@@ -624,19 +634,33 @@ class ProxyServer:
                 # (Any error here propagates — swallowing it would relay on a
                 # dead socket instead of retrying.)
                 r, _, _ = select.select([server], [], [], 1.5)
+                probe_ms = (time.time() - t2) * 1000
                 if r:
                     probe = server.recv(1, socket.MSG_PEEK)
                     if probe == b"":
                         raise OSError(
                             f"{host}:{port} server closed right after ClientHello "
                             f"(possible DPI reset)")
+            else:
+                probe_ms = 0.0
         except OSError:
             try:
                 server.close()
             except OSError:
                 pass
             raise
-
+        # detailed per-connection tunnel record (DEBUG + diagnostics)
+        total_ms = (time.time() - t0) * 1000
+        nseg = len(chunks) if frag else 0
+        self.log.debug(
+            f"{host}:{port} tunnel up via {strategy} in {total_ms:.0f}ms "
+            f"(dns {dns_ms:.0f}ms · connect {conn_ms:.0f}ms · "
+            f"{nseg} fragment{'s' if nseg != 1 else ''} · "
+            f"hello-probe {probe_ms:.0f}ms)")
+        with self._detail_lock:
+            if len(self._tunnel_detail) > 256:
+                self._tunnel_detail.clear()
+            self._tunnel_detail[host] = (strategy, dns_ms, conn_ms, nseg, total_ms)
         self._relay(csock, server, host)
         return server
 
@@ -699,8 +723,17 @@ class ProxyServer:
                 f"{host} upstream died mid-connection "
                 f"({up} B sent, {down} B received back)")
         if outcome == "server":
-            self.log.warn(f"{host} upstream cut the connection mid-transfer "
-                          f"({down} B received before the cut)")
+            key = host
+            now_s = time.time()
+            if len(self._cut_seen) > 500:
+                self._cut_seen.clear()
+            if now_s - self._cut_seen.get(key, 0) > 30:
+                self._cut_seen[key] = now_s
+                self.log.warn(f"{host} upstream cut the connection mid-transfer "
+                              f"({down} B received before the cut)")
+            else:
+                self.log.debug(f"{host} upstream cut mid-transfer "
+                               f"({down} B) — repeat within 30s, suppressed")
         return outcome
 
     # ------------------------------------------------------------------

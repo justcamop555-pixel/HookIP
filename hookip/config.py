@@ -27,7 +27,31 @@ class Config:
     def __init__(self, data=None):
         self._data = dict(DEFAULTS)
         if data:
-            self._data.update({k: v for k, v in data.items() if k in DEFAULTS})
+            clean = {k: v for k, v in data.items() if k in DEFAULTS}
+            self._data.update(self._sanitize(clean))
+
+    @staticmethod
+    def _sanitize(clean):
+        """Type-check loaded settings: a hand-edited (or corrupt) settings.json
+        must not put a string into cfg.port or a string into the excluded
+        LIST (which used to explode into single characters in the editor box)."""
+        if not isinstance(clean.get("port"), int) or not (1 <= clean["port"] <= 65535):
+            clean["port"] = DEFAULTS["port"]
+        if not isinstance(clean.get("fragment_size"), int) or not (1 <= clean["fragment_size"] <= 255):
+            clean["fragment_size"] = DEFAULTS["fragment_size"]
+        if clean.get("strategy") not in ("smart", "chunk", "random"):
+            clean["strategy"] = DEFAULTS["strategy"]
+        if clean.get("proxy_mode") not in ("manual", "pac", "both"):
+            clean["proxy_mode"] = DEFAULTS["proxy_mode"]
+        for k in ("doh_enabled", "verbose", "remember", "minimize_to_tray"):
+            if not isinstance(clean.get(k), bool):
+                clean[k] = DEFAULTS[k]
+        if not isinstance(clean.get("excluded"), list) or \
+                not all(isinstance(x, str) for x in clean["excluded"]):
+            clean["excluded"] = list(DEFAULTS["excluded"])
+        if not isinstance(clean.get("pac_token"), str):
+            clean["pac_token"] = DEFAULTS["pac_token"]
+        return clean
 
     # -- dict-style access ------------------------------------------------
     def __getattr__(self, name):

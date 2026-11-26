@@ -1678,7 +1678,7 @@ class App:
             self._diag_result("Tunnel test", "skipped", "start the proxy first", "info")
             return
         ok_count = 0
-        sites = ("github.com", "wikipedia.org")
+        sites = ("github.com", "wikipedia.org", "www.gnu.org")
         for site in sites:
             t0 = time.time()
             try:
@@ -1713,6 +1713,16 @@ class App:
         n = len(sites) + 2
         self._diag_result("Tunnel summary", f"{ok_count}/{n} passed", "",
                           "ok" if ok_count == n else ("warn" if ok_count else "fail"))
+        # last-tunnel detail straight from the running proxy
+        if self.proxy:
+            with self.proxy._detail_lock:
+                detail = dict(self.proxy._tunnel_detail)
+            if detail:
+                best = sorted(detail.items(), key=lambda kv: kv[1][4])[:3]
+                self._diag_result("Last tunnels", "info",
+                                  " · ".join(f"{h.split('.')[0]} {v[4]:.0f}ms via {v[0]} "
+                                             f"(dns {v[1]:.0f}+conn {v[2]:.0f}ms, {v[3]} seg)"
+                                             for h, v in best), "info")
 
     def _big_head_test(self):
         """Plain-HTTP request with a Steam-sized Cookie head (~40 KB).
@@ -1774,8 +1784,12 @@ class App:
         self.log.info("Diagnostic report copied to clipboard.")
 
     def _tunnel_test(self, host, port):
-        """Drive a real CONNECT + TLS handshake through our own proxy."""
+        """Drive a real CONNECT + TLS handshake through our own proxy.
+        Returns the response line PLUS a timing breakdown (CONNECT / TLS /
+        first byte) so a slow stage is visible in diagnostics."""
         local_port = self.cfg.port if self.running else int(self.port_var.get())
+        t_connect = t_tls = t_ttfb = 0.0
+        t0 = time.time()
         with socket.create_connection(("127.0.0.1", local_port), timeout=10) as s:
             s.sendall(f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}\r\n\r\n".encode())
             resp = b""
@@ -1784,15 +1798,21 @@ class App:
                 if not part:
                     raise OSError("proxy closed")
                 resp += part
+            t_connect = time.time() - t0
             if b" 200 " not in resp.split(b"\r\n", 1)[0]:
                 raise OSError(resp.split(b"\r\n", 1)[0].decode(errors="replace"))
+            t1 = time.time()
             ctx = ssl.create_default_context()
             tls = ctx.wrap_socket(s, server_hostname=host)
+            t_tls = time.time() - t1
             try:
                 tls.sendall(b"GET / HTTP/1.1\r\nHost: " + host.encode() +
                             b"\r\nConnection: close\r\n\r\n")
                 data = tls.recv(512)
-                return data.split(b"\r\n", 1)[0].decode(errors="replace")
+                t_ttfb = time.time() - t1
+                line = data.split(b"\r\n", 1)[0].decode(errors="replace")
+                return (f"{line} · connect {t_connect:.2f}s · tls {t_tls:.2f}s · "
+                        f"first byte {t_ttfb:.2f}s")
             finally:
                 tls.close()
 

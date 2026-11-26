@@ -254,6 +254,7 @@ class Resolver:
         pool instead of serializing behind one TLS session; a new connection
         is created while slots are free."""
         while True:
+            new_conn = None
             with self._pool_lock:
                 conns = [c for c in self._pool.get(name, []) if c.healthy()]
                 # drop dead entries
@@ -265,30 +266,35 @@ class Resolver:
                     if conn._reqlock.acquire(blocking=False):
                         return conn
                 if len(conns) < self._pool_max:
-                    try:
-                        conn = _DoHConn(ip, dns_host,
-                                        chunk=max(1, self.chunk), keepalive=True)
-                    except (OSError, ResolveError, ssl.SSLError):
-                        raise
+                    need_new = True
                 else:
-                    conn = None
-            if conn is None:
-                # all slots busy and pool full — wait for the first conn
-                with self._pool_lock:
-                    conns = self._pool.get(name, [])
-                    fallback = conns[0] if conns else None
-                if fallback is None or not fallback._reqlock.acquire(timeout=4):
-                    continue          # race: slot freed or conn died — re-scan
-                if not fallback.healthy():
-                    fallback._reqlock.release()
-                    self._drop_doh_session(name, fallback)
-                    continue
-                return fallback
-            if conn._reqlock.acquire(blocking=False):
-                with self._pool_lock:
-                    self._pool.setdefault(name, []).append(conn)
-                return conn
-            conn.close()
+                    need_new = False
+            # CONFLICT FIX: connection setup (TCP+TLS, up to ~3.5 s) must NOT
+            # happen while holding _pool_lock — every other resolver's checkout
+            # would stall behind it. Create outside, register after.
+            if need_new:
+                try:
+                    new_conn = _DoHConn(ip, dns_host,
+                                        chunk=max(1, self.chunk), keepalive=True)
+                except (OSError, ResolveError, ssl.SSLError):
+                    raise
+                if new_conn._reqlock.acquire(blocking=False):
+                    with self._pool_lock:
+                        self._pool.setdefault(name, []).append(new_conn)
+                    return new_conn
+                new_conn.close()      # someone else filled the slot meanwhile
+                continue
+            # all slots busy and pool full — wait for the first conn
+            with self._pool_lock:
+                conns = self._pool.get(name, [])
+                fallback = conns[0] if conns else None
+            if fallback is None or not fallback._reqlock.acquire(timeout=4):
+                continue          # race: slot freed or conn died — re-scan
+            if not fallback.healthy():
+                fallback._reqlock.release()
+                self._drop_doh_session(name, fallback)
+                continue
+            return fallback
 
     def _release_doh(self, conn):
         conn._reqlock.release()
@@ -552,12 +558,19 @@ class Resolver:
     def _via_udp_dns(self, host, qtype):
         query = dnsmsg.encode_query(host, qtype)
         for ip in UDP_DNS_LAST_RESORT:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                 s.settimeout(3)
                 s.sendto(query, (ip, 53))
                 resp, _ = s.recvfrom(4096)
+            except OSError as exc:
+                # FIX: the old version leaked one UDP socket per timeout/error
+                # (close() was only on the success path)
                 s.close()
+                self.log.debug(f"UDP DNS {ip} failed: {exc}")
+                continue
+            s.close()
+            try:
                 rcode, answers = dnsmsg.parse_response(resp)
                 # NXDOMAIN over plaintext UDP is NOT trusted (may be injected)
                 if rcode != 0:
@@ -566,8 +579,8 @@ class Resolver:
                 if ips:
                     self.log.debug(f"UDP DNS {ip}: {host} -> {ips[0]}")
                     return ips, (_min_ttl(answers) or 120)
-            except OSError as exc:
-                self.log.debug(f"UDP DNS {ip} failed: {exc}")
+            except ValueError as exc:
+                self.log.debug(f"UDP DNS {ip}: unparseable response ({exc})")
         return [], 120
 
     def _via_system(self, host, qtype):

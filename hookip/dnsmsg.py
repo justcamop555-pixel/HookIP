@@ -26,6 +26,8 @@ def _read_name(data, off):
                 end = off + 1
             break
         if length & 0xC0 == 0xC0:
+            if off + 1 >= len(data):
+                raise ValueError("truncated pointer")
             ptr = ((length & 0x3F) << 8) | data[off + 1]
             if end is None:
                 end = off + 2     # caller resumes after the 2-byte pointer
@@ -40,7 +42,18 @@ def _read_name(data, off):
 
 
 def parse_response(data):
-    """Return (rcode, answers) where answers = [(name, type, ttl, value_str)]."""
+    """Return (rcode, answers) where answers = [(name, type, ttl, value_str)].
+    Malformed/truncated input raises ValueError — never IndexError/struct.error
+    (a hostile or corrupt answer must not crash a resolver thread)."""
+    try:
+        return _parse_response_inner(data)
+    except ValueError:
+        raise
+    except (IndexError, struct.error):
+        raise ValueError("malformed DNS message")
+
+
+def _parse_response_inner(data):
     if len(data) < 12:
         raise ValueError("short DNS message")
     qd, an, _ns, _ar = struct.unpack(">HHHH", data[4:12])
@@ -48,13 +61,19 @@ def parse_response(data):
     off = 12
     for _ in range(qd):
         _name, off = _read_name(data, off)
+        if off + 4 > len(data):
+            raise ValueError("truncated question")
         off += 4
     answers = []
     for _ in range(an):
         name, off = _read_name(data, off)
+        if off + 10 > len(data):
+            raise ValueError("truncated record header")
         rtype, _rclass, ttl, rdlen = struct.unpack(">HHIH", data[off:off + 10])
         off += 10
         rdata = data[off:off + rdlen]
+        if len(rdata) < rdlen:
+            raise ValueError("truncated record data")
         off += rdlen
         if rtype == TYPE_A and rdlen == 4:
             answers.append((name, rtype, ttl, ".".join(str(b) for b in rdata)))
