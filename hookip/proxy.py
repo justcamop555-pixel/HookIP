@@ -236,7 +236,13 @@ class ProxyServer:
             if isinstance(exc, ValueError):
                 self.log.warn(f"Malformed request from client: {exc or 'unparseable target'}")
             else:
-                self.log.warn(f"{exc}")   # messages are host:port-complete by design
+                msg = f"{exc}"
+                if "no addresses for" in msg:
+                    # NODATA answers (e.g. Windows' ipv6.msftconnecttest.com
+                    # probes) are normal, not proxy failures
+                    self.log.info(f"{msg}")
+                else:
+                    self.log.warn(msg)   # messages are host:port-complete by design
         finally:
             if opened:
                 self.stats.conn_close(failed)

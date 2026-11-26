@@ -17,6 +17,15 @@ RESOLVERS = [
 TCP_DNS_FALLBACKS = ["1.1.1.1", "8.8.8.8", "9.9.9.9"]
 UDP_DNS_LAST_RESORT = ["1.1.1.1", "8.8.8.8"]
 
+SINKHOLE_ADDRESSES = {"0.0.0.0", "::"}
+
+
+def is_sinkhole(ip):
+    """Ad/tracker-blocking resolvers answer blocked names with a sinkhole
+    address (0.0.0.0, ::) — treat those as 'no answer', not as a real
+    destination."""
+    return ip in SINKHOLE_ADDRESSES or ip.startswith("127.") or ip == "::1"
+
 
 class ResolveError(Exception):
     pass
@@ -265,6 +274,15 @@ class Resolver:
                 self._neg_cache[host] = now + neg_ttl
             raise ResolveError(verified_neg or f"no addresses for {host}")
 
+        blocked = [ip for ip in ips if is_sinkhole(ip)]
+        if blocked:
+            ips = [ip for ip in ips if not is_sinkhole(ip)]
+            self.log.debug(f"resolve {host}: dropped sinkhole answer(s) {', '.join(blocked)}")
+            if not ips:
+                with self._lock:
+                    self._neg_cache[host] = now + 60
+                raise ResolveError(f"no addresses for {host} (all resolvers returned a sinkhole)")
+
         ttl = min(300, max(10, int(ttl)))
         with self._lock:
             self._cache[host] = (now + ttl, list(ips))
@@ -301,6 +319,16 @@ class Resolver:
                     continue
                 ips = dnsmsg.extract_ips(answers, qtype)
                 ttl = _min_ttl(answers) or 120
+                blocked = [ip for ip in ips if is_sinkhole(ip)]
+                if blocked:
+                    ips = [ip for ip in ips if not is_sinkhole(ip)]
+                    self.log.debug(
+                        f"DoH {name}: {host} returned a sinkhole/blocked answer "
+                        f"({', '.join(blocked)}) — "
+                        + ("trying next resolver" if not ips else "using remaining addresses"))
+                    if not ips:
+                        last_err = f"{name}: blocked (sinkhole)"
+                        continue
                 if not ips and answers:
                     # CNAME chain: follow the final alias on the same pooled session
                     for (_n, t, _ttl, v) in answers:
