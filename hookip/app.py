@@ -56,7 +56,13 @@ class App:
         self.log.attach_file(self._log_file)
         self._hook_exception_logging()
         self.stats = Stats()
-        self.pac_token = secrets.token_hex(8)
+        self.pac_token = self.cfg.pac_token or secrets.token_hex(8)
+        if self.cfg.pac_token != self.pac_token:
+            self.cfg.pac_token = self.pac_token
+            try:
+                self.cfg.save()
+            except OSError:
+                pass
         self.proxy = None
         self.running = False
         self.watchdog = winproxy.Watchdog()
@@ -462,12 +468,14 @@ class App:
 
         self.mode_var = tk.StringVar(value=self.cfg.proxy_mode)
         mode_c = ttk.Combobox(grid, textvariable=self.mode_var, width=12,
-                              state="readonly", values=["manual", "pac"])
+                              state="readonly", values=["manual", "pac", "both"])
         add_row("System proxy mode", mode_c, 3)
         Tooltip(mode_c,
-                "manual = point Windows straight at HookIP (most apps obey).\n"
-                "pac = hand apps a proxy-autoconfig script — use it if some\n"
-                "app ignores the manual proxy. Restore internet works with both.")
+                "How Windows is pointed at HookIP:\n"
+                "manual = fixed proxy setting (most apps obey).\n"
+                "pac = proxy-autoconfig script (some apps prefer it).\n"
+                "both = set both at once — the widest app coverage,\n"
+                "since both point at the same HookIP listener.")
 
         self.doh_var = tk.BooleanVar(value=self.cfg.doh_enabled)
         doh_c = ttk.Checkbutton(grid, text="Use DNS-over-HTTPS (recommended)",
@@ -721,8 +729,10 @@ class App:
             self.log.info("Current system proxy: " + winproxy.describe(winproxy.read_current()))
             if cfg.proxy_mode == "manual":
                 winproxy.apply_manual(cfg.port)
-            else:
+            elif cfg.proxy_mode == "pac":
                 winproxy.apply_pac(cfg.port, self.pac_token)
+            else:
+                winproxy.apply_both(cfg.port, self.pac_token)
             self.watchdog.start(cfg.port)
             winproxy.set_runonce()
             self.log.ok("System proxy configured. Crash protection active.")

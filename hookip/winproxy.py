@@ -164,6 +164,21 @@ def apply_pac(port, token):
     _write(vals)
 
 
+def apply_both(port, token):
+    """Manual proxy AND PAC at once: every app that honours either
+    mechanism now goes through HookIP. Both point at the same local
+    listener, so there is no conflict — this simply widens coverage to
+    apps that ignore one of the two settings."""
+    backup()
+    vals = {
+        "ProxyEnable": 1,
+        "ProxyServer": f"127.0.0.1:{port}",
+        "ProxyOverride": LOCAL_PROXY_OVERRIDE,
+        "AutoConfigURL": f"http://127.0.0.1:{port}/{token}.pac",
+    }
+    _write(vals)
+
+
 LOCAL_PROXY_OVERRIDE = ("localhost;127.*;192.168.*;10.*;172.16.*;172.17.*;172.18.*;"
                         "172.19.*;172.20.*;172.21.*;172.22.*;172.23.*;172.24.*;"
                         "172.25.*;172.26.*;172.27.*;172.28.*;172.29.*;172.30.*;"

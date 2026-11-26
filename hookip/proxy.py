@@ -122,6 +122,7 @@ class ProxyServer:
         self.stats = stats
         self.pac_token = pac_token
         self.resolver = Resolver(cfg, log, chunk=cfg.fragment_size)
+        self._strat_pref = {}                 # host -> strategy that last worked
         self._lsock = None
         self._accept_thread = None
         self._ticker = None
@@ -338,9 +339,40 @@ class ProxyServer:
             return None, "", {}
 
     def _serve_pac(self, csock):
+        # direct (bypass) rules: local ranges plus the user's excluded list,
+        # so domains HookIP would not touch never even enter the proxy
+        rules = ["isPlainHostName(host)", "shExpMatch(host,'localhost')",
+                 "shExpMatch(host,'127.*')", "shExpMatch(host,'10.*')",
+                 "shExpMatch(host,'192.168.*')",
+                 "shExpMatch(host,'172.16.*')", "shExpMatch(host,'172.17.*')",
+                 "shExpMatch(host,'172.18.*')", "shExpMatch(host,'172.19.*')",
+                 "shExpMatch(host,'172.20.*')", "shExpMatch(host,'172.21.*')",
+                 "shExpMatch(host,'172.22.*')", "shExpMatch(host,'172.23.*')",
+                 "shExpMatch(host,'172.24.*')", "shExpMatch(host,'172.25.*')",
+                 "shExpMatch(host,'172.26.*')", "shExpMatch(host,'172.27.*')",
+                 "shExpMatch(host,'172.28.*')", "shExpMatch(host,'172.29.*')",
+                 "shExpMatch(host,'172.30.*')", "shExpMatch(host,'172.31.*')"]
+
+        def esc(p):
+            return p.replace("\\", "\\\\").replace("'", "\\'")
+
+        for pat in (self.cfg.excluded or []):
+            pat = esc(str(pat).strip().lower())
+            if not pat:
+                continue
+            if pat.startswith("*."):
+                host = pat[2:]
+                rules.append(f"shExpMatch(host,'*.{host}')")
+                rules.append(f"dnsDomainIs(host, '{host}')")   # bare domain too
+            elif "." in pat:
+                rules.append(f"dnsDomainIs(host, '{pat}')")
+                rules.append(f"host == '{pat}'")
+            else:
+                rules.append(f"shExpMatch(host,'{pat}')")
         pac = (
             "function FindProxyForURL(url, host) {\n"
-            "  if (isPlainHostName(host) || shExpMatch(host,'localhost') || shExpMatch(host,'127.*')) return 'DIRECT';\n"
+            "  host = host.toLowerCase();\n"
+            f"  if ({' || '.join(rules)}) return 'DIRECT';\n"
             "  return 'PROXY 127.0.0.1:%d; DIRECT';\n"
             "}\n" % self.cfg.port
         ).encode()
@@ -353,7 +385,11 @@ class ProxyServer:
     def _tunnel(self, csock, host, port):
         self.stats.conn_open(host)
         excl = is_excluded(host, self.cfg.excluded)
-        strategies = [self.cfg.strategy]
+        # order: remembered winner for this host first, then the configured
+        # default, then the rest — connections after a DPI fight start with
+        # what actually worked last time
+        pref = self._strat_pref.get(host)
+        strategies = [s for s in (pref, self.cfg.strategy) if s]
         for alt in ("smart", "chunk", "random"):
             if alt not in strategies:
                 strategies.append(alt)
@@ -399,7 +435,9 @@ class ProxyServer:
         last_err = None
         for attempt, strategy in enumerate(strategies):
             try:
-                return self._tunnel_once(csock, host, port, strategy, first, excl)
+                ssock = self._tunnel_once(csock, host, port, strategy, first, excl)
+                self._strat_pref[host] = strategy
+                return ssock
             except ResolveError as exc:
                 # DNS-level failure (NXDOMAIN / SERVFAIL / sinkhole-only):
                 # re-fragmenting the ClientHello cannot make a name resolve,

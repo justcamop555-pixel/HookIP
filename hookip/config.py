@@ -13,10 +13,11 @@ DEFAULTS = {
     "strategy": "smart",          # smart | chunk | random
     "doh_enabled": True,
     "verbose": False,
-    "proxy_mode": "manual",       # manual | pac
+    "proxy_mode": "manual",       # manual | pac | both
     "excluded": ["localhost", "*.local", "*.lan", "127.0.0.1"],
     "remember": True,
     "minimize_to_tray": True,
+    "pac_token": "",              # stable PAC URL token (generated once)
 }
 
 

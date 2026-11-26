@@ -100,14 +100,19 @@ def fragment(data, strategy="smart", chunk_size=2):
             parts.append(head[i:i + size])
             i += size
     else:  # "smart": keep everything before the SNI hostname intact,
-        # then send the hostname itself in tiny segments.
+        # then send the hostname itself in tiny segments. Sizes vary per
+        # connection (1..n bytes) so consecutive connections do not share
+        # one identical segment fingerprint.
         s, e = info["sni_start"], info["sni_end"]
         if s is None:
             parts = [head[i:i + n] for i in range(0, len(head), n)]
         else:
             parts = [head[:s]] if s else []
-            for i in range(s, e, n):
-                parts.append(head[i:min(i + n, e)])
+            i = s
+            while i < e:
+                size = random.randint(1, n) if n > 1 else 1
+                parts.append(head[i:min(i + size, e)])
+                i += size
             if e < len(head):
                 parts.append(head[e:])
     if rest:
