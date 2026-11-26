@@ -3,6 +3,7 @@ import os
 import secrets
 import socket
 import ssl
+import sys
 import threading
 import time
 import tkinter as tk
@@ -26,6 +27,12 @@ FG = "#e6edf3"
 MUTED = "#8b949e"
 
 
+def resource_path(name):
+    """Locate a bundled data file (works frozen under PyInstaller and from source)."""
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    return os.path.join(base, name)
+
+
 class App:
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -44,6 +51,10 @@ class App:
         root.geometry("880x640")
         root.minsize(760, 560)
         root.configure(bg=BG)
+        try:
+            root.iconbitmap(resource_path("hookip.ico"))
+        except (tk.TclError, OSError):
+            pass
         self._style()
         self._build()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -399,11 +410,15 @@ class App:
             self.dash_vars["down"].configure(text=self._fmt_bytes(down))
             self.dash_vars["up"].configure(text=self._fmt_bytes(up))
             self._draw_spark()
-            for iid in self.dom_tree.get_children():
-                self.dom_tree.delete(iid)
-            for host, conns, bup, bdown in self.stats.top_domains():
-                self.dom_tree.insert("", "end", values=(
-                    host, conns, self._fmt_bytes(bup), self._fmt_bytes(bdown)))
+            top = self.stats.top_domains()
+            key = str(top)
+            if key != getattr(self, "_last_top", None):
+                self._last_top = key
+                for iid in self.dom_tree.get_children():
+                    self.dom_tree.delete(iid)
+                for host, conns, bup, bdown in top:
+                    self.dom_tree.insert("", "end", values=(
+                        host, conns, self._fmt_bytes(bup), self._fmt_bytes(bdown)))
         except (tk.TclError, RuntimeError):
             return   # window closing
         self.root.after(500, self._refresh_dashboard)
@@ -524,11 +539,14 @@ class App:
 
     # ------------------------------------------------------------------
     def _startup_restore_check(self):
-        """Power-loss / crash leftovers: restore saved settings and inform."""
+        """Power-loss / crash leftovers: restore saved settings and inform.
+        The backup file only exists if we ran before, so a leftover
+        127.0.0.1 proxy is ours with near-certainty (could also be a stale
+        port from an older version)."""
         if winproxy.has_backup():
             cur = winproxy.read_current()
             proxy_str = f"{cur.get('ProxyServer') or ''}{cur.get('AutoConfigURL') or ''}"
-            if "127.0.0.1" in proxy_str and (f":{self.cfg.port}" in proxy_str or ".pac" in proxy_str):
+            if "127.0.0.1" in proxy_str:
                 if winproxy.restore_from_file():
                     winproxy.clear_runonce()
                     self.log.ok("Recovered system-proxy settings from a previous session.")

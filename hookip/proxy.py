@@ -10,7 +10,7 @@ from collections import deque
 from . import tlsfrag
 from .doh import Resolver, ResolveError
 
-LOCAL_OVERRIDES = "localhost;127.*;192.168.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;172.2?.*;172.30.*;172.31.*;<local>"
+MAX_CONNECTIONS = 256
 
 
 class Stats:
@@ -87,6 +87,16 @@ def is_excluded(host, patterns):
     return False
 
 
+def _set_keepalive(sock, idle=30, interval=5):
+    """Aggressive TCP keepalive so a silently-dropped connection (NAT/DPI)
+    surfaces as an error instead of a zombie relay."""
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        sock.ioctl(socket.SIO_KEEPALIVE_VALS, (1, idle * 1000, interval * 1000))
+    except OSError:
+        pass
+
+
 class ProxyServer:
     """Threaded proxy on 127.0.0.1:<port>."""
 
@@ -101,6 +111,7 @@ class ProxyServer:
         self._ticker = None
         self._conns = set()
         self._conns_lock = threading.Lock()
+        self._conn_limit = threading.BoundedSemaphore(MAX_CONNECTIONS)
         self.running = False
 
     # ------------------------------------------------------------------
@@ -153,6 +164,18 @@ class ProxyServer:
                 break
             with self._conns_lock:
                 self._conns.add(csock)
+            if not self._conn_limit.acquire(blocking=False):
+                with self._conns_lock:
+                    self._conns.discard(csock)
+                try:
+                    csock.sendall(b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n")
+                except OSError:
+                    pass
+                try:
+                    csock.close()
+                except OSError:
+                    pass
+                continue
             threading.Thread(target=self._handle, args=(csock,), daemon=True).start()
 
     def _tick_loop(self):
@@ -207,6 +230,7 @@ class ProxyServer:
             if opened:
                 self.stats.conn_close(failed)
             self._forget(csock)
+            self._conn_limit.release()
             for s in (csock, ssock):
                 if s:
                     try:
@@ -267,6 +291,7 @@ class ProxyServer:
             strategies = [strategies[0]]   # excluded hosts: single attempt, no retry noise
 
         csock.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+        csock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
         # Sniff the client's first flight (normally the TLS ClientHello) ONCE.
         # Strategy retries reuse this captured data — the client cannot resend.
@@ -283,6 +308,9 @@ class ProxyServer:
             if tlsfrag.hello_needed(first) == 0:
                 break
         csock.settimeout(None)
+        if not first:
+            # client connected but sent nothing — close instead of relaying air
+            raise OSError("client sent no data")
 
         last_err = None
         for attempt, strategy in enumerate(strategies):
@@ -295,18 +323,50 @@ class ProxyServer:
                     break
         raise OSError(f"{host}: tunnel failed ({last_err})")
 
+    def _connect_parallel(self, ips, port, timeout=3.0):
+        """Race connection attempts to several addresses at once (Happy
+        Eyeballs). An unreachable first IP no longer costs its full serial
+        timeout — the fastest reachable address wins."""
+        socks = []
+        errors = []
+        lock = threading.Lock()
+        won = threading.Event()
+
+        def attempt(ip):
+            try:
+                s = socket.create_connection((ip, port), timeout=timeout)
+                with lock:
+                    if won.is_set():
+                        s.close()
+                        return
+                    socks.append(s)
+                    won.set()
+            except OSError as exc:
+                with lock:
+                    errors.append(exc)
+
+        candidates = ips[:4]
+        threads = [threading.Thread(target=attempt, args=(ip,), daemon=True) for ip in candidates]
+        for t in threads:
+            t.start()
+        deadline = time.time() + timeout + 0.5
+        while not won.is_set() and time.time() < deadline:
+            time.sleep(0.02)
+            if not any(t.is_alive() for t in threads) and not socks:
+                break
+        won.set()
+        if socks:
+            # winner found — do NOT wait for losing attempts to finish; a hung
+            # connect on a dead IP would otherwise delay the return (measured 2s)
+            return socks[0]
+        for t in threads:
+            t.join(timeout=0.5)
+        last = errors[-1] if errors else "timeout"
+        raise OSError(f"all {len(candidates)} addresses failed ({last})")
+
     def _tunnel_once(self, csock, host, port, strategy, first, exclude_frag=False):
         ips = self.resolver.resolve(host)
-        server = None
-        last_err = None
-        for ip in ips[:4]:
-            try:
-                server = socket.create_connection((ip, port), timeout=8)
-                break
-            except OSError as exc:
-                last_err = exc
-        if server is None:
-            raise OSError(f"cannot reach {host}: {last_err}")
+        server = self._connect_parallel(ips, port, timeout=3.0)
         server.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
         try:
@@ -344,6 +404,8 @@ class ProxyServer:
     def _relay(self, csock, server, host):
         up = down = 0
         sockets = [csock, server]
+        _set_keepalive(csock)
+        _set_keepalive(server)
         try:
             while self.running:
                 r, _, _ = select.select(sockets, [], [], 30)
@@ -385,16 +447,15 @@ class ProxyServer:
         self.stats.conn_open(host)
         path = "/" + (rest[1].split("/", 1)[1] if "/" in rest[1] else "")
         ips = self.resolver.resolve(host)
-        server = None
-        for ip in ips[:4]:
+        try:
+            server = self._connect_parallel(ips, port, timeout=3.0)
+        except OSError:
             try:
-                server = socket.create_connection((ip, port), timeout=8)
-                break
+                csock.sendall(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n")
             except OSError:
-                continue
-        if server is None:
-            csock.sendall(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n")
-            return None
+                pass
+            raise
+        server.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         server.settimeout(30)
         # rebuild request without proxy headers
         out = [f"{method} {path} HTTP/1.1"]
