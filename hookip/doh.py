@@ -21,6 +21,20 @@ UDP_DNS_LAST_RESORT = ["1.1.1.1", "8.8.8.8"]
 
 SINKHOLE_ADDRESSES = {"0.0.0.0", "::"}
 
+# one shared SSL context for ALL DoH connections: create_default_context
+# reloads the Windows CA store on EVERY call (tens of ms); contexts are
+# thread-safe for wrap_bio
+_SSL_CTX = None
+_SSL_CTX_LOCK = threading.Lock()
+
+
+def _ssl_context():
+    global _SSL_CTX
+    with _SSL_CTX_LOCK:
+        if _SSL_CTX is None:
+            _SSL_CTX = ssl.create_default_context()
+    return _SSL_CTX
+
 
 def is_sinkhole(ip):
     """Ad/tracker-blocking resolvers answer blocked names with a sinkhole
@@ -28,10 +42,9 @@ def is_sinkhole(ip):
     destination. Canonicalizes first so every textual form of :: or 0.0.0.0
     is caught (e.g. 0:0:0:0:0:0:0:0)."""
     try:
-        import socket as _s
         if ":" in ip:
-            return _s.inet_pton(_s.AF_INET6, ip) == _s.inet_pton(_s.AF_INET6, "::")
-        return _s.inet_pton(_s.AF_INET, ip) == _s.inet_pton(_s.AF_INET, "0.0.0.0")
+            return socket.inet_pton(socket.AF_INET6, ip) == socket.inet_pton(socket.AF_INET6, "::")
+        return socket.inet_pton(socket.AF_INET, ip) == socket.inet_pton(socket.AF_INET, "0.0.0.0")
     except (OSError, ValueError):
         pass
     return ip in SINKHOLE_ADDRESSES or ip.startswith("127.") or ip == "::1"
@@ -57,7 +70,7 @@ class _DoHConn:
         self.sock = socket.create_connection((ip, 443), timeout=timeout)
         self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self.sock.settimeout(timeout)
-        ctx = ssl.create_default_context()
+        ctx = _ssl_context()
         self._bio_in = ssl.MemoryBIO()
         self._bio_out = ssl.MemoryBIO()
         self.ssl = ctx.wrap_bio(self._bio_in, self._bio_out, server_hostname=host)
@@ -68,12 +81,22 @@ class _DoHConn:
         self._reqlock = threading.Lock()   # one query at a time on this conn
 
     def _frag_send(self, data, chunk):
-        if chunk <= 1:
+        """chunk >= 1 fragments (1-byte segments at chunk=1); chunk < 1
+        (0 — what _handshake passes for non-first flights) sends whole."""
+        if chunk < 1:
             self.sock.sendall(data)
             return
+        # cap the first flight at ~64 sendall calls: chunk=1 on a
+        # multi-KB ClientHello would otherwise mean thousands of tiny
+        # syscalls (each a separate TCP push). Raising the effective
+        # chunk size keeps the first record split across segments
+        # without hundreds of syscalls.
+        eff = chunk
+        if len(data) > 64 * eff:
+            eff = -(-len(data) // 64)          # ceil(len/64)
         i = 0
         while i < len(data):
-            size = min(chunk, len(data) - i)
+            size = min(eff, len(data) - i)
             self.sock.sendall(data[i:i + size])
             i += size
 
@@ -249,41 +272,60 @@ class Resolver:
         self._pool = {}                       # resolver name -> [_DoHConn, ...]
         self._pool_lock = threading.Lock()
         self._pool_max = profile().doh_pool_per_resolver  # hardware-scaled
+        self._pending = {}                    # resolver -> conns being created
+                                              # (slot reserved pre-creation;
+                                              # guarded by _pool_lock)
 
     def _doh_session(self, name, dns_host, ip):
         """Check out a pooled keep-alive connection with its per-connection
         lock HELD (release it after request() finishes via _release_doh).
         Parallel lookups to different hosts use different connections in the
         pool instead of serializing behind one TLS session; a new connection
-        is created while slots are free."""
+        is created while slots are free (a slot is RESERVED under the lock
+        before creation, so a burst of N parallel lookups can never open N
+        TLS sessions to one resolver)."""
         while True:
             new_conn = None
+            reserved = False
             with self._pool_lock:
-                conns = [c for c in self._pool.get(name, []) if c.healthy()]
-                # drop dead entries
-                for c in self._pool.get(name, []):
-                    if c not in conns:
-                        c.close()
+                pool = self._pool.get(name, [])
+                conns = []
+                stale = []
+                for c in pool:
+                    # FIX: never treat a CHECKED-OUT connection as stale —
+                    # healthy() keys off `used`, which another thread could
+                    # see as expired mid-request. A conn whose _reqlock is
+                    # held stays in the pool and is never closed here.
+                    if c.healthy() or self._lock_held(c):
+                        conns.append(c)
+                    else:
+                        stale.append(c)
                 self._pool[name] = conns
-                for conn in conns:
-                    if conn._reqlock.acquire(blocking=False):
-                        return conn
-                if len(conns) < self._pool_max:
-                    need_new = True
-                else:
-                    need_new = False
+            for c in stale:
+                c.close()
+            for conn in conns:
+                if conn._reqlock.acquire(blocking=False):
+                    conn.used = time.time()   # refresh at checkout
+                    return conn
+            if len(conns) + self._pending.get(name, 0) < self._pool_max:
+                self._pending[name] = self._pending.get(name, 0) + 1
+                reserved = True
             # CONFLICT FIX: connection setup (TCP+TLS, up to ~3.5 s) must NOT
             # happen while holding _pool_lock — every other resolver's checkout
-            # would stall behind it. Create outside, register after.
-            if need_new:
+            # would stall behind it. Create outside, register after (the
+            # slot was reserved under the lock BEFORE creating).
+            if reserved:
                 try:
                     new_conn = _DoHConn(ip, dns_host,
                                         chunk=max(1, self.chunk), keepalive=True)
-                except (OSError, ResolveError, ssl.SSLError):
-                    raise
+                finally:
+                    # reservation released whether creation succeeded or failed
+                    with self._pool_lock:
+                        self._pending[name] = max(0, self._pending.get(name, 1) - 1)
                 if new_conn._reqlock.acquire(blocking=False):
                     with self._pool_lock:
                         self._pool.setdefault(name, []).append(new_conn)
+                    new_conn.used = time.time()   # refresh at checkout
                     return new_conn
                 new_conn.close()      # someone else filled the slot meanwhile
                 continue
@@ -297,7 +339,16 @@ class Resolver:
                 fallback._reqlock.release()
                 self._drop_doh_session(name, fallback)
                 continue
+            fallback.used = time.time()           # refresh at checkout
             return fallback
+
+    def _lock_held(self, conn):
+        """True when conn._reqlock is currently held (in use by a lookup).
+        Non-blocking test — safe to call while holding _pool_lock."""
+        if conn._reqlock.acquire(blocking=False):
+            conn._reqlock.release()
+            return False
+        return True
 
     def _release_doh(self, conn):
         conn._reqlock.release()
@@ -367,8 +418,16 @@ class Resolver:
         try:
             if self.cfg.doh_enabled:
                 ips, ttl, doh_note = self._via_doh(host, qtype)
+            else:
+                ips, ttl, doh_note = [], 120, None
             if not ips:
-                ips, ttl = self._via_tcp_dns(host, qtype)
+                # a single unconfirmed DoH NXDOMAIN vote makes TCP DNS the
+                # second opinion (one agreeing server confirms it); with no
+                # DoH vote, two TCP servers must agree
+                ips, ttl = self._via_tcp_dns(
+                    host, qtype,
+                    doh_nx_vote=bool(doh_note
+                                     and doh_note.startswith("NXDOMAIN (unconfirmed")))
         except VerifiedNegative as exc:
             verified_neg = str(exc)
             ips, ttl = [], ttl
@@ -377,10 +436,12 @@ class Resolver:
         if not ips and verified_neg is None:
             ips, ttl = self._via_system(host, qtype)
         if not ips:
-            # A resolver that ANSWERED (rcode 0) but has no usable records is
-            # a trusted verdict: the name exists but has no A/AAAA addresses
-            # right now (NODATA). The old code discarded that and let the
-            # LAST resolver's SERVFAIL win, then cached the wrong reason.
+            # A resolver that ANSWERED (rcode 0) but has no usable records
+            # is a trusted verdict (NODATA). A single unconfirmed DoH
+            # NXDOMAIN vote is NOT — cache it briefly (60 s), not like a
+            # confirmed negative (300 s).
+            unconfirmed_nx = bool(verified_neg is None and doh_note
+                                  and doh_note.startswith("NXDOMAIN (unconfirmed"))
             if verified_neg is None and doh_note:
                 verified_neg = doh_note
             if verified_neg:
@@ -389,7 +450,7 @@ class Resolver:
                           if verified_neg.startswith(host + ": ") else verified_neg)
             else:
                 reason = "no addresses (DNS unreachable or dead domain)"
-            neg_ttl = 300 if verified_neg else 120
+            neg_ttl = 60 if unconfirmed_nx else (300 if verified_neg else 120)
             with self._lock:
                 self._neg_cache[host] = (now + neg_ttl, reason)
             if not verified_neg and self.cfg.doh_enabled:
@@ -403,7 +464,10 @@ class Resolver:
                         # the cached verdict from 'DNS unreachable' to the
                         # verified NODATA story
                         with self._lock:
-                            self._neg_cache[host] = (now + 300, note_aaaa)
+                            self._neg_cache[host] = (
+                                now + (60 if note_aaaa.startswith(
+                                    "NXDOMAIN (unconfirmed") else 300),
+                                note_aaaa)
                         reason = note_aaaa
                     if ips:
                         ips = [ip for ip in ips if not is_sinkhole(ip)]
@@ -471,91 +535,91 @@ class Resolver:
 
     def _via_doh(self, host, qtype):
         n = len(RESOLVERS)
-        order = [RESOLVERS[(self._start_idx + i) % n] for i in range(n)]
-        self._start_idx = (self._start_idx + 1) % n
+        with self._lock:
+            order = [RESOLVERS[(self._start_idx + i) % n] for i in range(n)]
+            self._start_idx = (self._start_idx + 1) % n
         # fastest first — measured latency beats fixed rotation
         order.sort(key=lambda r: self._lat.get(r[0], 1.0))
         query = dnsmsg.encode_query(host, qtype)
-        last_err = None
-        nodata = []           # resolvers that ANSWERED but have no records
         rec = "AAAA" if qtype == dnsmsg.TYPE_AAAA else "A"
-        for name, dns_host, ip in order:
-            conn = None
-            try:
-                t0 = time.time()
-                conn = self._doh_session(name, dns_host, ip)
-                try:
-                    resp = conn.request(dns_host, query)
-                except (OSError, ResolveError, ssl.SSLError, ValueError) as exc:
-                    # pooled session died (idle timeout, RST) — one fresh retry.
-                    # Release the checkout BEFORE dropping so a waiter on the
-                    # dying connection's lock is freed instead of stalling.
-                    self._release_doh(conn)
-                    self._drop_doh_session(name, conn)
-                    conn = None
-                    self.log.debug(f"DoH {name}: session dropped ({exc}), reconnecting")
-                    conn = self._doh_session(name, dns_host, ip)
-                    resp = conn.request(dns_host, query)
-                if not resp:
-                    raise ResolveError("empty response")
-                rcode, answers = dnsmsg.parse_response(resp)
-                dt = time.time() - t0
-                self._note_latency(name, dt, ok=True)
-                self.log.debug(f"DoH {name}: {host} rcode={rcode} in {dt:.2f}s")
-                if rcode == 3:
-                    raise VerifiedNegative(f"{host}: NXDOMAIN (verified via DoH {name})")
-                if rcode != 0:
-                    last_err = f"{name}: rcode {rcode}"
-                    continue
-                ips = dnsmsg.extract_ips(answers, qtype)
-                ttl = _min_ttl(answers) or 120
-                blocked = [ip for ip in ips if is_sinkhole(ip)]
-                if blocked:
-                    ips = [ip for ip in ips if not is_sinkhole(ip)]
-                    self.log.debug(
-                        f"DoH {name}: {host} returned a sinkhole/blocked answer "
-                        f"({', '.join(blocked)}) — "
-                        + ("trying next resolver" if not ips else "using remaining addresses"))
-                    if not ips:
-                        last_err = f"{name}: blocked (sinkhole)"
-                        continue
-                if not ips and answers:
-                    # CNAME chain: follow the final alias on the same pooled session
-                    for (_n, t, _ttl, v) in answers:
-                        if t == 5:
-                            follow = dnsmsg.encode_query(v, qtype)
-                            try:
-                                resp2 = conn.request(dns_host, follow)
-                            except (OSError, ResolveError, ssl.SSLError, ValueError):
-                                self._release_doh(conn)
-                                self._drop_doh_session(name, conn)
-                                conn = self._doh_session(name, dns_host, ip)
-                                resp2 = conn.request(dns_host, follow)
-                            _rc, ans2 = dnsmsg.parse_response(resp2)
-                            if _rc == 3:
-                                raise VerifiedNegative(f"{host}: NXDOMAIN (verified via DoH {name})")
-                            ips = dnsmsg.extract_ips(ans2, qtype)
-                            ttl = _min_ttl(ans2) or ttl
-                            break
-                with self._lock:
-                    self.verbose_stats[name] = self.verbose_stats.get(name, 0) + 1
-                if ips:
-                    return ips, ttl, None
-                # rcode 0 with no usable records: the name exists but has no
-                # address records right now (NODATA) — a TRUSTED verdict from
-                # this resolver (it spoke authoritatively over DoH)
-                nodata.append(name)
-                last_err = f"{name}: rcode 0 but no {rec} records (NODATA)"
-            except VerifiedNegative:
-                raise
-            except (OSError, ResolveError, ValueError, ssl.SSLError) as exc:
-                self._note_latency(name, time.time() - t0, ok=False)
-                last_err = f"{name}: {exc}"
-                self.log.debug(f"DoH {name} failed: {exc}")
-            finally:
-                if conn is not None:
-                    self._release_doh(conn)
+
+        # HEDGED execution: at most 2 resolver attempts in flight. The 2nd
+        # launches 0.4 s after the 1st if it has not answered (if DoH IPs
+        # are blocked, the old strict sequence burned ~14 s before TCP
+        # fallback). First usable answer wins; the rest are abandoned (their
+        # connections release/drop inside _doh_attempt, which runs to
+        # completion in its worker thread regardless).
+        holders = {}                      # idx -> [attempt result]
+        inflight = []                     # (idx, thread)
+        state = {"next": 0, "hedge_deadline": None}
+
+        def _launch(i):
+            name, dns_host, ip = order[i]
+            holders[i] = []
+            t = threading.Thread(
+                target=lambda: holders[i].append(
+                    self._doh_attempt(name, dns_host, ip, host, qtype, query)),
+                daemon=True)
+            inflight.append((i, t))
+            t.start()
+
+        result = None            # ('pos', ips, ttl) winner
+        verified = None          # CNAME-path VerifiedNegative message
+        nx_votes = []            # resolver names that voted NXDOMAIN
+        nodata = []
+        last_err = None
+        if n:
+            _launch(0)
+            state["next"] = 1
+            state["hedge_deadline"] = time.time() + 0.4
+        while result is None and verified is None and (inflight or state["next"] < n):
+            # keep up to 2 attempts in flight (2nd hedges 0.4 s behind the 1st)
+            if (len(inflight) < 2 and state["next"] < n
+                    and (len(inflight) == 0 or time.time() >= state["hedge_deadline"])):
+                _launch(state["next"])
+                state["next"] += 1
+                state["hedge_deadline"] = time.time() + 0.4
+                continue
+            if not inflight:
+                break
+            # wait a tick for any attempt to finish
+            done = None
+            for k, (_i, t2) in enumerate(inflight):
+                if not t2.is_alive():
+                    done = k
+                    break
+            if done is None:
+                time.sleep(0.02)
+                continue
+            _i, _t2 = inflight.pop(done)
+            res = holders[_i][0] if holders[_i] else ("err", f"{_i}: no result", None)
+            kind = res[0]
+            if kind == "pos":
+                result = res
+                break
+            if kind == "verified_neg":
+                verified = res[1]
+                break
+            if kind == "nx":
+                nx_votes.append(res[1])
+            elif kind == "nodata":
+                nodata.append(res[1])
+            else:
+                last_err = res[1]
+        if verified:
+            raise VerifiedNegative(verified)
+        if result:
+            return result[1], result[2], None
+
+        # NXDOMAIN is a VOTE, not an immediate verdict: one filtering
+        # resolver (AdGuard, ControlD) can NXDOMAIN a name the others
+        # resolve. Positive answers already won above; two DIFFERENT
+        # resolvers agreeing is a verified negative; a single vote stays
+        # unconfirmed and lets _via_tcp_dns act as the second opinion.
         note = None
+        if len(set(nx_votes)) >= 2:
+            raise VerifiedNegative(
+                f"{host}: NXDOMAIN (verified via DoH {', '.join(nx_votes)})")
         if nodata:
             # at least one resolver answered authoritatively: the name has no
             # usable address record right now — this is a real verdict, not a
@@ -566,6 +630,10 @@ class Resolver:
                     f"{', '.join(nodata)})")
             self.log.debug(f"DoH verdict for {host}: {note} "
                            f"(other resolvers: {last_err})")
+        elif nx_votes:
+            note = "NXDOMAIN (unconfirmed, single resolver)"
+            self.log.debug(f"DoH verdict for {host}: {note} "
+                           f"(other resolvers: {last_err})")
         elif last_err:
             # policy verdicts (sinkhole/empty) are expected for ad domains —
             # DEBUG keeps the detail without spamming WARN on every retry
@@ -574,8 +642,96 @@ class Resolver:
             getattr(self.log, level)(f"DoH failed for {host}: {last_err}")
         return [], 120, note
 
-    def _via_tcp_dns(self, host, qtype):
+    def _doh_attempt(self, name, dns_host, ip, host, qtype, query):
+        """One resolver attempt, fully self-contained (checkout, retries,
+        release). Returns ('pos', ips, ttl) | ('nx', name) | ('nodata', name)
+        | ('verified_neg', msg) | ('err', msg). Never raises (except nothing
+        escapes — failures come back as results)."""
+        conn = None
+        t0 = time.time()
+        try:
+            conn = self._doh_session(name, dns_host, ip)
+            try:
+                resp = conn.request(dns_host, query)
+            except (OSError, ResolveError, ssl.SSLError, ValueError) as exc:
+                # pooled session died (idle timeout, RST) — one fresh retry.
+                # Release the checkout BEFORE dropping so a waiter on the
+                # dying connection's lock is freed instead of stalling.
+                self._release_doh(conn)
+                self._drop_doh_session(name, conn)
+                conn = None
+                self.log.debug(f"DoH {name}: session dropped ({exc}), reconnecting")
+                conn = self._doh_session(name, dns_host, ip)
+                resp = conn.request(dns_host, query)
+            if not resp:
+                raise ResolveError("empty response")
+            rcode, answers = dnsmsg.parse_response(resp)
+            dt = time.time() - t0
+            self._note_latency(name, dt, ok=True)
+            self.log.debug(f"DoH {name}: {host} rcode={rcode} in {dt:.2f}s")
+            if rcode == 3:
+                return ("nx", name, None)
+            if rcode != 0:
+                return ("err", f"{name}: rcode {rcode}", None)
+            ips = dnsmsg.extract_ips(answers, qtype)
+            ttl = _min_ttl(answers) or 120
+            blocked = [ip2 for ip2 in ips if is_sinkhole(ip2)]
+            if blocked:
+                ips = [ip2 for ip2 in ips if not is_sinkhole(ip2)]
+                self.log.debug(
+                    f"DoH {name}: {host} returned a sinkhole/blocked answer "
+                    f"({', '.join(blocked)}) — "
+                    + ("trying next resolver" if not ips else "using remaining addresses"))
+                if not ips:
+                    return ("err", f"{name}: blocked (sinkhole)", None)
+            if not ips and answers:
+                # CNAME chain: follow the final alias on the same pooled session
+                for (_n, t, _ttl, v) in answers:
+                    if t == 5:
+                        follow = dnsmsg.encode_query(v, qtype)
+                        try:
+                            resp2 = conn.request(dns_host, follow)
+                        except (OSError, ResolveError, ssl.SSLError, ValueError):
+                            self._release_doh(conn)
+                            self._drop_doh_session(name, conn)
+                            conn = None     # FIX: cleared BEFORE reconnecting so
+                            # a reconnect failure can never double-release via
+                            # the finally below (the first retry path does this)
+                            conn = self._doh_session(name, dns_host, ip)
+                            resp2 = conn.request(dns_host, follow)
+                        _rc, ans2 = dnsmsg.parse_response(resp2)
+                        if _rc == 3:
+                            raise VerifiedNegative(
+                                f"{host}: NXDOMAIN (verified via DoH {name})")
+                        ips = dnsmsg.extract_ips(ans2, qtype)
+                        ttl = _min_ttl(ans2) or ttl
+                        break
+            with self._lock:
+                self.verbose_stats[name] = self.verbose_stats.get(name, 0) + 1
+            if ips:
+                return ("pos", ips, ttl)
+            # rcode 0 with no usable records: the name exists but has no
+            # address records right now (NODATA) — a TRUSTED verdict from
+            # this resolver (it spoke authoritatively over DoH)
+            return ("nodata", name, None)
+        except VerifiedNegative as exc:
+            return ("verified_neg", str(exc), None)
+        except (OSError, ResolveError, ValueError, ssl.SSLError) as exc:
+            self._note_latency(name, time.time() - t0, ok=False)
+            self.log.debug(f"DoH {name} failed: {exc}")
+            return ("err", f"{name}: {exc}", None)
+        finally:
+            if conn is not None:
+                self._release_doh(conn)
+
+    def _via_tcp_dns(self, host, qtype, doh_nx_vote=False):
+        """Plaintext DNS-over-TCP fallback. NXDOMAIN here is trusted only
+        as a SECOND OPINION: it confirms an existing DoH NXDOMAIN vote,
+        or (DoH disabled / unreachable, doh_nx_vote False) requires TWO
+        TCP servers to agree — a single plaintext port-53 answer is too
+        easy to inject."""
         query = dnsmsg.encode_query(host, qtype)
+        nx_seen = []
         for ip in TCP_DNS_FALLBACKS:
             try:
                 with socket.create_connection((ip, 53), timeout=4) as s:
@@ -592,7 +748,16 @@ class Resolver:
                         resp += part
                 rcode, answers = dnsmsg.parse_response(resp)
                 if rcode == 3:
-                    raise VerifiedNegative(f"{host}: NXDOMAIN (verified via TCP DNS {ip})")
+                    nx_seen.append(ip)
+                    if doh_nx_vote:
+                        # agrees with the DoH vote — confirmed
+                        raise VerifiedNegative(
+                            f"{host}: NXDOMAIN (verified via DoH + TCP DNS {ip})")
+                    if len(nx_seen) >= 2:
+                        raise VerifiedNegative(
+                            f"{host}: NXDOMAIN (verified via TCP DNS "
+                            f"{nx_seen[0]} + {nx_seen[1]})")
+                    continue
                 ips = dnsmsg.extract_ips(answers, qtype)
                 if ips:
                     self.log.debug(f"TCP DNS {ip}: {host} -> {ips[0]}")
@@ -603,12 +768,16 @@ class Resolver:
 
     def _via_udp_dns(self, host, qtype):
         query = dnsmsg.encode_query(host, qtype)
+        qid = query[:2]                     # transaction ID echoed by replies
         for ip in UDP_DNS_LAST_RESORT:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             try:
                 s.settimeout(3)
-                s.sendto(query, (ip, 53))
-                resp, _ = s.recvfrom(4096)
+                # connect() so the kernel filters datagrams from other
+                # sources — the old recvfrom accepted a reply from ANYONE
+                s.connect((ip, 53))
+                s.send(query)
+                resp = s.recv(4096)
             except OSError as exc:
                 # FIX: the old version leaked one UDP socket per timeout/error
                 # (close() was only on the success path)
@@ -616,6 +785,10 @@ class Resolver:
                 self.log.debug(f"UDP DNS {ip} failed: {exc}")
                 continue
             s.close()
+            if resp[:2] != qid:
+                # wrong transaction ID: injected/garbage reply — ignore
+                self.log.debug(f"UDP DNS {ip}: reply transaction ID mismatch — ignored")
+                continue
             try:
                 rcode, answers = dnsmsg.parse_response(resp)
                 # NXDOMAIN over plaintext UDP is NOT trusted (may be injected)

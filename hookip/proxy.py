@@ -20,7 +20,13 @@ class ClientAbortError(OSError):
     proxy failure and must not be counted or alarmed as one."""
 
 
-class UpstreamDied(OSError):
+class DpiReset(OSError):
+    """The upstream reset/killed the connection during the ClientHello
+    exchange — the classic DPI fingerprint-kill signature. Fragmentation
+    strategy retries exist to defeat exactly this."""
+
+
+class UpstreamDied(DpiReset):
     """The upstream server accepted the connection but died before ever
     sending anything back (mid-handshake reset after our 1.5s probe window).
     Retrying with a different fragmentation strategy can defeat it."""
@@ -145,6 +151,11 @@ class ProxyServer:
         self._detail_lock = threading.Lock()
         self._cut_seen = {}                   # host -> ts (mid-transfer cut dedupe)
         self._failnote_seen = {}              # host -> ts (repeat-failure note dedupe)
+        # one lock for the shared state dicts above (_strat_pref,
+        # _blocked_seen, _cut_seen, _failnote_seen): they are mutated from
+        # many threads and bare next(iter(...)) evictions can raise
+        # 'dictionary changed size during iteration'
+        self._state_lock = threading.Lock()
         self._conns_lock = threading.Lock()
         self._conn_limit = threading.BoundedSemaphore(_MAX_CONNECTIONS)
         self.running = False
@@ -205,18 +216,25 @@ class ProxyServer:
         # user's internet breaks while the app looks 'Running'. Per-connection
         # errors are contained; anything that kills the loop anyway triggers
         # the emergency callback so the system proxy is restored at once.
+        accept_errors = 0
         try:
             while self.running:
                 try:
                     csock, _addr = self._lsock.accept()
                 except OSError:
                     # transient errors (e.g. a client resetting mid-connect)
-                    # must not kill the accept loop; only stop when we closed
-                    # the listener
+                    # must not kill the accept loop; a persistent failure
+                    # (~2 s of consecutive errors) breaks out so the finally
+                    # fires on_accept_death instead of spinning forever
                     if self.running and self._lsock and self._lsock.fileno() != -1:
+                        accept_errors += 1
+                        if accept_errors >= 40:
+                            break
                         time.sleep(0.05)
                         continue
                     break
+                accept_errors = 0
+                acquired = False
                 try:
                     with self._conns_lock:
                         self._conns.add(csock)
@@ -233,12 +251,20 @@ class ProxyServer:
                         except OSError:
                             pass
                         continue
+                    acquired = True
                     threading.Thread(target=self._handle, args=(csock,),
                                      daemon=True).start()
                 except Exception as exc:      # noqa: BLE001 — never kill the loop
                     self.log.error(f"connection accept failed: {exc}")
                     with self._conns_lock:
                         self._conns.discard(csock)
+                    # FIX: a failed Thread.start() leaked the semaphore slot
+                    # forever (the limit drained one slot per failure)
+                    if acquired:
+                        try:
+                            self._conn_limit.release()
+                        except ValueError:
+                            pass
                     try:
                         csock.close()
                     except OSError:
@@ -254,6 +280,15 @@ class ProxyServer:
         while self.running:
             self.stats.tick()
             time.sleep(1.0)
+
+    def _bounded_state_put(self, d, key, value, cap):
+        """Store in a shared state dict under _state_lock with bounded
+        size: drop an arbitrary entry when full (the duplicated eviction
+        code, factored out)."""
+        with self._state_lock:
+            if len(d) >= cap and key not in d:
+                d.pop(next(iter(d)), None)
+            d[key] = value
 
     def _note_fail(self, host, dpi=False):
         """Remember a fully-failed host so repeat connections skip the
@@ -275,10 +310,13 @@ class ProxyServer:
             # dead host used to print 'marked as repeat-failure' on EVERY
             # connection (the user's pstream.net session showed it ~40×)
             now_s = time.time()
-            if len(self._failnote_seen) > 500:
-                self._failnote_seen.clear()
-            if now_s - self._failnote_seen.get(host, 0) > 60:
-                self._failnote_seen[host] = now_s
+            with self._state_lock:
+                if len(self._failnote_seen) > 500:
+                    self._failnote_seen.clear()
+                note_recent = now_s - self._failnote_seen.get(host, 0) <= 60
+                if not note_recent:
+                    self._failnote_seen[host] = now_s
+            if not note_recent:
                 self.log.debug(f"{host}: marked as repeat-failure — "
                                "next connections will try a single strategy")
 
@@ -331,7 +369,8 @@ class ProxyServer:
                 host = host.strip("[]").lower()
                 opened = True
                 ssock = self._tunnel(csock, host, port)
-            elif method in ("GET", "POST", "HEAD", "OPTIONS"):
+            elif method in ("GET", "POST", "HEAD", "OPTIONS",
+                            "PUT", "PATCH", "DELETE"):
                 opened = True
                 ssock = self._plain_http(csock, head, method, target, headers)
             else:
@@ -357,7 +396,7 @@ class ProxyServer:
                 else:
                     # parallel connections to the same dead host: log once
                     self.log.debug(f"{msg} — blocked/dead upstream (repeat within 10s, suppressed)")
-            elif "no addresses for" in msg:
+            elif "no addresses" in msg:
                 # UNVERIFIED: no resolver even answered NXDOMAIN — this is a
                 # network/DNS outage, not a dead domain. Never dress it up
                 # as 'blocked upstream' (that would be a false positive).
@@ -417,7 +456,14 @@ class ProxyServer:
     @staticmethod
     def _parse_head(data):
         try:
-            text = data.decode("latin1", "replace")
+            # parse ONLY the head: a request body rides along in the same
+            # buffer and any body line containing ':' (every JSON body)
+            # would become a bogus header. Body bytes are handled via
+            # body = head[sep:] in _plain_http.
+            sep = data.find(b"\r\n\r\n")
+            if sep < 0:
+                sep = len(data)
+            text = data[:sep].decode("latin1", "replace")
             line, _, rest = text.partition("\r\n")
             method, target, _ver = (line.split(" ") + ["", ""])[:3]
             headers = {}
@@ -441,17 +487,20 @@ class ProxyServer:
     def _serve_pac(self, csock):
         # direct (bypass) rules: local ranges plus the user's excluded list,
         # so domains HookIP would not touch never even enter the proxy
-        rules = ["isPlainHostName(host)", "shExpMatch(host,'localhost')",
-                 "shExpMatch(host,'127.*')", "shExpMatch(host,'10.*')",
-                 "shExpMatch(host,'192.168.*')",
-                 "shExpMatch(host,'172.16.*')", "shExpMatch(host,'172.17.*')",
-                 "shExpMatch(host,'172.18.*')", "shExpMatch(host,'172.19.*')",
-                 "shExpMatch(host,'172.20.*')", "shExpMatch(host,'172.21.*')",
-                 "shExpMatch(host,'172.22.*')", "shExpMatch(host,'172.23.*')",
-                 "shExpMatch(host,'172.24.*')", "shExpMatch(host,'172.25.*')",
-                 "shExpMatch(host,'172.26.*')", "shExpMatch(host,'172.27.*')",
-                 "shExpMatch(host,'172.28.*')", "shExpMatch(host,'172.29.*')",
-                 "shExpMatch(host,'172.30.*')", "shExpMatch(host,'172.31.*')"]
+        # Private-range rules as REGEX tests on dotted-quad form: the old
+        # shExpMatch(host,'10.*') also matched hostnames like 10.example.com.
+        # IPv6 loopback arrives as '::1' or bracketed '[::1]'.
+        rules = [
+            "isPlainHostName(host)",
+            "shExpMatch(host, 'localhost')",
+            ("/^(?:10\\.\\d+\\.\\d+\\.\\d+"
+             "|127\\.\\d+\\.\\d+\\.\\d+"
+             "|192\\.168\\.\\d+\\.\\d+"
+             "|172\\.(?:1[6-9]|2[0-9]|3[01])\\.\\d+\\.\\d+"
+             "|169\\.254\\.\\d+\\.\\d+)$/.test(host)"),
+            "host == '::1'",
+            "host == '[::1]'",
+        ]
 
         def esc(p):
             return p.replace("\\", "\\\\").replace("'", "\\'")
@@ -466,19 +515,19 @@ class ProxyServer:
                 continue
             if pat.startswith("*."):
                 host = pat[2:]
-                rules.append(f"shExpMatch(host,'*.{host}')")
-                rules.append(f"dnsDomainIs(host, '{host}')")   # bare domain too
+                rules.append(f"shExpMatch(host, '*.{host}')")
+                rules.append(f"host == '{host}'")   # bare domain too
             elif "." in pat:
-                rules.append(f"dnsDomainIs(host, '{pat}')")
                 rules.append(f"host == '{pat}'")
+                rules.append(f"shExpMatch(host, '*.{pat}')")   # subdomains
             else:
-                rules.append(f"shExpMatch(host,'{pat}')")
+                rules.append(f"shExpMatch(host, '{pat}')")
         pac = (
             "function FindProxyForURL(url, host) {\n"
             "  host = host.toLowerCase();\n"
             f"  if ({' || '.join(rules)}) return 'DIRECT';\n"
-            "  return 'PROXY 127.0.0.1:%d; DIRECT';\n"
-            "}\n" % self.cfg.port
+            f"  return 'PROXY 127.0.0.1:{self.cfg.port}; DIRECT';\n"
+            "}\n"
         ).encode()
         csock.sendall(
             b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ns-proxy-autoconfig\r\n"
@@ -492,7 +541,8 @@ class ProxyServer:
         # order: remembered winner for this host first, then the configured
         # default, then the rest — connections after a DPI fight start with
         # what actually worked last time
-        pref = self._strat_pref.get(host)
+        with self._state_lock:
+            pref = self._strat_pref.get(host)
         strategies = [s for s in (pref, self.cfg.strategy) if s and s != "raw"]
         for alt in ("smart", "chunk", "random"):
             if alt not in strategies:
@@ -506,6 +556,7 @@ class ProxyServer:
 
         last_err = None
         attempt_errors = []
+        saw_dpi = False
         try:
             csock.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
         except OSError as exc:
@@ -517,26 +568,38 @@ class ProxyServer:
 
         # Sniff the client's first flight (normally the TLS ClientHello) ONCE.
         # Strategy retries reuse this captured data — the client cannot resend.
-        csock.settimeout(10)
+        csock.settimeout(10 if port == 443 else 2)
         first = b""
+        client_closed = False
+        wait_timed_out = False
         while True:
             try:
                 part = csock.recv(65536)
             except socket.timeout:
+                wait_timed_out = True
                 break
             except OSError as exc:
                 raise ClientAbortError(
                     f"{host}:{port} client aborted during handshake ({exc})") from exc
             if not part:
+                client_closed = True
                 break
             first += part
             if tlsfrag.hello_needed(first) == 0:
                 break
         csock.settimeout(None)
         if not first:
-            # client connected but sent nothing — normal browser preconnect,
-            # not a proxy failure (do not count it in the Failed stat)
-            raise ClientAbortError(f"{host}:{port} client sent no data (browser preconnect)")
+            if not wait_timed_out or port == 443:
+                # client connected but sent nothing (or closed) — normal
+                # browser preconnect, not a proxy failure (do not count it
+                # in the Failed stat). 443 behavior unchanged.
+                raise ClientAbortError(
+                    f"{host}:{port} client sent no data (browser preconnect)")
+            # server-first protocol (SSH/SMTP/FTP via CONNECT): the client
+            # waits for the SERVER's banner. Try one unfragmented attempt
+            # and let the relay carry the banner back.
+            return self._tunnel_once(csock, host, port, "raw", b"", excl,
+                                     force_no_frag=True)
         # a host whose memory says "raw" only accepts unfragmented handshakes
         # — go straight there (fragmented attempts would all fail)
         if pref == "raw":
@@ -547,6 +610,8 @@ class ProxyServer:
             except ResolveError:
                 raise
             except OSError as exc:
+                if isinstance(exc, DpiReset):
+                    saw_dpi = True
                 last_err = exc
                 attempt_errors.append(f"raw: {exc}")
                 self.log.debug(f"{host}: raw attempt failed: {exc}")
@@ -556,10 +621,8 @@ class ProxyServer:
         for attempt, strategy in enumerate(strategies):
             try:
                 ssock = self._tunnel_once(csock, host, port, strategy, first, excl)
-                if len(self._strat_pref) >= self._strat_cap and host not in self._strat_pref:
-                    # bounded memory: drop an arbitrary entry when full
-                    self._strat_pref.pop(next(iter(self._strat_pref)), None)
-                self._strat_pref[host] = strategy
+                self._bounded_state_put(self._strat_pref, host, strategy,
+                                        self._strat_cap)
                 return ssock
             except ResolveError as exc:
                 # DNS-level failure (NXDOMAIN / SERVFAIL / sinkhole-only):
@@ -569,7 +632,9 @@ class ProxyServer:
                 attempt_errors.append(f"{strategy}: {exc}")
                 self.log.debug(f"{host}: attempt {attempt+1} ({strategy}) failed: {exc}")
                 break
-            except (OSError, ResolveError) as exc:
+            except OSError as exc:
+                if isinstance(exc, DpiReset):
+                    saw_dpi = True
                 last_err = exc
                 attempt_errors.append(f"{strategy}: {exc}")
                 self.log.debug(f"{host}: attempt {attempt+1} ({strategy}) failed: {exc}")
@@ -577,11 +642,9 @@ class ProxyServer:
                     break
         # Only cap retries for infrastructural failures (timeout/refused/DNS
         # blocked/client gone). A DPI reset is exactly what fragmentation is
-        # meant to defeat — keep full strategy retries for those.
-        if "ClientHello" not in str(last_err):
-            self._note_fail(host, dpi=False)
-        else:
-            self._note_fail(host, dpi=True)
+        # meant to defeat — keep full strategy retries for those. The DPI
+        # flag comes from the raised exception type, not message text.
+        self._note_fail(host, dpi=saw_dpi)
         if isinstance(last_err, ResolveError):
             # DNS-level failure — strategies are irrelevant; surface the
             # resolver's own verdict (classified as blocked/dead upstream)
@@ -592,7 +655,7 @@ class ProxyServer:
         # unfragmented ClientHello. On a filtered network it may be blocked,
         # but the fragmented attempts have already failed — connectivity
         # beats silence.
-        if last_err and "ClientHello" in str(last_err) and not excl:
+        if saw_dpi and not excl:
             try:
                 ssock = self._tunnel_once(csock, host, port, "raw", first,
                                           excl, force_no_frag=True)
@@ -601,9 +664,8 @@ class ProxyServer:
                     "sent one unfragmented (server or middlebox dislikes "
                     "tiny segments); protection was still active for the "
                     "handshake attempt itself.")
-                if len(self._strat_pref) >= self._strat_cap and host not in self._strat_pref:
-                    self._strat_pref.pop(next(iter(self._strat_pref)), None)
-                self._strat_pref[host] = "raw"
+                self._bounded_state_put(self._strat_pref, host, "raw",
+                                        self._strat_cap)
                 return ssock
             except (OSError, ResolveError) as exc2:
                 attempt_errors.append(f"unfragmented: {exc2}")
@@ -647,9 +709,20 @@ class ProxyServer:
             threads.append(t)
             t.start()
             if i < len(candidates) - 1:
-                time.sleep(0.15)   # stagger: no SYN burst
+                # stagger: launch candidates 150 ms apart (no SYN burst),
+                # but cut the wait short when a winner appeared or the
+                # previous attempt already failed
+                stagger_end = time.time() + 0.15
+                while time.time() < stagger_end:
+                    if won.wait(0.02):
+                        break
+                    with lock:
+                        prev_failed = (not t.is_alive()) and bool(errors)
+                    if prev_failed:
+                        break
         while not won.is_set() and time.time() < deadline:
-            time.sleep(0.02)
+            if won.wait(0.02):
+                break
             if not any(t.is_alive() for t in threads) and not socks:
                 break
         won.set()
@@ -720,13 +793,20 @@ class ProxyServer:
     def _tunnel_once(self, csock, host, port, strategy, first, exclude_frag=False,
                      force_no_frag=False):
         t0 = time.time()
-        try:
-            ips = self.resolver.resolve(host)
-        except ResolveError:
-            # re-raise unwrapped: DNS-level failures cannot be fixed by
-            # re-fragmenting, so _tunnel must see them to skip the retries
-            raise
-        dns_ms = (time.time() - t0) * 1000
+        upstream_set = bool(str(getattr(self.cfg, "upstream_proxy", "") or "").strip())
+        if upstream_set:
+            # the CONNECT to the network proxy carries the hostname —
+            # resolving it ourselves is wasted work
+            ips = []
+            dns_ms = 0.0
+        else:
+            try:
+                ips = self.resolver.resolve(host)
+            except ResolveError:
+                # re-raise unwrapped: DNS-level failures cannot be fixed by
+                # re-fragmenting, so _tunnel must see them to skip the retries
+                raise
+            dns_ms = (time.time() - t0) * 1000
         t1 = time.time()
         upstream = str(getattr(self.cfg, "upstream_proxy", "") or "").strip()
         if upstream:
@@ -753,22 +833,39 @@ class ProxyServer:
             else:
                 chunks = []
             t2 = time.time()
-            for chunk in chunks:
-                server.sendall(chunk)
+            try:
+                for chunk in chunks:
+                    server.sendall(chunk)
+            except (ConnectionResetError, ConnectionAbortedError,
+                    BrokenPipeError) as exc:
+                # DPI resets are DETECTED, not string-matched: a reset while
+                # the ClientHello is going out is the fingerprint-kill
+                # signature (only when a hello was actually being sent)
+                if first:
+                    raise DpiReset(
+                        f"{host}:{port} connection reset during ClientHello "
+                        f"(possible DPI reset)") from exc
+                raise
 
             if first:
                 # Detect immediate RST/close (DPI kill) → propagate to caller
                 # so the outer loop can retry with a different strategy.
                 # (Any error here propagates — swallowing it would relay on a
                 # dead socket instead of retrying.)
-                r, _, _ = select.select([server], [], [], 1.5)
-                probe_ms = (time.time() - t2) * 1000
-                if r:
-                    probe = server.recv(1, socket.MSG_PEEK)
-                    if probe == b"":
-                        raise OSError(
-                            f"{host}:{port} server closed right after ClientHello "
-                            f"(possible DPI reset)")
+                try:
+                    r, _, _ = select.select([server], [], [], 1.5)
+                    probe_ms = (time.time() - t2) * 1000
+                    if r:
+                        probe = server.recv(1, socket.MSG_PEEK)
+                        if probe == b"":
+                            raise DpiReset(
+                                f"{host}:{port} server closed right after "
+                                f"ClientHello (possible DPI reset)")
+                except (ConnectionResetError, ConnectionAbortedError,
+                        BrokenPipeError) as exc:
+                    raise DpiReset(
+                        f"{host}:{port} connection reset during ClientHello "
+                        f"(possible DPI reset)") from exc
             else:
                 probe_ms = 0.0
         except OSError:
@@ -789,11 +886,25 @@ class ProxyServer:
             if len(self._tunnel_detail) > 256:
                 self._tunnel_detail.clear()
             self._tunnel_detail[host] = (strategy, dns_ms, conn_ms, nseg, total_ms)
-        self._relay(csock, server, host)
+        try:
+            self._relay(csock, server, host, initial_up=len(first))
+        except BaseException:
+            # FIX: the _relay call sat outside the close-on-error guard —
+            # an exception leaked the upstream socket
+            try:
+                server.close()
+            except OSError:
+                pass
+            raise
         return server
 
-    def _relay(self, csock, server, host):
-        up = down = 0
+    def _relay(self, csock, server, host, initial_up=0):
+        # initial_up: bytes already pushed upstream before relay started
+        # (the ClientHello). Without counting them, a clean FIN right
+        # after the handshake read as outcome 'ok' and UpstreamDied never
+        # fired — and the first flight was missing from the stats.
+        up = initial_up
+        down = 0
         started = time.time()
         sockets = [csock, server]
         _set_keepalive(csock)
@@ -896,23 +1007,20 @@ class ProxyServer:
                     pass
                 raise
             server.settimeout(30)
-            out = [l for l in head.split(b"\r\n")
+            # header lines come from the HEAD ONLY — the buffer also
+            # holds the start of the body, and splitting the whole blob
+            # duplicated body lines (then appended the body again)
+            sep = head.find(b"\r\n\r\n")
+            sep = len(head) if sep < 0 else sep
+            body = head[sep + 4:]
+            out = [l for l in head[:sep].split(b"\r\n")
                    if l and not l.lower().startswith((b"proxy-connection:",
                                                       b"proxy-authorization:"))]
             payload = b"\r\n".join(out)
-            sep = head.find(b"\r\n\r\n") + 4
-            body = head[sep:]
-            if headers.get("content-length"):
-                try:
-                    need = int(headers["content-length"]) - len(body)
-                    while need > 0:
-                        part = csock.recv(min(65536, need))
-                        if not part:
-                            break
-                        body += part
-                        need -= len(part)
-                except (socket.timeout, OSError):
-                    pass
+            # NO Content-Length pre-read here: a client that sent
+            # 'Expect: 100-continue' withholds its body until it sees an
+            # interim response — pre-reading stalled the request for 30 s.
+            # The relay loop below streams the rest of the body upstream.
             server.sendall(payload + b"\r\n\r\n" + body)
         else:
             ips = self.resolver.resolve(host)
@@ -935,21 +1043,13 @@ class ProxyServer:
                     continue
                 out.append(f"{k}: {v}")
             out.append("Connection: close")
-            payload = head
-            # forward already-buffered remainder + any body that follows
-            sep = payload.find(b"\r\n\r\n") + 4
-            body = payload[sep:]
-            if headers.get("content-length"):
-                try:
-                    need = int(headers["content-length"]) - len(body)
-                    while need > 0:
-                        part = csock.recv(min(65536, need))
-                        if not part:
-                            break
-                        body += part
-                        need -= len(part)
-                except (socket.timeout, OSError):
-                    pass
+            # forward whatever body bytes are already buffered; the
+            # relay loop below streams the rest (a client that sent
+            # 'Expect: 100-continue' withholds its body until it sees an
+            # interim response — the pre-read loop stalled 30 s here too)
+            sep = head.find(b"\r\n\r\n")
+            sep = len(head) if sep < 0 else sep
+            body = head[sep + 4:]
             server.sendall(("\r\n".join(out) + "\r\n\r\n").encode("latin1") + body)
         # relay response until close
         up = down = 0
@@ -959,11 +1059,23 @@ class ProxyServer:
                 if not r:
                     break
                 for s in r:
-                    data = s.recv(65536)
+                    try:
+                        data = s.recv(65536)
+                    except (OSError, ConnectionError):
+                        if s is csock:
+                            # client reset mid-relay — its own choice,
+                            # end quietly instead of failing the request
+                            return server
+                        raise            # server-side: as before
                     if not data:
                         return server
                     other = csock if s is server else server
-                    other.sendall(data)
+                    try:
+                        other.sendall(data)
+                    except (OSError, ConnectionError):
+                        if other is csock:
+                            return server   # client gone — quiet
+                        raise
                     if s is server:
                         down += len(data)
                     else:

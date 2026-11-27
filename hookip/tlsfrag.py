@@ -14,6 +14,12 @@ def parse_client_hello(data):
             return None
         reclen = int.from_bytes(data[3:5], "big")
         total = 5 + reclen
+        # degenerate or oversized records are not real client hellos —
+        # reject so fragment() falls back to the 4096-byte split instead
+        # of slicing nonsense offsets (hello_needed already stops waiting
+        # past 17000, so a record claiming more is garbage/truncated)
+        if reclen == 0 or total > 17000:
+            return None
         if len(data) < total:
             return None
         body = data[5:total]
@@ -47,9 +53,16 @@ def parse_client_hello(data):
             if etype == 0 and elen >= 5 and p + elen <= len(body):
                 # server_name_list: listlen(2) entrytype(1) namelen(2) name
                 nlen = int.from_bytes(body[p + 3:p + 5], "big")
-                sni_start = 5 + p + 5
-                sni_end = sni_start + nlen
-                host = body[p + 5:p + 5 + nlen].decode("ascii", "replace").lower()
+                if p + 5 + nlen <= len(body):
+                    sni_start = 5 + p + 5
+                    sni_end = sni_start + nlen
+                    host = body[p + 5:p + 5 + nlen].decode("ascii", "replace").lower()
+                else:
+                    # malformed name length (would read past the record):
+                    # treat as no SNI rather than producing a short host
+                    # with an out-of-range sni_end; keep parsing
+                    sni_start = sni_end = None
+                    host = None
             p += elen
         return {"total": total, "sni_start": sni_start, "sni_end": sni_end, "host": host}
     except (IndexError, ValueError, struct.error):
@@ -58,7 +71,11 @@ def parse_client_hello(data):
 
 def hello_needed(data):
     """How many more bytes are needed for a complete first TLS record.
-    0 = complete (or not TLS at all); None = cannot tell yet."""
+
+    Returns a positive int (at least that many more bytes needed) or
+    0 (the record is complete, the data is not TLS at all, or the
+    declared record length is oversized garbage — stop waiting).
+    It never returns None."""
     if not data:
         return 1
     if data[0] != 0x16:
@@ -79,24 +96,38 @@ def fragment(data, strategy="smart", chunk_size=2):
     Returns a list of byte chunks to sendall() in order.
     """
     info = parse_client_hello(data)
-    n = max(1, int(chunk_size))
+    try:
+        n = max(1, int(chunk_size))
+    except (TypeError, ValueError):
+        n = 2
     if info is None:
         return [data[i:i + 4096] for i in range(0, len(data), 4096)] or [b""]
 
     head = data[:info["total"]]
     rest = data[info["total"]:]
+    has_sni = info["sni_start"] is not None
 
-    if strategy == "chunk":
+    if not has_sni:
+        # nothing to hide (IP-literal hosts, ECH-only edge cases): every
+        # strategy sends the record whole — chopping an SNI-less hello
+        # into hundreds of tiny segments only adds latency
+        parts = [head]
+    elif strategy == "chunk":
         parts = [head[i:i + n] for i in range(0, len(head), n)]
     elif strategy == "random":
+        # random small sizes from offset 0 THROUGH the whole SNI (the
+        # hostname can sit in the second half of the record — Chrome
+        # randomizes extension order), then big segments for the rest.
+        # The old limit len(head)//2 missed an SNI placed late.
         parts = []
+        s, e = info["sni_start"], info["sni_end"]
         i = 0
+        while i < e:
+            size = min(random.randint(1, max(2, n)), e - i)
+            parts.append(head[i:i + size])
+            i += size
         while i < len(head):
-            limit = len(head) // 2 if info["sni_start"] is not None else len(head)
-            if i < limit:
-                size = random.randint(1, max(2, n))
-            else:
-                size = 1400
+            size = min(1400, len(head) - i)
             parts.append(head[i:i + size])
             i += size
     else:  # "smart": keep everything before the SNI hostname intact,
@@ -104,17 +135,14 @@ def fragment(data, strategy="smart", chunk_size=2):
         # connection (1..n bytes) so consecutive connections do not share
         # one identical segment fingerprint.
         s, e = info["sni_start"], info["sni_end"]
-        if s is None:
-            parts = [head[i:i + n] for i in range(0, len(head), n)]
-        else:
-            parts = [head[:s]] if s else []
-            i = s
-            while i < e:
-                size = random.randint(1, n) if n > 1 else 1
-                parts.append(head[i:min(i + size, e)])
-                i += size
-            if e < len(head):
-                parts.append(head[e:])
+        parts = [head[:s]] if s else []
+        i = s
+        while i < e:
+            size = random.randint(1, n) if n > 1 else 1
+            parts.append(head[i:min(i + size, e)])
+            i += size
+        if e < len(head):
+            parts.append(head[e:])
     if rest:
         parts.append(rest)
     return [p for p in parts if p]
