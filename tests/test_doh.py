@@ -48,10 +48,12 @@ class FakeConn:
     created = 0
     created_per_name = {}
 
-    def __init__(self, ip, host, timeout=3.5, chunk=2, keepalive=False):
+    def __init__(self, ip, host, timeout=3.5, chunk=2, keepalive=False,
+                 validate_by_ip=True):
         FakeConn.created += 1
         FakeConn.created_per_name[host] = FakeConn.created_per_name.get(host, 0) + 1
         self.ip, self.host = ip, host
+        self.validate_by_ip = validate_by_ip
         self.keepalive = keepalive
         self.alive = True
         self.used = time.time()
@@ -250,6 +252,83 @@ def test_cname_no_double_release():
 
 
 # ---- 4. _frag_send chunk semantics -----------------------------------
+def test_sni_less_and_fallback():
+    """SNI-less DoH: the ClientHello must validate by IP SAN (no resolver
+    name in SNI — that was the Secure-DNS bypass: a DPI filter could block
+    'cloudflare-dns.com' etc. by name). A resolver whose cert lacks an IP
+    SAN falls back to hostname SNI and the mode is cached."""
+    import ssl as _ssl
+
+    def make_resolver():
+        r = dohmod.Resolver.__new__(dohmod.Resolver)
+        r.cfg = None
+        r.log = types.SimpleNamespace(
+            debug=lambda *a, **k: None, ok=lambda *a, **k: None,
+            warn=lambda *a, **k: None, error=lambda *a, **k: None)
+        r.chunk = 2
+        r._sni_mode = {}
+        r._pool = {}
+        r._pending = {}
+        r._pool_lock = threading.Lock()
+        r._pool_max = 2
+        return r
+
+    # bundled resolvers unchanged (vote math across suites assumes 4)
+    names = [n for (n, _h, _i) in dohmod.RESOLVERS]
+    check("bundled DoH resolvers intact", len(names) == 4, str(names))
+
+    captured = {}
+    class RecordingConn(dohmod._DoHConn):
+        def __init__(self, ip, host, timeout=3.5, chunk=2, keepalive=False,
+                     validate_by_ip=True):
+            captured.setdefault("modes", []).append(validate_by_ip)
+            self.ip, self.host = ip, host
+            self.used = time.time()
+            self.alive = True
+            self.keepalive = keepalive
+            self._reqlock = threading.Lock()
+            self.healthy = lambda: True
+
+    r = make_resolver()
+    real_conn = dohmod._DoHConn
+    dohmod._DoHConn = RecordingConn
+    try:
+        c = r._new_conn("Cloudflare", "1.1.1.1", "cloudflare-dns.com")
+        check("SNI-less default (validate by IP SAN)",
+              captured["modes"] == [True], str(captured["modes"]))
+        check("mode cached 'ip'", r._sni_mode.get("Cloudflare") == "ip",
+              str(r._sni_mode))
+
+        # a resolver whose cert has no IP SAN: first attempt fails cert
+        # verification, second succeeds with the hostname, mode cached
+        class CertFailConn(RecordingConn):
+            def __init__(self, *a, **k):
+                captured.setdefault("modes", []).append(k.get("validate_by_ip", True))
+                if k.get("validate_by_ip", True):
+                    raise _ssl.SSLCertVerificationError("no IP SAN")
+                self.ip, self.host = a[0], a[1]
+                self.used = time.time()
+                self.alive = True
+                self.keepalive = k.get("keepalive", False)
+                self._reqlock = threading.Lock()
+                self.healthy = lambda: True
+
+        captured.clear()
+        dohmod._DoHConn = CertFailConn
+        r2 = make_resolver()
+        c2 = r2._new_conn("NoSAN", "9.9.9.9", "dns.nosan.example")
+        check("cert w/o IP SAN falls back to hostname SNI",
+              captured.get("modes") == [True, False], str(captured.get("modes")))
+        check("fallback mode cached 'host'", r2._sni_mode.get("NoSAN") == "host",
+              str(r2._sni_mode))
+        captured.clear()
+        r2._new_conn("NoSAN", "9.9.9.9", "dns.nosan.example")
+        check("cached 'host' mode skips the failing IP attempt",
+              captured.get("modes") == [False], str(captured.get("modes")))
+    finally:
+        dohmod._DoHConn = real_conn
+
+
 def test_frag_send():
     conn = dohmod._DoHConn.__new__(dohmod._DoHConn)   # skip __init__ (no socket)
     sends = []
@@ -668,6 +747,7 @@ if __name__ == "__main__":
     test_hedging()
     test_udp_verification()
     test_start_idx_threadsafe()
+    test_sni_less_and_fallback()
 
     print()
     print(f"Summary: {sum(1 for _, c in RESULTS if c)}/{len(RESULTS)} passed")

@@ -316,6 +316,9 @@ class App:
 
     # -- update check ----------------------------------------------------
     UPDATE_REPO = "justcamop555-pixel/HookIP"
+    # Same-bytes mirrors used ONLY when GitHub's asset CDN is unreachable
+    # for a user; integrity stays with the checksum verified afterwards.
+    _DL_MIRRORS = ("https://ghproxy.net/", "https://gh-proxy.com/", "https://ghfast.top/")
 
     def _validate_numeric_fields(self, *_):
         """Live port/fragment validation: invalid entries turn red and show
@@ -463,6 +466,7 @@ class App:
         import urllib.error
         latest, url, offline, asset, sha_asset, prerelease = (None, None, False,
                                                               None, None, False)
+        body = None
 
         def fetch(req, timeout=10):
             # The system proxy may point at HookIP itself; if the request
@@ -475,6 +479,23 @@ class App:
                     urllib.request.ProxyHandler({}))
                 return opener.open(req, timeout=timeout)
 
+        def redirect_fallback():
+            """Some users cannot reach api.github.com at all (DNS/TLS
+            filtering or the unauthenticated 60 req/h rate limit eaten by
+            a shared NAT). github.com's releases/latest redirect is
+            separate infrastructure and usually still reachable."""
+            try:
+                req2 = urllib.request.Request(
+                    f"https://github.com/{self.UPDATE_REPO}/releases/latest",
+                    headers={"User-Agent": "HookIP-updater"})
+                with fetch(req2) as r2:
+                    tag = r2.geturl().rsplit("/tag/", 1)[-1]
+                    if tag and tag != "latest":
+                        return tag
+            except (OSError, ValueError):
+                pass
+            return None
+
         try:
             req = urllib.request.Request(
                 f"https://api.github.com/repos/{self.UPDATE_REPO}/releases/latest",
@@ -485,6 +506,7 @@ class App:
                 url = data.get("html_url") or \
                     f"https://github.com/{self.UPDATE_REPO}/releases"
                 prerelease = bool(data.get("prerelease"))
+                body = data.get("body") or None
                 for a in data.get("assets") or []:
                     nm = str(a.get("name", "")).lower()
                     if nm.endswith(".exe") and not asset:
@@ -495,28 +517,32 @@ class App:
             offline = exc.code in (403, 429, 500, 502, 503)
             # 404: private repo — try the redirect form (works once public)
             if latest is None:
-                try:
-                    req2 = urllib.request.Request(
-                        f"https://github.com/{self.UPDATE_REPO}/releases/latest",
-                        headers={"User-Agent": "HookIP-updater"})
-                    with fetch(req2) as r2:
-                        tag = r2.geturl().rsplit("/tag/", 1)[-1]
-                        if tag and tag != "latest":
-                            # the redirect fallback succeeded — we are NOT offline
-                            latest, url, offline = (tag,
-                                f"https://github.com/{self.UPDATE_REPO}/releases/tag/{tag}",
-                                False)
-                            prerelease = "-" in tag
-                except OSError:
-                    pass
+                tag = redirect_fallback()
+                if tag:
+                    # the redirect fallback succeeded — we are NOT offline
+                    latest, url, offline = (tag,
+                        f"https://github.com/{self.UPDATE_REPO}/releases/tag/{tag}",
+                        False)
+                    prerelease = "-" in tag
         except OSError:
-            offline = True
+            # api.github.com unreachable for this user (DNS/TLS filtering,
+            # timeouts): the redirect form lives on other infrastructure —
+            # try it before declaring offline (it used to give up here,
+            # leaving users 'offline' forever on api-blocked networks)
+            tag = redirect_fallback()
+            if tag:
+                latest, url, offline = (tag,
+                    f"https://github.com/{self.UPDATE_REPO}/releases/tag/{tag}",
+                    False)
+                prerelease = "-" in tag
+            else:
+                offline = True
         except ValueError:
             # malformed API response must not kill the worker (it used to
             # leave the update check permanently stuck on 'already running')
             offline = True
         self._ui_queue.put(("update", (latest, url, offline, asset,
-                                       sha_asset, prerelease)))
+                                       sha_asset, prerelease, body)))
 
     @staticmethod
     def _ver_tuple(s):
@@ -535,7 +561,7 @@ class App:
             return (0,)
 
     def _update_result(self, latest, url, offline=False, asset=None,
-                       sha_asset=None, prerelease=False):
+                       sha_asset=None, prerelease=False, body=None):
         self._update_running = False
         try:
             if not latest:
@@ -598,6 +624,7 @@ class App:
                 if asset:
                     self._update_asset_url = asset
                     self._update_sha_url = sha_asset
+                    self._update_body = body
                     self._pending_ver = latest
                     self._dl_btn.configure(text=f"⬇ Download {latest}", state="normal")
                     self._dl_btn.pack(side="left", padx=(10, 0))
@@ -635,16 +662,48 @@ class App:
         import urllib.error
 
         def fetch(u, timeout=30):
-            # system proxy (our own tunnel) first; direct retry if it fails
-            try:
-                return urllib.request.urlopen(
-                    urllib.request.Request(u, headers={"User-Agent": "HookIP-updater"}),
-                    timeout=timeout)
-            except (OSError, urllib.error.URLError):
-                opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-                return opener.open(
-                    urllib.request.Request(u, headers={"User-Agent": "HookIP-updater"}),
-                    timeout=timeout)
+            # Order: GitHub via system proxy (our own tunnel) → GitHub
+            # direct → public mirrors of the same bytes. The asset CDN
+            # (objects.githubusercontent.com) is unreachable for some
+            # users even when github.com works; mirrors close that gap.
+            # Integrity is NOT handed to the mirror — the checksum below
+            # still comes from GitHub-published data.
+            variants = [u] + [m + u for m in self._DL_MIRRORS]
+            last = None
+            for u2 in variants:
+                try:
+                    return urllib.request.urlopen(
+                        urllib.request.Request(u2, headers={"User-Agent": "HookIP-updater"}),
+                        timeout=timeout)
+                except (OSError, urllib.error.URLError) as exc:
+                    last = exc
+                    try:
+                        opener = urllib.request.build_opener(
+                            urllib.request.ProxyHandler({}))
+                        return opener.open(
+                            urllib.request.Request(u2, headers={"User-Agent": "HookIP-updater"}),
+                            timeout=timeout)
+                    except (OSError, urllib.error.URLError) as exc2:
+                        last = exc2
+            raise OSError(f"all download sources failed ({last})")
+
+        def body_sha256():
+            """Fallback checksum source: the release notes text the API
+            already returned (github.com server side, not the asset CDN).
+            Used only when it is unambiguous — exactly one 64-hex token,
+            or one sitting next to the exe's name."""
+            txt = str(getattr(self, "_update_body", "") or "")
+            if not txt:
+                return None
+            import re as _re
+            hexes = _re.findall(r"\b[0-9a-fA-F]{64}\b", txt)
+            if len(hexes) == 1:
+                return hexes[0].lower()
+            for h in hexes:
+                i = txt.find(h)
+                if "HookIP.exe" in txt[max(0, i - 80):i + 80]:
+                    return h.lower()
+            return None
 
         dest_dir = os.path.join(os.path.expanduser("~"), "Downloads")
         tmp = dest = None
@@ -660,12 +719,14 @@ class App:
                     if not chunk:
                         break
                     data += chunk
-            # verify against the release's published checksum — a corrupted
+            # verify against a GitHub-published checksum — a corrupted
             # download is deleted, not left behind to be run by mistake.
-            # FAIL CLOSED once a checksum is published: if the .sha256 asset
-            # exists but cannot be fetched, the download is refused rather
-            # than saved unverified (the checksum lives on the same release
-            # page, so this guards corruption, not GitHub-side tampering).
+            # FAIL CLOSED once a checksum is published: if no source can
+            # produce one, the download is refused rather than saved
+            # unverified. Sources in order of trust: the .sha256 release
+            # asset (via GitHub, then via the same mirrors), then the
+            # sha256 printed in the release notes (github.com server side,
+            # immune to asset-CDN blocks).
             expected = None
             sha_url = getattr(self, "_update_sha_url", None)
             if sha_url:
@@ -675,11 +736,16 @@ class App:
                     expected = txt.split()[0].strip().lower() if txt.split() else None
                 except (OSError, urllib.error.URLError):
                     expected = None
+            if expected is None:
+                expected = body_sha256()
+                if expected:
+                    self.log.info("Update checksum taken from the release "
+                                  "notes (asset CDN unreachable).")
                 if expected is None:
                     self.log.error(
                         "Update download REFUSED: the release publishes a "
-                        "checksum but it could not be fetched — install "
-                        "manually from the Releases page instead.")
+                        "checksum but no reachable source could provide "
+                        "it — install manually from the Releases page.")
                     notify.notify(
                         "HookIP — update download failed",
                         "The checksum could not be verified, so the "

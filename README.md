@@ -58,7 +58,8 @@ a changelog. The repository itself is source-only.
 ## ⚡ One-line install (PowerShell)
 
 ```powershell
-irm https://raw.githubusercontent.com/justcamop555-pixel/HookIP/main/install.ps1 | iex
+irm https://github.com/justcamop555-pixel/HookIP/releases/latest/download/install.ps1 | iex
+(or:  irm https://raw.githubusercontent.com/justcamop555-pixel/HookIP/main/install.ps1 | iex)
 ```
 
 Downloads the latest `HookIP.exe` to your Desktop and launches it. The installer prefers the

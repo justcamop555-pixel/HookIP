@@ -64,7 +64,8 @@ class _DoHConn:
     """A DoH HTTPS connection with a fragmented ClientHello.
     Supports HTTP/1.1 keep-alive so one connection can serve many queries."""
 
-    def __init__(self, ip, host, timeout=3.5, chunk=2, keepalive=False):
+    def __init__(self, ip, host, timeout=3.5, chunk=2, keepalive=False,
+                 validate_by_ip=True):
         self.ip = ip
         self.host = host
         self.sock = socket.create_connection((ip, 443), timeout=timeout)
@@ -73,7 +74,15 @@ class _DoHConn:
         ctx = _ssl_context()
         self._bio_in = ssl.MemoryBIO()
         self._bio_out = ssl.MemoryBIO()
-        self.ssl = ctx.wrap_bio(self._bio_in, self._bio_out, server_hostname=host)
+        # SNI-LESS by default: server_hostname=IP validates the cert's
+        # iPAddress SAN and Python omits the SNI extension entirely for IP
+        # literals. With the old server_hostname=<resolver name> every
+        # ClientHello carried 'cloudflare-dns.com' etc. in PLAINTEXT SNI —
+        # a DPI filter could block each DoH endpoint BY NAME and silently
+        # push HookIP down the plaintext fallbacks. Certificates without
+        # an IP SAN fail here; _new_conn retries with the hostname.
+        sni = ip if validate_by_ip else host
+        self.ssl = ctx.wrap_bio(self._bio_in, self._bio_out, server_hostname=sni)
         self._handshake(chunk)
         self.keepalive = keepalive
         self.alive = True
@@ -270,11 +279,33 @@ class Resolver:
         self._inflight_lock = threading.Lock()
         self.verbose_stats = {}               # resolver -> success count
         self._pool = {}                       # resolver name -> [_DoHConn, ...]
+        self._sni_mode = {}                   # resolver -> 'ip' | 'host'
         self._pool_lock = threading.Lock()
         self._pool_max = profile().doh_pool_per_resolver  # hardware-scaled
         self._pending = {}                    # resolver -> conns being created
                                               # (slot reserved pre-creation;
                                               # guarded by _pool_lock)
+
+    def _new_conn(self, name, ip, dns_host):
+        """Create one pooled DoH connection, SNI-less when the resolver's
+        certificate carries an IP SAN (all bundled resolvers do, verified
+        live). A cert without an IP SAN falls back to the hostname (SNI
+        visible) and the working mode is cached per resolver."""
+        mode = self._sni_mode.get(name, "ip")
+        try:
+            conn = _DoHConn(ip, dns_host, chunk=max(1, self.chunk),
+                            keepalive=True, validate_by_ip=(mode == "ip"))
+            self._sni_mode[name] = mode
+            return conn
+        except ssl.SSLCertVerificationError:
+            if mode != "ip":
+                raise
+            conn = _DoHConn(ip, dns_host, chunk=max(1, self.chunk),
+                            keepalive=True, validate_by_ip=False)
+            self._sni_mode[name] = "host"
+            self.log.debug(f"DoH {name}: certificate has no IP SAN — "
+                           "falling back to hostname SNI")
+            return conn
 
     def _doh_session(self, name, dns_host, ip):
         """Check out a pooled keep-alive connection with its per-connection
@@ -318,8 +349,7 @@ class Resolver:
             # slot was reserved under the lock BEFORE creating).
             if reserved:
                 try:
-                    new_conn = _DoHConn(ip, dns_host,
-                                        chunk=max(1, self.chunk), keepalive=True)
+                    new_conn = self._new_conn(name, ip, dns_host)
                 except BaseException:
                     # reservation released whether creation succeeded or failed
                     with self._pool_lock:
