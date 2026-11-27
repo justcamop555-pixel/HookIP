@@ -241,12 +241,23 @@ class App:
                 elif kind == "emergency_done":
                     self._set_running_ui(False)
                 elif kind == "dl_done":
+                    ok = bool(args and args[0])
+                    dest = getattr(self, "_downloaded_path", None)
                     try:
-                        self._dl_btn.configure(
-                            state="normal",
-                            text=(f"⬇ Download {self._pending_ver}"
-                                  if getattr(self, "_pending_ver", None)
-                                  else "⬇ Download"))
+                        if ok and dest and os.path.isfile(dest):
+                            # a verified download turns the button into the
+                            # installer — no more 'close HookIP, find the
+                            # file in Downloads' dance
+                            self._dl_btn.configure(state="normal",
+                                                   text="▶ Install now",
+                                                   command=self._install_downloaded)
+                        else:
+                            self._dl_btn.configure(
+                                state="normal",
+                                text=(f"⬇ Download {self._pending_ver}"
+                                      if getattr(self, "_pending_ver", None)
+                                      else "⬇ Download"),
+                                command=self._download_update)
                     except tk.TclError:
                         pass
         except queue.Empty:
@@ -415,6 +426,22 @@ class App:
         self.update_label.configure(text="checking…", fg=MUTED)
         threading.Thread(target=self._update_worker, daemon=True).start()
 
+    def _schedule_update_recheck(self, delay_ms):
+        """(Re)schedule the next automatic update check, cancelling any
+        pending one first. Both the 12 h cadence and the 30 min offline
+        retry used to stack a NEW timer on every result — repeated manual
+        checks and offline periods multiplied them permanently."""
+        try:
+            old = getattr(self, "_update_after", None)
+            if old:
+                self.root.after_cancel(old)
+        except (tk.TclError, RuntimeError, ValueError):
+            pass
+        try:
+            self._update_after = self.root.after(delay_ms, self.check_updates)
+        except (tk.TclError, RuntimeError):
+            pass
+
     def _update_worker(self):
         import json as _json
         import urllib.request
@@ -497,22 +524,21 @@ class App:
         self._update_running = False
         try:
             if not latest:
+                stamp = time.strftime(" · checked %H:%M")
                 if offline:
                     self.update_label.configure(
-                        text="offline — will re-check later", fg=MUTED)
+                        text="offline — will re-check later" + stamp, fg=MUTED)
                 else:
                     self.update_label.configure(
-                        text="private repo — works once public", fg=MUTED)
+                        text="private repo — works once public" + stamp, fg=MUTED)
                 self.update_pill.configure(text="", fg=MUTED)
                 self._dl_btn.pack_forget()
                 self.log.debug("Update check: no reachable release info "
                                + ("(offline)." if offline else "(private repo)."))
                 # offline is usually transient (or our own tunnel mid-restart)
-                # — re-check in 30 min instead of waiting 12 h
-                try:
-                    self.root.after(30 * 60 * 1000, self.check_updates)
-                except (tk.TclError, RuntimeError):
-                    pass
+                # — re-check in 30 min instead of waiting 12 h (cancels any
+                # pending timer first; this path used to stack timers)
+                self._schedule_update_recheck(30 * 60 * 1000)
                 return
             self._update_url = url
             remote = self._ver_tuple(latest)
@@ -578,20 +604,8 @@ class App:
         except (tk.TclError, RuntimeError):
             pass
         # re-check every 12 h so a published update is noticed without a
-        # restart — CANCEL the previous timer first: every check used to
-        # schedule another one, so repeated manual checks multiplied the
-        # 12-hour timers permanently
-        try:
-            old = getattr(self, "_update_after", None)
-            if old:
-                self.root.after_cancel(old)
-        except (tk.TclError, RuntimeError, ValueError):
-            pass
-        try:
-            self._update_after = self.root.after(12 * 3600 * 1000,
-                                                 self.check_updates)
-        except (tk.TclError, RuntimeError):
-            pass
+        # restart — cancels any pending timer first (no stacking)
+        self._schedule_update_recheck(12 * 3600 * 1000)
 
     def _download_update(self):
         url = getattr(self, "_update_asset_url", None)
@@ -656,7 +670,7 @@ class App:
                         "The checksum could not be verified, so the "
                         "download was refused. Install manually from the "
                         "Releases page.", timeout_s=12)
-                    self._ui_queue.put(("dl_done", ()))
+                    self._ui_queue.put(("dl_done", (False,)))
                     return
             if expected:
                 actual = hashlib.sha256(data).hexdigest()
@@ -671,18 +685,21 @@ class App:
                                   timeout_s=12)
                     # re-enable the button too — the mismatch path used to
                     # leave it stuck on 'downloading…' forever
-                    self._ui_queue.put(("dl_done", ()))
+                    self._ui_queue.put(("dl_done", (False,)))
                     return
                 self.log.ok("Downloaded update verified against the release checksum.")
             with open(tmp, "wb") as fh:
                 fh.write(data)
             os.replace(tmp, dest)   # atomic: the exe appears only when complete
-            self.log.ok(f"Update downloaded to {dest} — close HookIP, then run "
-                        "the new file to update.")
+            self._downloaded_path = dest
+            self._downloaded_ok = True
+            self.log.ok(f"Update downloaded to {dest} — press 'Install now' "
+                        "in Settings, or run the file manually.")
             notify.notify("HookIP update downloaded",
-                          f"Saved to {dest}. Close HookIP, then run the new "
-                          "file to update.", timeout_s=12)
-            self._ui_queue.put(("dl_done", ()))
+                          f"Saved to {dest}. Press 'Install now' in the app, "
+                          "or run the new file after closing HookIP.",
+                          timeout_s=12)
+            self._ui_queue.put(("dl_done", (True,)))
         except OSError as exc:
             if tmp:
                 try:
@@ -691,7 +708,7 @@ class App:
                     pass
             self.log.error(f"Update download failed: {exc} — use 'click to "
                            "update' to get it from the Releases page.")
-            self._ui_queue.put(("dl_done", ()))
+            self._ui_queue.put(("dl_done", (False,)))
 
     def _update_pill_click(self, _event=None):
         if getattr(self, "_update_url", None) and "⬆" in self.update_pill.cget("text"):
@@ -699,6 +716,51 @@ class App:
             webbrowser.open(self._update_url)
         else:
             self.check_updates(manual=True)
+
+    def _install_downloaded(self):
+        """One-click install of a verified download: HookIP closes cleanly
+        (proxy stopped, internet restored, settings saved) and the new exe
+        starts ~2 s later — via a detached waiter so it can never race our
+        single-instance mutex."""
+        dest = getattr(self, "_downloaded_path", None)
+        if not dest or not os.path.isfile(dest):
+            messagebox.showerror(
+                APP_NAME,
+                "The downloaded update file is gone —\n"
+                "download it again from Settings → Updates.")
+            self._dl_btn.configure(text=f"⬇ Download {self._pending_ver}"
+                                   if getattr(self, "_pending_ver", None)
+                                   else "⬇ Download",
+                                   command=self._download_update)
+            return
+        if getattr(self, "_installing", False):
+            return
+        if not messagebox.askyesno(
+                APP_NAME,
+                f"Install the downloaded update now?\n\n{dest}\n\n"
+                "HookIP will close, your internet settings will be "
+                "restored, and the new version will start."):
+            return
+        self._installing = True
+        try:
+            self._dl_btn.configure(state="disabled", text="installing…")
+        except tk.TclError:
+            pass
+        try:
+            subprocess.Popen(
+                ["cmd", "/c", "timeout", "/t", "2", "/nobreak", ">nul",
+                 "&", "start", "", dest],
+                creationflags=0x08000000)   # CREATE_NO_WINDOW
+        except OSError as exc:
+            self._installing = False
+            messagebox.showerror(APP_NAME, f"Could not start the installer:\n{exc}")
+            return
+        self.log.ok(f"Installing {os.path.basename(dest)} — HookIP is closing "
+                    "and your internet settings are being restored.")
+        try:
+            self.root.after(300, self.on_close)
+        except (tk.TclError, RuntimeError):
+            self.on_close()
 
     def _show_self(self):
         try:
@@ -1066,8 +1128,10 @@ class App:
                                  cursor="hand2")
         Tooltip(self._dl_btn,
                 "Downloads the new HookIP.exe straight from the release "
-                "into your Downloads folder. Close HookIP and run the new "
-                "file to update (settings are kept).")
+                "(checksum-verified) into your Downloads folder, then "
+                "turns into 'Install now': HookIP closes, your internet "
+                "settings are restored, and the new version starts. "
+                "Settings are kept.")
         add_row("Updates", upd, 8)
 
         row = tk.Frame(setf, bg=PANEL)
