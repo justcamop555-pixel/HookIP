@@ -74,6 +74,32 @@ def test_qname_filter():
           and "9.9.9.9" in [v for (_n, t, _ttl, v) in answers if t == dm.TYPE_A],
           str(answers))
 
+    # A record BEFORE the CNAME in the answer section — the old single-pass
+    # filter dropped it (alias still unknown) and the domain looked dead
+    resp4 = build_resp("chain.test", [
+        ("alias.test", dm.TYPE_A, 60, b"\x0c\x0c\x0c\x0c"),   # before CNAME!
+        ("chain.test", 5, 300, enc_name("alias.test")),
+    ])
+    rcode, answers = dm.parse_response(resp4, qname="chain.test")
+    vals = [v for (_n, t, _ttl, v) in answers if t == dm.TYPE_A]
+    check("A before CNAME kept (order-independent chain)",
+          rcode == 0 and vals == ["12.12.12.12"], str(answers))
+
+    # multi-hop chain, records interleaved with unrelated entries
+    resp5 = build_resp("hop.test", [
+        ("unrelated.test", dm.TYPE_A, 60, b"\x0e\x0e\x0e\x0e"),
+        ("hop2.test", dm.TYPE_A, 60, b"\x0f\x0f\x0f\x0f"),
+        ("hop.test", 5, 300, enc_name("hop1.test")),
+        ("hop1.test", 5, 300, enc_name("hop2.test")),
+        ("hop2.test", dm.TYPE_AAAA, 60, b"\x20" * 15 + b"\x01"),
+    ])
+    rcode, answers = dm.parse_response(resp5, qname="hop.test")
+    a = dm.extract_ips(answers, dm.TYPE_A)
+    aaaa = dm.extract_ips(answers, dm.TYPE_AAAA)
+    check("multi-hop CNAME chain followed across interleaved records",
+          rcode == 0 and a == ["15.15.15.15"] and len(aaaa) == 1
+          and "unrelated" not in str(answers), str(answers))
+
     # no qname -> old behaviour (all records), tests keep working
     rcode, answers = dm.parse_response(resp)
     check("no qname: all records returned (back-compat)", len(answers) == 3)

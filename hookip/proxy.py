@@ -387,6 +387,12 @@ class ProxyServer:
                 host = host.strip("[]").lower()
                 opened = True
                 ssock = self._tunnel(csock, host, port)
+                # success instantly clears the repeat-failure cap: a host
+                # that flapped once used to stay capped for its full 60 s
+                # expiry even after recovery, so connections that would
+                # work via another strategy were refused in that window
+                with self._fails_lock:
+                    self._fails.pop(host, None)
             elif method in ("GET", "POST", "HEAD", "OPTIONS",
                             "PUT", "PATCH", "DELETE"):
                 opened = True
@@ -463,16 +469,29 @@ class ProxyServer:
 
     # ------------------------------------------------------------------
     @staticmethod
-    def _read_head(csock):
+    def _read_head(csock, first_byte_timeout=10.0):
         """Read one HTTP request head. Returns (data, complete).
 
         The cap must be generous: Steam-style clients ship several KB of
         session cookies on EVERY request, and cookie-heavy browsers push a
         single request head well past 32 KB. The old 32 KB cap silently
         truncated such requests (no terminator, parsed anyway, upstream saw
-        garbage) — that was the 'Steam sometimes refuses to connect' bug."""
+        garbage) — that was the 'Steam sometimes refuses to connect' bug.
+
+        The FIRST byte gets a shorter timeout than the rest: idle browser
+        preconnects (connect then send nothing) used to pin a full
+        connection slot for the whole 30 s — a burst of them could starve
+        the connection budget and make real requests hit the 503 path.
+        10 s covers every real preconnect; genuine slow clients that are
+        mid-request still get 30 s for the remainder."""
         data = b""
         try:
+            csock.settimeout(first_byte_timeout)
+            first = csock.recv(16384)
+            if not first:
+                return (b"", False)
+            data = first
+            csock.settimeout(30.0)
             while b"\r\n\r\n" not in data and len(data) < 262144:
                 part = csock.recv(16384)
                 if not part:

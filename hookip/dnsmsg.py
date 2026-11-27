@@ -91,16 +91,14 @@ def _parse_response_inner(data, qname=None):
             raise ValueError("truncated question")
         off += 4
     expect = _norm_name(qname) if qname else None
-    alias = None            # current CNAME-chain target (normalized)
 
-    def _owned(rec_name):
-        """Record belongs to the question (or the alias chain so far)?"""
-        if expect is None:
-            return True
-        n = _norm_name(rec_name)
-        return n == expect or (alias is not None and n == alias)
-
-    answers = []
+    # Parse every record first, THEN decide ownership. The old filter was
+    # single-pass: an A record appearing BEFORE its CNAME in the answer
+    # section (legal DNS, and what a caching middlebox or reordered
+    # answer can produce) arrived while the alias was still unknown and
+    # was silently dropped — the domain then looked like it had 'no
+    # addresses' and the proxy refused the connection.
+    raw = []
     for _ in range(an):
         name, off = _read_name(data, off)
         if off + 10 > len(data):
@@ -112,17 +110,34 @@ def _parse_response_inner(data, qname=None):
             raise ValueError("truncated record data")
         off += rdlen
         if rtype == TYPE_A and rdlen == 4:
-            if _owned(name):
-                answers.append((name, rtype, ttl, ".".join(str(b) for b in rdata)))
+            raw.append((name, rtype, ttl, ".".join(str(b) for b in rdata)))
         elif rtype == TYPE_AAAA and rdlen == 16:
-            if _owned(name):
-                groups = [rdata[i:i + 2].hex() for i in range(0, 16, 2)]
-                answers.append((name, rtype, ttl, _compact_v6(groups)))
+            groups = [rdata[i:i + 2].hex() for i in range(0, 16, 2)]
+            raw.append((name, rtype, ttl, _compact_v6(groups)))
         elif rtype == 5:  # CNAME — parse so callers can follow if needed
             cname, _ = _read_name(data, off - rdlen)
-            if _owned(name):
-                answers.append((name, rtype, ttl, cname))
-                alias = _norm_name(cname)   # next records belong to this
+            raw.append((name, rtype, ttl, cname))
+
+    if expect is None:
+        return rcode, raw
+
+    # Follow the CNAME chain WHEREVER the records appear in the section
+    # (order-independent, multi-hop). A/AAAA records under the question
+    # name or any chain alias are kept; everything else is dropped.
+    aliases = set()
+    cur = expect
+    changed = True
+    while changed:
+        changed = False
+        for (n, t, _ttl, v) in raw:
+            if t == 5 and _norm_name(n) == cur:
+                tgt = _norm_name(v)
+                if tgt != cur and tgt not in aliases:
+                    aliases.add(tgt)
+                    cur = tgt
+                    changed = True
+    allowed = {expect} | aliases
+    answers = [rec for rec in raw if _norm_name(rec[0]) in allowed]
     return rcode, answers
 
 

@@ -849,6 +849,30 @@ def test_flap_retry_time_budget():
           and calls == ["smart"], f"calls={calls} err={result.get('err')}")
 
 
+def test_recent_fail_cleared_on_success():
+    """A host that failed everything gets a 60 s single-attempt cap — but
+    the FIRST SUCCESS must clear it instantly, so recovery is immediate
+    instead of being refused via the capped path for the remaining window."""
+    ps = make_server()
+    host = "recover.test"
+    ps._note_fail(host, dpi=False)
+    check("recent-fail cap active after a failure",
+          ps._recent_fail(host), "capped too early?")
+    # simulate the handler's success path (the _fails pop moved next to
+    # the successful _tunnel call in _handle)
+    with ps._fails_lock:
+        ps._fails.pop(host, None)
+    check("success clears the cap instantly", not ps._recent_fail(host))
+
+    # and the code really does it: the pop must sit next to the tunnel
+    # success in _handle (guard against regressions)
+    import inspect
+    src = inspect.getsource(proxymod.ProxyServer._handle)
+    check("_handle clears _fails right after a successful tunnel",
+          "_tunnel(csock, host, port)" in src
+          and "_fails.pop(host, None)" in src.split("_tunnel(csock, host, port)")[1][:500])
+
+
 def test_bind_error_messages():
     """Start's bind failure must distinguish 'in use' from Windows-reserved
     ranges (Hyper-V/WSL reserve large blocks; WinError 10013 there used to
@@ -996,6 +1020,7 @@ if __name__ == "__main__":
     test_flap_retry_skips_never_worked()
     test_flap_retry_time_budget()
     test_bind_error_messages()
+    test_recent_fail_cleared_on_success()
 
     print()
     print(f"Summary: {sum(1 for _, c in RESULTS if c)}/{len(RESULTS)} passed")
