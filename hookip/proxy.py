@@ -401,10 +401,15 @@ class ProxyServer:
                 blocked = True
                 key = host or msg[:80]
                 now_s = time.time()
-                if len(self._blocked_seen) > 500:
-                    self._blocked_seen.clear()
-                if now_s - self._blocked_seen.get(key, 0) > 10:
-                    self._blocked_seen[key] = now_s
+                # shared dict mutated from every handler thread — under
+                # _state_lock like the rest (the class comment declares it)
+                with self._state_lock:
+                    if len(self._blocked_seen) > 500:
+                        self._blocked_seen.clear()
+                    note_recent = now_s - self._blocked_seen.get(key, 0) <= 10
+                    if not note_recent:
+                        self._blocked_seen[key] = now_s
+                if not note_recent:
                     self.log.info(f"{msg} — blocked/dead upstream, not a HookIP failure")
                 else:
                     # parallel connections to the same dead host: log once
@@ -985,10 +990,15 @@ class ProxyServer:
         if outcome == "server":
             key = host
             now_s = time.time()
-            if len(self._cut_seen) > 500:
-                self._cut_seen.clear()
-            if now_s - self._cut_seen.get(key, 0) > 30:
-                self._cut_seen[key] = now_s
+            # shared dict mutated from many handler threads — under
+            # _state_lock like the rest
+            with self._state_lock:
+                if len(self._cut_seen) > 500:
+                    self._cut_seen.clear()
+                cut_recent = now_s - self._cut_seen.get(key, 0) <= 30
+                if not cut_recent:
+                    self._cut_seen[key] = now_s
+            if not cut_recent:
                 self.log.warn(f"{host} upstream cut the connection mid-transfer "
                               f"({down} B received before the cut)")
             else:
@@ -1078,7 +1088,11 @@ class ProxyServer:
             while True:
                 r, _, _ = select.select([server, csock], [], [], 30)
                 if not r:
-                    break
+                    # 30 s of complete silence on BOTH ends: keep waiting
+                    # (same policy as _relay) — a slow server pausing mid-
+                    # response used to be answered with a silent close and
+                    # an 'empty reply' on the client
+                    continue
                 for s in r:
                     try:
                         data = s.recv(65536)
