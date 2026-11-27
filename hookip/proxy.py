@@ -26,6 +26,13 @@ class DpiReset(OSError):
     strategy retries exist to defeat exactly this."""
 
 
+class ConnectDead(OSError):
+    """The TCP connect itself failed (timed out / network unreachable /
+    refused) before any ClientHello byte was sent. Fragmentation strategy
+    changes cannot influence a SYN that never completed — retrying all 3
+    strategies is pure waste (~9 s for a dead host)."""
+
+
 class UpstreamDied(DpiReset):
     """The upstream server accepted the connection but died before ever
     sending anything back (mid-handshake reset after our 1.5s probe window).
@@ -632,6 +639,16 @@ class ProxyServer:
                 attempt_errors.append(f"{strategy}: {exc}")
                 self.log.debug(f"{host}: attempt {attempt+1} ({strategy}) failed: {exc}")
                 break
+            except ConnectDead as exc:
+                # the TCP connect itself died (timeout / unreachable network /
+                # refused) — that happens BEFORE any ClientHello byte, so a
+                # different fragmentation strategy cannot help; stop after
+                # one attempt instead of burning ~9 s re-dialing a dead host
+                saw_dpi = False
+                last_err = exc
+                attempt_errors.append(f"{strategy}: {exc}")
+                self.log.debug(f"{host}: attempt {attempt+1} ({strategy}) failed: {exc}")
+                break
             except OSError as exc:
                 if isinstance(exc, DpiReset):
                     saw_dpi = True
@@ -819,7 +836,7 @@ class ProxyServer:
                 server = self._connect_parallel(ips, port, timeout=3.0)
             except OSError as exc:
                 kind = "timed out" if "timed out" in str(exc) else "refused/unreachable"
-                raise OSError(
+                raise ConnectDead(
                     f"{host}:{port} could not connect ({len(ips)} address(es) tried, {kind})") from exc
         conn_ms = (time.time() - t1) * 1000
         server.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)

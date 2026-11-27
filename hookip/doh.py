@@ -424,10 +424,15 @@ class Resolver:
                 # a single unconfirmed DoH NXDOMAIN vote makes TCP DNS the
                 # second opinion (one agreeing server confirms it); with no
                 # DoH vote, two TCP servers must agree
-                ips, ttl = self._via_tcp_dns(
-                    host, qtype,
-                    doh_nx_vote=bool(doh_note
-                                     and doh_note.startswith("NXDOMAIN (unconfirmed")))
+                try:
+                    ips, ttl = self._via_tcp_dns(
+                        host, qtype,
+                        doh_nx_vote=bool(doh_note
+                                         and doh_note.startswith("NXDOMAIN (unconfirmed")))
+                except VerifiedNegative:
+                    raise           # a confirming vote is a verdict, not noise
+                except (ResolveError, OSError):
+                    ips, ttl = [], ttl
         except VerifiedNegative as exc:
             verified_neg = str(exc)
             ips, ttl = [], ttl
@@ -453,41 +458,63 @@ class Resolver:
             neg_ttl = 60 if unconfirmed_nx else (300 if verified_neg else 120)
             with self._lock:
                 self._neg_cache[host] = (now + neg_ttl, reason)
-            if not verified_neg and self.cfg.doh_enabled:
-                # IPv6-only host? one AAAA pass before giving up — connecting
-                # through the tunnel to an IPv6 address works fine
+
+            # CROSS-TYPE last chance: a name can be AAAA-only
+            # (brunhild.challenges.cloudflare.com: the A query is a verified
+            # NODATA from every provider, but AAAA has live addresses) or
+            # A-only. This runs whether or not the first verdict was
+            # verified — NXDOMAIN skips it (the name does not exist at all,
+            # so no record type can answer). Finding a usable address here
+            # beats reporting a false 'dead domain'.
+            nx_verdict = bool(verified_neg and "NXDOMAIN" in verified_neg)
+            other = (dnsmsg.TYPE_AAAA if qtype == dnsmsg.TYPE_A
+                     else dnsmsg.TYPE_A)
+            other_note = None
+            if not nx_verdict:
                 try:
-                    ips, ttl, note_aaaa = self._via_doh(host, dnsmsg.TYPE_AAAA)
-                    if not ips and note_aaaa:
-                        # the name exists (a resolver answered) but has no A
-                        # AND no AAAA records — genuinely addressless: upgrade
-                        # the cached verdict from 'DNS unreachable' to the
-                        # verified NODATA story
-                        with self._lock:
-                            self._neg_cache[host] = (
-                                now + (60 if note_aaaa.startswith(
-                                    "NXDOMAIN (unconfirmed") else 300),
-                                note_aaaa)
-                        reason = note_aaaa
-                    if ips:
-                        ips = [ip for ip in ips if not is_sinkhole(ip)]
-                        # the negative mark above is WRONG now (the name has
-                        # AAAA records) — clear it or resolve() would report
-                        # 'cached NXDOMAIN' for the next 120s while a working
-                        # address sits in the positive cache
-                        with self._lock:
-                            self._neg_cache.pop(host, None)
+                    if self.cfg.doh_enabled:
+                        ips, ttl, other_note = self._via_doh(host, other)
                 except (ResolveError, OSError):
-                    ips = []
+                    ips, other_note = [], None
                 if not ips:
                     try:
-                        ips, ttl = self._via_tcp_dns(host, dnsmsg.TYPE_AAAA)
-                        if ips:
-                            ips = [ip for ip in ips if not is_sinkhole(ip)]
-                            with self._lock:
-                                self._neg_cache.pop(host, None)
+                        ips, ttl = self._via_tcp_dns(
+                            host, other,
+                            doh_nx_vote=bool(other_note and other_note.startswith(
+                                "NXDOMAIN (unconfirmed")))
                     except (ResolveError, OSError):
                         ips = []
+                if ips:
+                    ips = [ip for ip in ips if not is_sinkhole(ip)]
+                if ips:
+                    # the negative mark above is WRONG now (a working
+                    # address exists) — clear it or resolve() would report
+                    # a cached negative while the positive cache below is
+                    # written with real addresses
+                    with self._lock:
+                        self._neg_cache.pop(host, None)
+                elif other_note and not other_note.startswith("NXDOMAIN"):
+                    # both types answered-empty: one honest merged verdict
+                    other_kind = "AAAA" if qtype == dnsmsg.TYPE_A else "A"
+                    if verified_neg and "(" in verified_neg:
+                        kind = ("no A or AAAA records"
+                                if qtype == dnsmsg.TYPE_A
+                                else "no AAAA or A records")
+                        reason = f"{kind} ({verified_neg.split('(', 1)[1]}"
+                        if not reason.endswith(")"):
+                            reason += ")"
+                        neg_ttl = 300
+                    elif verified_neg:
+                        reason = f"{reason}; {other_kind} check: {other_note}"
+                        neg_ttl = 120
+                    else:
+                        # primary lookups were network-dead, but the cross
+                        # type was answered-empty — say both halves
+                        reason = (f"{reason} ({other_kind} lookup answered "
+                                  f"empty: {other_note})")
+                        neg_ttl = 60
+                    with self._lock:
+                        self._neg_cache[host] = (now + neg_ttl, reason)
             if not ips:
                 raise ResolveError(reason if reason.startswith("no addresses for ")
                                    else f"no addresses for {host} ({reason})")

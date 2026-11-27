@@ -743,6 +743,39 @@ def test_cached_negative_blocked():
     client.close(); client_peer.close()
 
 
+# ---- 15. connect-dead fail-fast ----------------------------------------
+def test_connect_dead_fail_fast():
+    check("ConnectDead subclasses OSError",
+          issubclass(proxymod.ConnectDead, OSError))
+    ps = make_server()
+    calls = []
+
+    def fake_tunnel_once(csock, host, port, strategy, first, excl=False,
+                         force_no_frag=False):
+        calls.append(strategy)
+        raise proxymod.ConnectDead(
+            f"{host}:{port} could not connect (1 address(es) tried, timed out)")
+
+    ps._tunnel_once = fake_tunnel_once
+    client, client_peer = socketpair()
+    result = {}
+    th = run_tunnel_async(ps, client, client_peer, "deadhost.test", 443, result)
+    th.join(10)
+    err = result.get("err")
+    check("connect-dead raises (single attempt)",
+          isinstance(err, OSError) and "could not connect" in str(err),
+          str(err)[:80] if err else str(result))
+    check("connect-dead: exactly ONE strategy attempt (no cycling)",
+          len(calls) == 1, str(calls))
+    with ps._fails_lock:
+        entry = ps._fails.get("deadhost.test")
+    # capped=True on count=1 means the failure was NOT dpi-flagged
+    # (dpi failures get ONE uncapped retry cycle first)
+    check("connect-dead: capped immediately (dpi not flagged)",
+          entry is not None and entry[1] == 1 and entry[2] is True, str(entry))
+    client.close(); client_peer.close()
+
+
 if __name__ == "__main__":
 
     test_parse_head_body()
@@ -762,6 +795,7 @@ if __name__ == "__main__":
     test_put_patch_delete()
     test_upstream_skips_dns()
     test_cached_negative_blocked()
+    test_connect_dead_fail_fast()
 
     print()
     print(f"Summary: {sum(1 for _, c in RESULTS if c)}/{len(RESULTS)} passed")

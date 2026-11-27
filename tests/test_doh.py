@@ -413,6 +413,85 @@ def test_tcp_confirms_doh_vote():
     check("confirmed NX cached 300 s", entry is not None and entry[0] - time.time() > 200)
 
 
+# ---- 11. cross-type fallback (AAAA-only / A-only names) ---------------
+def test_cross_type_fallback():
+    # an A-negative name may be AAAA-only (brunhild.challenges.cloudflare.com)
+    calls = []
+    r = make_resolver()
+
+    def via_doh(host, qtype):
+        calls.append(qtype)
+        if qtype == 1:
+            return [], 120, "no A records (NODATA, verified via DoH Cloudflare, Google)"
+        return ["2606:4700::1234"], 300, None
+
+    def tcp(host, qtype, doh_nx_vote=False):
+        raise OSError("tcp dead")
+
+    r._via_doh = via_doh
+    r._via_tcp_dns = tcp
+    ips = r._lookup_uncached("aaaaonly.test", 1, time.time())
+    check("AAAA-only name: A-negative falls through to AAAA",
+          ips == ["2606:4700::1234"], str(ips))
+    with r._lock:
+        hit = r._cache.get("aaaaonly.test")
+        neg = r._neg_cache.get("aaaaonly.test")
+    check("AAAA-only name: positive cached, negative cleared",
+          hit is not None and neg is None, f"hit={hit} neg={neg}")
+
+    # genuinely dead name: both types NODATA -> one merged verdict, 300 s
+    r2 = make_resolver()
+
+    def via_doh2(host, qtype):
+        label = "no A records" if qtype == 1 else "no AAAA records"
+        return [], 120, f"{label} (NODATA, verified via DoH Cloudflare, Google)"
+
+    r2._via_doh = via_doh2
+    r2._via_tcp_dns = tcp
+    try:
+        r2._lookup_uncached("dead.test", 1, time.time())
+        check("both-NODATA raises", False, "no raise")
+    except ResolveError as e:
+        check("both-NODATA raises", True)
+        check("both-NODATA merged verdict names both types",
+              "no A or AAAA records" in str(e), str(e)[:90])
+    with r2._lock:
+        entry = r2._neg_cache.get("dead.test")
+    check("both-NODATA cached 300 s",
+          entry is not None and entry[0] - time.time() > 200, str(entry))
+
+    # reverse direction: AAAA-primary falls back to A
+    r3 = make_resolver()
+
+    def via_doh3(host, qtype):
+        if qtype == 28:
+            return [], 120, "no AAAA records (NODATA, verified via DoH Google)"
+        return ["1.2.3.4"], 300, None
+
+    r3._via_doh = via_doh3
+    r3._via_tcp_dns = tcp
+    ips = r3._lookup_uncached("aonly.test", 28, time.time())
+    check("AAAA-negative falls back to A", ips == ["1.2.3.4"], str(ips))
+
+    # NXDOMAIN skips the cross-type attempt entirely
+    r4 = make_resolver()
+
+    def via_doh4(host, qtype):
+        calls.append(f"nx{qtype}")
+        raise VerifiedNegative(f"{host}: NXDOMAIN (verified via DoH Cloudflare, Google)")
+
+    calls.clear()
+    r4._via_doh = via_doh4
+    r4._via_tcp_dns = tcp
+    try:
+        r4._lookup_uncached("nx.test", 1, time.time())
+        check("NXDOMAIN raises", False, "no raise")
+    except ResolveError:
+        check("NXDOMAIN raises", True)
+    check("NXDOMAIN skips cross-type DoH attempt",
+          calls == ["nx1"], str(calls))
+
+
 # ---- 7. hedging ------------------------------------------------------
 def test_hedging():
     # resolver 1 hangs, resolver 2 answers fast -> total well under 0.4+5
@@ -540,6 +619,7 @@ if __name__ == "__main__":
     test_nx_voting()
     test_unconfirmed_cached_60s()
     test_tcp_confirms_doh_vote()
+    test_cross_type_fallback()
     test_hedging()
     test_udp_verification()
     test_start_idx_threadsafe()
