@@ -193,6 +193,8 @@ class App:
                             b.configure(state="normal")
                         except tk.TclError:
                             pass
+                elif kind == "emergency_done":
+                    self._set_running_ui(False)
                 elif kind == "dl_done":
                     try:
                         self._dl_btn.configure(state="normal")
@@ -1342,7 +1344,10 @@ class App:
     def _on_accept_death(self):
         """The listener died while Windows still points at it — without this
         hook the user's internet would be broken and the app would still say
-        'Running'. Emergency: restore the original proxy settings NOW."""
+        'Running'. Emergency: restore the original proxy settings NOW.
+        BUGFIX: this runs on the proxy's accept thread — widget calls from a
+        non-main thread can crash Tk (right when the proxy already died), so
+        the UI refresh is marshalled through _ui_queue/_pump_ui."""
         try:
             self.log.error("Proxy listener died unexpectedly — restoring your "
                            "internet immediately.")
@@ -1350,6 +1355,7 @@ class App:
                           "The proxy stopped unexpectedly; your original "
                           "internet settings were restored.", timeout_s=12)
             self._emergency_restore()
+            self._ui_queue.put(("emergency_done", ()))
         except Exception:
             pass
 
@@ -1376,7 +1382,8 @@ class App:
             self.log.ok("Emergency restore done — internet is back.")
         except Exception as exc:
             self.log.error(f"Emergency restore failed: {exc}")
-        self._set_running_ui(False)
+        # UI refresh happens on the main thread via _pump_ui ("emergency_done")
+        # — this hook runs on the accept thread and must not touch Tk directly
 
     def stop_proxy(self, tell_user=True):
         if not self.running:
@@ -1711,14 +1718,23 @@ class App:
             b.configure(state="disabled")
         self._diag_result("Diagnostics", "running", time.strftime("%H:%M:%S"), "info")
 
+        # capture Tk variables on the MAIN thread — the work() thread below
+        # must never touch Tk/Tk variables (cross-thread Tcl access is
+        # undefined behaviour and has crashed interpreters)
+        ui_port = int(self.port_var.get()) if self.port_var.get().isdigit() else self.cfg.port
+        try:
+            ui_frag = max(1, int(self.frag_var.get()))
+        except (ValueError, tk.TclError, RuntimeError):
+            ui_frag = max(1, self.cfg.fragment_size)
+
         def work():
             try:
                 if sections in ("all", "system"):
                     self._diag_system()
                 if sections == "all":
-                    self._diag_settings()
+                    self._diag_settings(ui_port, ui_frag)
                 if sections in ("all", "dns"):
-                    self._diag_dns()
+                    self._diag_dns(ui_frag)
                 if sections in ("all", "tunnel"):
                     self._diag_tunnel()
                 self._diag_result("Summary", "done", "", "info")
@@ -1730,11 +1746,13 @@ class App:
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _diag_settings(self):
-        """Sanity of the numeric settings + port availability."""
+    def _diag_settings(self, ui_port=None, ui_frag=None):
+        """Sanity of the numeric settings + port availability.
+        ui_port/ui_frag are captured on the main thread before this runs
+        (background threads must not read Tk variables)."""
         self._diag_section("Settings")
         try:
-            port = int(self.port_var.get())
+            port = ui_port if ui_port is not None else int(self.port_var.get())
             ok = 1 <= port <= 65535
             self._diag_result("Local port", "OK" if ok else "FAIL",
                               f"{port}" if ok else f"{port} is not in 1–65535",
@@ -1758,7 +1776,7 @@ class App:
         except (ValueError, tk.TclError):
             self._diag_result("Local port", "FAIL", "not a number (1–65535)", "fail")
         try:
-            frag = int(self.frag_var.get())
+            frag = ui_frag if ui_frag is not None else int(self.frag_var.get())
             ok = 1 <= frag <= 255
             self._diag_result("Fragment size", "OK" if ok else "FAIL",
                               f"{frag} bytes" if ok else f"{frag} is not in 1–255",
@@ -1791,6 +1809,13 @@ class App:
             pass
         try:
             from . import dataguard
+            from .config import APP_DIR          # BUGFIX: referenced below but
+                                                 # only ever imported inside
+                                                 # __init__ — when hardening had
+                                                 # failed, the NameError was
+                                                 # swallowed and the whole 'Data
+                                                 # protection' diagnostic row
+                                                 # silently vanished
             log_files = [n for n in (os.listdir(self._log_dir)
                                      if os.path.isdir(self._log_dir) else [])
                          if n.startswith("hookip_") and (n.endswith(".hlog") or n.endswith(".log"))]
@@ -1866,10 +1891,10 @@ class App:
         except (OSError, subprocess.SubprocessError) as exc:
             self._diag_result("Windows Defender", "info", f"status unavailable ({type(exc).__name__})")
 
-    def _diag_dns(self):
+    def _diag_dns(self, ui_frag=None):
         self._diag_section("DNS resolvers (DNS-over-HTTPS)")
         try:
-            frag = max(1, int(self.frag_var.get()))
+            frag = ui_frag if ui_frag is not None else max(1, int(self.frag_var.get()))
         except (ValueError, tk.TclError, RuntimeError):
             frag = max(1, self.cfg.fragment_size)
         query = dnsmsg.encode_query("example.com")
@@ -1953,7 +1978,8 @@ class App:
         """Plain-HTTP request with a Steam-sized Cookie head (~40 KB).
         The old 32 KB read cap truncated this into a malformed upstream
         request — the 'Steam sometimes refuses' bug."""
-        local_port = self.cfg.port if self.running else int(self.port_var.get())
+        local_port = self.cfg.port   # only reached while running; cfg.port is
+                             # authoritative and avoids a bg-thread Tk read
         cookie = "; ".join(f"session{i}=" + ("x" * 96) for i in range(500))
         req = (f"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n"
                f"Cookie: {cookie}\r\nConnection: close\r\n\r\n").encode()
@@ -1974,7 +2000,8 @@ class App:
         """Steam CDNs often CONNECT by literal IP with the SNI carrying the
         name. Mimic that end-to-end: resolve via the proxy's DoH, CONNECT to
         the IP, then TLS with the real hostname."""
-        local_port = self.cfg.port if self.running else int(self.port_var.get())
+        local_port = self.cfg.port   # only reached while running; cfg.port is
+                             # authoritative and avoids a bg-thread Tk read
         host = "github.com"
         ips = self.proxy.resolver.resolve(host) if self.proxy else [socket.gethostbyname(host)]
         with socket.create_connection(("127.0.0.1", local_port), timeout=10) as s:
@@ -2013,7 +2040,8 @@ class App:
         """Drive a real CONNECT + TLS handshake through our own proxy.
         Returns the response line PLUS a timing breakdown (CONNECT / TLS /
         first byte) so a slow stage is visible in diagnostics."""
-        local_port = self.cfg.port if self.running else int(self.port_var.get())
+        local_port = self.cfg.port   # only reached while running; cfg.port is
+                             # authoritative and avoids a bg-thread Tk read
         t_connect = t_tls = t_ttfb = 0.0
         t0 = time.time()
         with socket.create_connection(("127.0.0.1", local_port), timeout=10) as s:

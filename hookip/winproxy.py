@@ -424,6 +424,14 @@ class Watchdog:
     def stop(self):
         if self._event:
             _k32.SetEvent(self._event)
+            # the onefile child reacts to the event instantly (~0.01 s) —
+            # give it that moment so terminate() below stays a rare
+            # fallback: killing the bootloader PID would orphan the inner
+            # child process, and an orphan would resurrect the backup file
+            # from its memory copy ~10 s later (stale-restore hazard)
+            deadline = time.time() + 1.5
+            while time.time() < deadline and self._proc.poll() is None:
+                time.sleep(0.05)
             _k32.CloseHandle(self._event)     # one handle per start cycle
             self._event = None
         if self._proc and self._proc.poll() is None:

@@ -25,7 +25,7 @@ def check(name, cond, extra=""):
     print(("PASS" if cond else "FAIL"), name, extra, flush=True)
 
 
-def fake_restore_fail(path=wd.BACKUP_PATH):
+def fake_restore_fail(path=winproxy.BACKUP_PATH):
     return False
 
 

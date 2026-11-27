@@ -40,9 +40,14 @@ if (-not $done) {
         Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $dest -UseBasicParsing
         $done = $true
     } catch {
+        $why = $_.Exception.Message
+        if ($why -match 'being used by another process|in use') {
+            $why = "HookIP.exe is already running from this folder — stop it (right-click its tray icon > Exit) and run the installer again."
+        }
         throw @"
 
-Download failed. The repository is private, so anonymous downloads don't work.
+Download failed. ($why)
+The repository is private, so anonymous downloads don't work.
 Fix either way:
   * make the repo public (GitHub -> Settings -> Change visibility), or
   * log in the GitHub CLI once:  gh auth login

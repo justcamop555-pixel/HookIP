@@ -20,11 +20,10 @@ Design notes (v2):
 """
 import ctypes
 import os
-import sys
 import time
 
 from . import notify
-from .winproxy import BACKUP_PATH, _k32, restore_from_file, set_runonce
+from .winproxy import _k32, restore_from_file, set_runonce
 
 WAIT_OBJECT_0 = 0
 WAIT_TIMEOUT = 0x00000102          # 258
