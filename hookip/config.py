@@ -1,6 +1,7 @@
 """Settings persistence for HookIP (%LOCALAPPDATA%\\HookIP\\settings.json)."""
 import json
 import os
+import threading
 
 from . import APP_NAME
 from . import dataguard
@@ -98,7 +99,11 @@ class Config:
                     os.replace(SETTINGS_PATH, SETTINGS_PATH + ".bad")
                 except OSError:
                     pass
-                return cls()
+                c = cls()
+                # the caller surfaces this loudly (log + toast) — the old
+                # file with the user's site list is recoverable at .bad
+                c.quarantined = True
+                return c
             try:
                 return cls(json.loads(plain.decode("utf-8")))
             except ValueError:
@@ -116,7 +121,11 @@ class Config:
             # atomic write: settings.json is replaced only after the temp
             # file is fully on disk — a crash or power loss mid-save can no
             # longer corrupt the settings file (it used to truncate it)
-            tmp = SETTINGS_PATH + ".tmp"
+            # UNIQUE temp name per thread: saves can legitimately happen
+            # from two threads (PAC-token bootstrap, settings dialog) — a
+            # shared .tmp let the second writer truncate the first one's
+            # file mid-write and publish a corrupt mix.
+            tmp = SETTINGS_PATH + f".{threading.get_ident()}.tmp"
             with open(tmp, "w", encoding="utf-8") as fh:
                 # DPAPI-encrypted at rest: a copied settings.json shows no
                 # bypassed-site list, no port, nothing to profile

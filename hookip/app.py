@@ -75,6 +75,18 @@ class App:
                             f"in {_u_files} file(s) with the per-install key "
                             "— old generically-decryptable data is gone.")
             del _u_files, _u_lines
+            # settings still on the legacy static entropy? one save fixes it.
+            # SYNCHRONOUS here (beside the log upgrade, before any other
+            # thread can save) instead of from the background bootstrap —
+            # a settings save collides with the main thread's own saves.
+            try:
+                if (self.cfg.remember
+                        and _dg.settings_needs_entropy_upgrade(SETTINGS_PATH)):
+                    self.cfg.save()
+                    self.log.ok("Data guard: settings re-encrypted with the "
+                                "per-install key.")
+            except OSError:
+                pass
         except Exception:
             pass
         try:
@@ -89,9 +101,32 @@ class App:
         self.pac_token = self.cfg.pac_token or secrets.token_hex(8)
         if self.cfg.pac_token != self.pac_token:
             self.cfg.pac_token = self.pac_token
+            # persist the token only when the user wants settings kept —
+            # with 'Remember' off the file is deleted at Start anyway, and
+            # writing it here recreated data the user asked not to keep
+            if self.cfg.remember:
+                try:
+                    self.cfg.save()
+                except OSError:
+                    pass
+        if getattr(self.cfg, "quarantined", False):
+            # the encrypted settings could not be decrypted (corrupt blob,
+            # another Windows account, or a lost per-install key): defaults
+            # are active and the ORIGINALS are safe at settings.json.bad —
+            # say so instead of silently showing an empty site list
+            self.log.warn(
+                "Settings file could not be decrypted — starting with "
+                "defaults. Your previous settings are kept untouched at "
+                f"{SETTINGS_PATH}.bad and can be recovered after fixing "
+                "the cause (e.g. restore the file from the same Windows "
+                "account that created it).")
             try:
-                self.cfg.save()
-            except OSError:
+                notify.notify(
+                    "HookIP — settings need attention",
+                    "settings.json could not be decrypted; defaults are "
+                    "active. The original file was kept as "
+                    "settings.json.bad.", timeout_s=30)
+            except Exception:
                 pass
         self.proxy = None
         self.running = False
@@ -155,14 +190,6 @@ class App:
         from .config import APP_DIR
         try:
             from . import dataguard
-            # settings still on the legacy static entropy? one save fixes it
-            try:
-                if dataguard.settings_needs_entropy_upgrade(SETTINGS_PATH):
-                    self.cfg.save()
-                    self.log.debug("Data guard: settings re-encrypted with "
-                                   "the per-install key.")
-            except Exception:
-                pass
             self._dg_acl_ok = dataguard.harden_dir(APP_DIR)
             if not self._dg_acl_ok:
                 self.log.debug("Data guard: folder ACL hardening unavailable "
@@ -215,7 +242,11 @@ class App:
                     self._set_running_ui(False)
                 elif kind == "dl_done":
                     try:
-                        self._dl_btn.configure(state="normal")
+                        self._dl_btn.configure(
+                            state="normal",
+                            text=(f"⬇ Download {self._pending_ver}"
+                                  if getattr(self, "_pending_ver", None)
+                                  else "⬇ Download"))
                     except tk.TclError:
                         pass
         except queue.Empty:
@@ -444,6 +475,7 @@ class App:
             offline = True
         self._ui_queue.put(("update", (latest, url, offline, asset,
                                        sha_asset, prerelease)))
+
     @staticmethod
     def _ver_tuple(s):
         """Numeric compare that tolerates pre-release AND build-ID suffixes:
@@ -502,10 +534,12 @@ class App:
                     + (f" build {__build_id__}" if __build_id__ else "")
                     + f") is newer than the latest GitHub release ({latest}) "
                     "— nothing to update until it is published.")
-            elif prerelease and not getattr(self, "_update_manual", False):
+            elif newer and prerelease and not getattr(self, "_update_manual", False):
                 # pre-release builds (v1.2.0-beta) are opt-in: automatic
                 # checks stay on the stable channel and only mention them;
-                # a MANUAL check offers the download
+                # a MANUAL check offers the download. A pre-release whose
+                # version EQUALS the installed one falls through to
+                # 'up to date' below instead of claiming a release exists.
                 self.update_label.configure(
                     text=f"pre-release {latest} exists — stable stays installed",
                     fg=MUTED)
@@ -543,9 +577,19 @@ class App:
                 self._dl_btn.pack_forget()
         except (tk.TclError, RuntimeError):
             pass
-        # re-check every 12 h so a published update is noticed without a restart
+        # re-check every 12 h so a published update is noticed without a
+        # restart — CANCEL the previous timer first: every check used to
+        # schedule another one, so repeated manual checks multiplied the
+        # 12-hour timers permanently
         try:
-            self.root.after(12 * 3600 * 1000, self.check_updates)
+            old = getattr(self, "_update_after", None)
+            if old:
+                self.root.after_cancel(old)
+        except (tk.TclError, RuntimeError, ValueError):
+            pass
+        try:
+            self._update_after = self.root.after(12 * 3600 * 1000,
+                                                 self.check_updates)
         except (tk.TclError, RuntimeError):
             pass
 
@@ -588,7 +632,11 @@ class App:
                         break
                     data += chunk
             # verify against the release's published checksum — a corrupted
-            # download is deleted, not left behind to be run by mistake
+            # download is deleted, not left behind to be run by mistake.
+            # FAIL CLOSED once a checksum is published: if the .sha256 asset
+            # exists but cannot be fetched, the download is refused rather
+            # than saved unverified (the checksum lives on the same release
+            # page, so this guards corruption, not GitHub-side tampering).
             expected = None
             sha_url = getattr(self, "_update_sha_url", None)
             if sha_url:
@@ -598,6 +646,18 @@ class App:
                     expected = txt.split()[0].strip().lower() if txt.split() else None
                 except (OSError, urllib.error.URLError):
                     expected = None
+                if expected is None:
+                    self.log.error(
+                        "Update download REFUSED: the release publishes a "
+                        "checksum but it could not be fetched — install "
+                        "manually from the Releases page instead.")
+                    notify.notify(
+                        "HookIP — update download failed",
+                        "The checksum could not be verified, so the "
+                        "download was refused. Install manually from the "
+                        "Releases page.", timeout_s=12)
+                    self._ui_queue.put(("dl_done", ()))
+                    return
             if expected:
                 actual = hashlib.sha256(data).hexdigest()
                 if actual != expected:
@@ -609,6 +669,9 @@ class App:
                                   "The downloaded file did not match its "
                                   "checksum and was deleted. Try again.",
                                   timeout_s=12)
+                    # re-enable the button too — the mismatch path used to
+                    # leave it stuck on 'downloading…' forever
+                    self._ui_queue.put(("dl_done", ()))
                     return
                 self.log.ok("Downloaded update verified against the release checksum.")
             with open(tmp, "wb") as fh:
@@ -813,8 +876,8 @@ class App:
         self.log_filter.pack(side="left", padx=(6, 8))
         Tooltip(self.log_filter,
                 "Filter the on-screen log by importance.\n"
-                "'Everything' also reveals per-connection detail;\n"
-                "the log FILE on disk always keeps it all.")
+                "'Everything' also reveals per-connection detail; the "
+                "log file on disk (.hlog, encrypted) always keeps it all.")
         self.log_filter.bind("<<ComboboxSelected>>", lambda _e: self._apply_log_filter())
         save_btn = tk.Button(bar, text="Save log…", command=self._export_log,
                              bg="#202634", fg=FG, bd=0, padx=10, pady=3,
@@ -822,9 +885,11 @@ class App:
                              cursor="hand2")
         save_btn.pack(side="right")
         Tooltip(save_btn,
-                "Save the complete log (every detail, no filter) to a file —\n"
-                "perfect for attaching to a bug report. The log is also always\n"
-                "written to disk automatically: %LOCALAPPDATA%\\HookIP\\logs.")
+                "Save the complete log (every detail, no filter) to a file "
+                "— this is a DECRYPTED copy of your browsing history, so "
+                "share it only intentionally (e.g. a bug report). The log "
+                "is also always written to disk encrypted: "
+                "%LOCALAPPDATA%\\HookIP\\logs.")
         copy_btn = tk.Button(bar, text="Copy all", command=self._copy_log,
                              bg="#202634", fg=FG, bd=0, padx=10, pady=3,
                              activebackground="#2a3244", activeforeground=FG,
@@ -835,18 +900,20 @@ class App:
                           fg=MUTED, font=("Segoe UI", 8))
         sf_lbl.pack(side="right", padx=8)
         Tooltip(sf_lbl,
-                "The log file for this session (debug detail is always "
-                "written here, even with the on-screen filter set higher). "
-                "Logs are kept in %LOCALAPPDATA%\\HookIP\\logs and pruned "
-                "after 7 days.")
+                "This session's encrypted log file (.hlog): each line is "
+                "DPAPI-encrypted with a per-install key before it touches "
+                "disk — a copied file shows no browsing history. Logs are "
+                "kept in %LOCALAPPDATA%\\HookIP\\logs and pruned to the "
+                "newest 7 sessions.")
         self.log_text = tk.Text(logf, bg="#0d1017", fg=FG, insertbackground=FG,
                                 font=("Consolas", 9), state="disabled", wrap="none",
                                 height=10)
         self.log_text.pack(fill="both", expand=True)
         Tooltip(self.log_text,
                 "Live log view — filtered by the 'Show' selector above. "
-                "Use 'Save log…' for the complete unfiltered file; colors: "
-                "blue = DNS, teal = resolves, dim = per-connection detail.")
+                "Use 'Save log…' for the complete unfiltered (decrypted) "
+                "file; colors: blue = DNS, teal = resolves, dim = "
+                "per-connection detail.")
         for tag, color in (("info", FG), ("ok", OK), ("warn", WARN),
                            ("error", ERR), ("debug", MUTED)):
             self.log_text.tag_configure(tag, foreground=color)
@@ -1312,7 +1379,13 @@ class App:
             self.log.warn(f"System proxy not fully configured: {exc}")
 
         if cfg.remember:
-            cfg.save()
+            # Config.save already swallows OSError (the file keep its old
+            # content); guard anyway so NO exception can skip the running
+            # state below — by now Windows already routes through HookIP
+            try:
+                cfg.save()
+            except Exception:
+                pass
         else:
             # user chose not to remember — forget any previously stored settings
             try:
@@ -1524,7 +1597,12 @@ class App:
                         self.log_text.see("end")
             lines = int(self.log_text.index("end-1c").split(".")[0])
             if lines > 2500:
+                # the trim was silently IGNORED while the widget is
+                # 'disabled' (Tk ignores delete on a disabled Text) — the
+                # on-screen log grew without bound in long sessions
+                self.log_text.configure(state="normal")
                 self.log_text.delete("1.0", f"{lines - 2000}.0")
+                self.log_text.configure(state="disabled")
             self.root.after(250, self._pump_log)
         except Exception as exc:  # noqa: BLE001 — never stop the log pump;
             # only a real shutdown may end it (stray RuntimeErrors used to
@@ -1623,12 +1701,32 @@ class App:
                                 "of 2 protection processes were live).")
                         except OSError:
                             pass
+                    elif not getattr(self, "_wd_cap_warned", False):
+                        # the restart cap gave up — say it ONCE instead of
+                        # leaving crash protection silently degraded/gone
+                        self._wd_cap_warned = True
+                        self.log.warn(
+                            "Watchdog restart cap reached — crash "
+                            "protection is degraded. The proxy still "
+                            "works; restart HookIP to re-arm it.")
+                        try:
+                            notify.notify(
+                                "HookIP — crash protection degraded",
+                                "The watchdog kept dying and restarts "
+                                "gave up. The proxy still works; restart "
+                                "HookIP to re-arm crash protection.",
+                                timeout_s=30)
+                        except Exception:
+                            pass
                 else:
                     self._wd_restarts = 0
-            if self.root.state() != "iconic":
+                    self._wd_cap_warned = False   # healthy again — re-arm
+            if self.root.state() == "normal":
                 self._draw_spark()
-            if self.root.state() == "iconic":
-                # minimized: skip the expensive top-domains redraw (stats keep
+            if self.root.state() != "normal":
+                # minimized OR hidden to tray ('withdrawn' — the old
+                # '!= iconic' check still redrew every tick while hidden)
+                # skip the expensive top-domains redraw (stats keep
                 # accumulating; the watchdog check above still ran)
                 pass
             else:
@@ -1833,15 +1931,25 @@ class App:
         pats = self._parse_excluded()
         self._diag_result("Excluded domains", "OK", f"{len(pats)} valid pattern(s)", "ok")
         try:
-            Config.save(self.cfg)
             from . import dataguard as _dg
+            # READ-ONLY check — this used to call Config.save() from the
+            # diagnostics worker thread, which recreated settings.json even
+            # with 'Remember settings' off and raced the main thread's saves
             enc = _dg.is_encrypted_file(SETTINGS_PATH, _dg.CFG_MAGIC)
-            self._diag_result("Settings file", "OK",
-                              SETTINGS_PATH + " · encrypted at rest" if enc
-                              else SETTINGS_PATH + " · plaintext (re-encrypts on next save)",
-                              "ok")
+            if not os.path.exists(SETTINGS_PATH):
+                self._diag_result("Settings file", "OK",
+                                  "not saved yet ('Remember settings' is off)", "ok")
+            elif enc:
+                self._diag_result("Settings file", "OK",
+                                  SETTINGS_PATH + " · encrypted at rest "
+                                  "(per-install key)", "ok")
+            else:
+                self._diag_result("Settings file", "WARN",
+                                  SETTINGS_PATH + " · settings stored as "
+                                  "plaintext (re-encrypts on next save)", "warn")
         except OSError as exc:
-            self._diag_result("Settings file", "WARN", f"cannot save: {exc}", "warn")
+            self._diag_result("Settings file", "WARN",
+                              f"cannot read: {exc}", "warn")
 
     def _diag_system(self):
         self._diag_section("System")
@@ -1870,21 +1978,31 @@ class App:
                          if n.startswith("hookip_") and (n.endswith(".hlog") or n.endswith(".log"))]
             n_enc = sum(1 for n in log_files if n.endswith(".hlog"))
             n_plain = len(log_files) - n_enc
+            # leftover migration claims still hold PLAINTEXT on disk —
+            # they used to be invisible in this count
+            n_migrating = sum(1 for n in (os.listdir(self._log_dir)
+                              if os.path.isdir(self._log_dir) else [])
+                              if n.endswith(".log.migrating"))
             cfg_enc = (not os.path.exists(SETTINGS_PATH)) or dataguard.is_encrypted_file(
                 SETTINGS_PATH, dataguard.CFG_MAGIC)
             acl_ok = getattr(self, "_dg_acl_ok", False) or dataguard.acl_is_hardened(APP_DIR)
-            if n_plain == 0 and cfg_enc and acl_ok:
+            if n_plain == 0 and cfg_enc and acl_ok and not n_migrating:
                 self._diag_result(
                     "Data protection", "OK",
                     f"logs encrypted {n_enc}/{len(log_files)} · settings "
                     "encrypted (per-install key) · folder locked to your "
-                    "account")
+                    "account · limits: same-user software can still "
+                    "reverse DPAPI; old plaintext may persist in free "
+                    "disk space, OneDrive history and backups")
             else:
                 missing = []
                 if n_plain:
                     missing.append(f"{n_plain} plaintext log(s) pending encryption")
+                if n_migrating:
+                    missing.append(f"{n_migrating} migration claim file(s) "
+                                   "still hold plaintext")
                 if not cfg_enc:
-                    missing.append("settings file readable")
+                    missing.append("settings stored as plaintext")
                 if not acl_ok:
                     missing.append("folder ACL default")
                 self._diag_result("Data protection", "WARN",
@@ -1976,7 +2094,11 @@ class App:
 
     def _diag_tunnel(self):
         self._diag_section("End-to-end tunnel through HookIP")
-        if not (self.running and self.proxy):
+        # snapshot BEFORE the checks: Stop during the test clears
+        # self.proxy on the main thread — reaching back into it below
+        # (locks/detail) could hit None mid-diagnostic
+        proxy = self.proxy
+        if not (self.running and proxy):
             self._diag_result("Tunnel test", "skipped", "start the proxy first", "info")
             return
         ok_count = 0
@@ -2016,9 +2138,8 @@ class App:
         self._diag_result("Tunnel summary", f"{ok_count}/{n} passed", "",
                           "ok" if ok_count == n else ("warn" if ok_count else "fail"))
         # last-tunnel detail straight from the running proxy
-        if self.proxy:
-            with self.proxy._detail_lock:
-                detail = dict(self.proxy._tunnel_detail)
+        with proxy._detail_lock:
+            detail = dict(proxy._tunnel_detail)
             if detail:
                 best = sorted(detail.items(), key=lambda kv: kv[1][4])[:3]
                 self._diag_result("Last tunnels", "info",
@@ -2142,9 +2263,14 @@ class App:
             self._closing.set()
             if self.running:
                 self.stop_proxy(tell_user=False)   # no toast during exit
-            self.cfg.minimize_to_tray = self.tray_var.get()
-            if self.cfg.remember:
-                self.cfg.save()
+            # the final save must never skip the cleanup below (tray icon,
+            # log file) — a failed save used to leave the tray icon behind
+            try:
+                self.cfg.minimize_to_tray = self.tray_var.get()
+                if self.cfg.remember:
+                    self.cfg.save()
+            except Exception:
+                pass
             self.log.session_end()
             self.log.close_file()
             try:
