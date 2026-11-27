@@ -12,6 +12,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 import winreg
 
 from . import APP_NAME
@@ -35,6 +36,8 @@ _k32.ResetEvent.argtypes = [wt.HANDLE]
 _k32.ResetEvent.restype = wt.BOOL
 _k32.WaitForSingleObject.argtypes = [wt.HANDLE, wt.DWORD]
 _k32.WaitForSingleObject.restype = wt.DWORD
+_k32.WaitForMultipleObjects.argtypes = [wt.DWORD, ctypes.POINTER(wt.HANDLE), wt.BOOL, wt.DWORD]
+_k32.WaitForMultipleObjects.restype = wt.DWORD
 _k32.CloseHandle.argtypes = [wt.HANDLE]
 _k32.CloseHandle.restype = wt.BOOL
 
@@ -406,10 +409,22 @@ class Watchdog:
                 env = dict(os.environ, PYTHONPATH=pkg_parent)
         flags = 0x08000000  # CREATE_NO_WINDOW
         self._proc = subprocess.Popen(args, creationflags=flags, close_fds=True, env=env)
+        # a watchdog that died at birth (broken cwd / python) used to leave
+        # crash protection silently OFF for the whole session — verify it
+        # actually survived startup, and respawn once before giving up
+        time.sleep(0.4)
+        if self._proc.poll() is not None:
+            try:
+                self._proc = subprocess.Popen(args, creationflags=flags,
+                                              close_fds=True, env=env)
+                time.sleep(0.4)
+            except OSError:
+                self._proc = None
 
     def stop(self):
         if self._event:
             _k32.SetEvent(self._event)
+            _k32.CloseHandle(self._event)     # one handle per start cycle
             self._event = None
         if self._proc and self._proc.poll() is None:
             try:

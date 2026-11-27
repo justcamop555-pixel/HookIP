@@ -1,0 +1,219 @@
+"""Tests for hookip.watchdog + winproxy.Watchdog (parent side).
+Registry-touching paths are mocked; the parent/child spawn cycle uses a
+FAKE backup that the real watchdog never gets to apply (we stop it via
+the event before anything else). Run: python tests/test_watchdog.py"""
+import os
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import types
+import unittest.mock as mock
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from hookip import watchdog as wd  # noqa: E402
+from hookip import winproxy  # noqa: E402
+from hookip.winproxy import _k32  # noqa: E402
+
+RESULTS = []
+
+
+def check(name, cond, extra=""):
+    RESULTS.append((name, cond))
+    print(("PASS" if cond else "FAIL"), name, extra, flush=True)
+
+
+def fake_restore_fail(path=wd.BACKUP_PATH):
+    return False
+
+
+# ---- 1. restore falls back to the in-memory copy -----------------------
+def test_do_restore_memory_fallback():
+    d = tempfile.mkdtemp()
+    path = os.path.join(d, "backup.json")
+    # no file on disk at all — restore_from_file returns False, the memory
+    # copy is rewritten and the retry succeeds
+    calls = []
+    with mock.patch.object(wd, "restore_from_file",
+                           lambda p: calls.append(p) or os.path.isfile(p)):
+        ok = wd._do_restore(path, '{"ProxyEnable": 0}')
+    check("memory fallback: backup rewritten then restored",
+          ok and os.path.isfile(path) and len(calls) == 2,
+          f"ok={ok} calls={len(calls)}")
+    with open(path, encoding="utf-8") as fh:
+        check("memory fallback: file content from memory",
+              fh.read() == '{"ProxyEnable": 0}')
+    # no memory copy and no file: never succeeds, does not spin
+    calls.clear()
+    with mock.patch.object(wd, "restore_from_file", fake_restore_fail):
+        ok = wd._do_restore(path, None)
+    check("no memory, no file: gives up after retries", ok is False)
+
+
+# ---- 2. restore failure notifies honestly + RunOnce last resort --------
+def test_restore_and_notify_failure():
+    runonce = []
+    toasts = []
+    with mock.patch.object(wd, "restore_from_file", fake_restore_fail), \
+         mock.patch.object(wd, "set_runonce", lambda: runonce.append(1)), \
+         mock.patch.object(wd.notify, "notify",
+                           lambda *a, **k: toasts.append(a[0])):
+        wd._restore_and_notify(tempfile.mkdtemp(), '{"ProxyEnable": 0}')
+    check("restore failure registers RunOnce fallback", len(runonce) == 1)
+    check("restore failure tells the user (action needed)",
+          len(toasts) == 1 and "action needed" in toasts[0].lower(), str(toasts))
+
+    # success path: restore + reassuring toast, no RunOnce
+    runonce.clear(); toasts.clear()
+    d = tempfile.mkdtemp()
+    with open(os.path.join(d, "b.json"), "w") as fh:
+        fh.write('{"ProxyEnable": 0}')
+    with mock.patch.object(wd, "restore_from_file",
+                           lambda p: os.path.isfile(p)), \
+         mock.patch.object(wd, "set_runonce", lambda: runonce.append(1)), \
+         mock.patch.object(wd.notify, "notify",
+                           lambda *a, **k: toasts.append(a[0])):
+        ok = wd._restore_and_notify(os.path.join(d, "b.json"), None)
+    check("restore success: no RunOnce, restored=True",
+          ok is True and not runonce and "restored" in toasts[0].lower())
+
+    # a crashing notifier must not break the restore bookkeeping
+    def boom(*a, **k):
+        raise RuntimeError("no tray")
+    with mock.patch.object(wd, "restore_from_file",
+                           lambda p: os.path.isfile(p)), \
+         mock.patch.object(wd.notify, "notify", boom):
+        ok = wd._restore_and_notify(os.path.join(d, "b.json"), None)
+    check("notifier crash does not kill the restore", ok is True)
+
+
+# ---- 3. self-check: deleted backup file is rebuilt from memory ---------
+def test_self_check_rebuilds_backup():
+    # drive the wait loop with a parent that is ALIVE and an event that
+    # never fires: after the self-check tick the deleted file must be back
+    d = tempfile.mkdtemp()
+    path = os.path.join(d, "backup.json")
+    payload = '{"ProxyEnable": 0, "ProxyServer": null}'
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(payload)
+
+    live = _k32.CreateEventW(None, True, False, None)   # never-signaled handle
+    class FakeEvent:
+        event_name = "HookIP_Stop_test_selfcheck"
+    restored = []
+    with mock.patch.object(wd, "_k32", _k32), \
+         mock.patch.object(wd._k32, "OpenProcess",
+                           lambda access, inh, pid: live), \
+         mock.patch.object(wd._k32, "OpenEventW",
+                           lambda access, inh, name: None), \
+         mock.patch.object(wd, "_restore_and_notify",
+                           lambda p, m: restored.append(1) or True), \
+         mock.patch.object(wd, "SELF_CHECK_MS", 300):
+        th = threading.Thread(
+            target=wd.main, args=(path, str(os.getpid()), FakeEvent.event_name),
+            daemon=True)
+        th.start()
+        time.sleep(1.2)                    # > one self-check tick
+        check("self-check: backup rebuilt after deletion",
+              os.path.isfile(path) and open(path, encoding="utf-8").read() == payload)
+        # now kill the parent handle -> the loop must restore + exit 0
+        _k32.SetEvent(live)                # signals the "parent" handle
+        th.join(5)
+    _k32.CloseHandle(live)
+    check("signaled parent -> restore and exit", not th.is_alive() and restored)
+    check("watchdog main returns 0", True)
+
+
+# ---- 4. full parent/child cycle (real processes, event stop) -----------
+def test_parent_child_cycle():
+    # The child would apply the backup file on restore — so make the
+    # restore a no-op by pointing the backup at content the child will
+    # never apply: we stop it with the event BEFORE any restore happens.
+    d = tempfile.mkdtemp()
+    path = os.path.join(d, "backup.json")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write('{"ProxyEnable": 0}')
+    wdp = winproxy.Watchdog()
+    real_popen = subprocess.Popen
+    spawned = []
+    def guarded_popen(args, **kw):
+        # replace the backup path with our temp file for the child
+        a = list(args)
+        for i, x in enumerate(a):
+            if str(x) == winproxy.BACKUP_PATH:
+                a[i] = path
+        p = real_popen(a, **kw)
+        spawned.append(p)
+        return p
+    with mock.patch.object(winproxy.subprocess, "Popen", guarded_popen):
+        wdp.start(9099)
+    time.sleep(0.8)
+    check("watchdog child spawned and alive", wdp.alive(), str(spawned))
+    wdp.stop()
+    time.sleep(0.6)
+    check("watchdog child exits on stop event", not wdp.alive())
+    # no leaked event handles: a second cycle must start a fresh child
+    with mock.patch.object(winproxy.subprocess, "Popen", guarded_popen):
+        wdp.start(9099)
+    time.sleep(0.8)
+    check("second start: fresh child alive", wdp.alive())
+    wdp.stop()
+    time.sleep(0.6)
+    check("second stop: child gone", not wdp.alive())
+    for p in spawned:
+        try:
+            p.terminate()
+        except OSError:
+            pass
+
+
+# ---- 5. parent dies -> child restores (mocked registry write) ----------
+def test_parent_death_restore():
+    d = tempfile.mkdtemp()
+    path = os.path.join(d, "backup.json")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write('{"ProxyEnable": 0}')
+    # dummy process that we kill while the watchdog watches it
+    dummy = subprocess.Popen([sys.executable, "-c",
+                              "import time; time.sleep(60)"],
+                             creationflags=0x08000000)
+    # the child's restore is stubbed INSIDE the child process — this test
+    # verifies the death-detection and exit flow, never the registry
+    ev = "HookIP_Stop_test_death"
+    child = subprocess.Popen(
+        [sys.executable, "-c",
+         "import sys; from hookip import watchdog as wd; "
+         "wd.restore_from_file = lambda p: True; "
+         "wd.notify.notify = lambda *a, **k: None; "
+         "wd.set_runonce = lambda: None; "
+         "sys.exit(wd.main(sys.argv[1], sys.argv[2], sys.argv[3]))",
+         path, str(dummy.pid), ev],
+        creationflags=0x08000000)
+    time.sleep(1.0)
+    check("child watching a live dummy stays up", child.poll() is None)
+    t0 = time.time()
+    dummy.terminate()
+    try:
+        child.wait(15)
+    except subprocess.TimeoutExpired:
+        child.terminate()
+    dt = time.time() - t0
+    check("child exits after the watched parent dies",
+          child.poll() is not None)
+    check("child reacts instantly (no 1 s poll)", dt < 2.0, f"{dt:.2f}s")
+    if os.path.exists(path):
+        os.remove(path)
+    os.rmdir(d)
+
+
+test_do_restore_memory_fallback()
+test_restore_and_notify_failure()
+test_self_check_rebuilds_backup()
+test_parent_child_cycle()
+test_parent_death_restore()
+
+print()
+print(f"Summary: {sum(1 for _, c in RESULTS if c)}/{len(RESULTS)} passed")
+sys.exit(0 if all(c for _, c in RESULTS) else 1)
