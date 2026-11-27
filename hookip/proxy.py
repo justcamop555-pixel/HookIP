@@ -583,7 +583,6 @@ class ProxyServer:
         # Strategy retries reuse this captured data — the client cannot resend.
         csock.settimeout(10 if port == 443 else 2)
         first = b""
-        client_closed = False
         wait_timed_out = False
         while True:
             try:
@@ -595,8 +594,7 @@ class ProxyServer:
                 raise ClientAbortError(
                     f"{host}:{port} client aborted during handshake ({exc})") from exc
             if not part:
-                client_closed = True
-                break
+                break     # client closed without data — same as preconnect
             first += part
             if tlsfrag.hello_needed(first) == 0:
                 break

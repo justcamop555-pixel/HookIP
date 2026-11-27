@@ -1548,7 +1548,6 @@ class App:
         try:
             self.log_text.configure(state="normal")
             self.log_text.delete("1.0", "end")
-            today = time.strftime("%Y-%m-%d")
             for level, ts, msg, _date in self._log_all:
                 if logutil.LEVEL_RANK.get(level, 1) >= self._log_min_rank:
                     extra = self._log_semantic_tag(msg)
@@ -1609,16 +1608,19 @@ class App:
             self.dash_vars["down"].configure(text=self._fmt_bytes(down))
             self.dash_vars["up"].configure(text=self._fmt_bytes(up))
             # crash protection must never silently vanish: the watchdog is a
-            # separate process and can die without anyone noticing
+            # separate process and can die without anyone noticing. With v3
+            # there are TWO children — re-arm the pair whenever one dies,
+            # not just when the protection is fully gone.
             if self.running:
-                if not self.watchdog.alive():
+                if self.watchdog.watchers() < 2:
                     self._wd_restarts = getattr(self, "_wd_restarts", 0) + 1
                     if self._wd_restarts <= 3:
                         try:
                             self.watchdog.start(self.cfg.port)
-                            self.log.warn("Watchdog died — restarted "
-                                          "automatically (crash protection "
-                                          "was unprotected).")
+                            self.log.warn(
+                                "Watchdog child died — restarted "
+                                f"automatically ({self.watchdog.watchers()} "
+                                "of 2 protection processes were live).")
                         except OSError:
                             pass
                 else:
