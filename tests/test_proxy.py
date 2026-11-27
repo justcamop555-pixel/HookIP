@@ -744,6 +744,105 @@ def test_cached_negative_blocked():
 
 
 # ---- 15. connect-dead fail-fast ----------------------------------------
+def test_flap_retry_recovers_known_good():
+    """A host that tunneled before and now fails every strategy gets ONE
+    extra round — and that round wins (flapping upstream, e.g. gnu.org)."""
+    ps = make_server()
+    with ps._state_lock:
+        ps._strat_pref["gnu.test"] = "smart"     # it worked earlier today
+    calls = []
+
+    def fake_tunnel_once(csock, host, port, strategy, first, excl=False,
+                         force_no_frag=False):
+        calls.append(strategy)
+        if len(calls) >= 2:
+            s1, _s2 = socketpair()               # the alive window opens on
+            return s1                            # the second (flap-retry) round
+        raise proxymod.ConnectDead(
+            f"{host}:{port} could not connect (1 address(es) tried, timed out)")
+
+    ps._tunnel_once = fake_tunnel_once
+    client, client_peer = socketpair()
+    result = {}
+    th = run_tunnel_async(ps, client, client_peer, "gnu.test", 443, result)
+    th.join(10)
+    s = result.get("s")
+    check("flap-retry: known-good host recovered on second round",
+          result.get("ok") and s is not None, str(result))
+    check("flap-retry: loop attempt + one extra fresh round",
+          calls == ["smart", "smart"], str(calls))
+    client.close(); client_peer.close()
+    try:
+        s.close()
+    except OSError:
+        pass
+
+
+def test_flap_retry_skips_never_worked():
+    """A host that NEVER tunneled successfully gets no extra round —
+    dead-forever IPs keep their fast failure."""
+    ps = make_server()                        # no _strat_pref entry
+    calls = []
+
+    def fake_tunnel_once(csock, host, port, strategy, first, excl=False,
+                         force_no_frag=False):
+        calls.append(strategy)
+        raise proxymod.ConnectDead(
+            f"{host}:{port} could not connect (1 address(es) tried, timed out)")
+
+    ps._tunnel_once = fake_tunnel_once
+    client, client_peer = socketpair()
+    result = {}
+    th = run_tunnel_async(ps, client, client_peer, "neverworked.test", 443, result)
+    th.join(10)
+    check("no flap-retry for never-worked host (single attempt)",
+          isinstance(result.get("err"), OSError) and len(calls) == 1,
+          f"calls={calls} err={result.get('err')}")
+    client.close(); client_peer.close()
+
+
+def test_flap_retry_time_budget():
+    """When the strategy rounds already burned >= 6 s (slow dead routing),
+    the flap retry must NOT add another round."""
+    ps = make_server()
+    with ps._state_lock:
+        ps._strat_pref["slow.test"] = "smart"
+    calls = []
+
+    def fake_tunnel_once(csock, host, port, strategy, first, excl=False,
+                         force_no_frag=False):
+        calls.append(strategy)
+        time.sleep(0.05)                     # simulated cost per attempt
+        offset[0] += 7.0                     # each attempt 'costs' 7 s of
+                                             # fake clock — deterministic
+        raise proxymod.ConnectDead(
+            f"{host}:{port} could not connect (1 address(es) tried, timed out)")
+
+    ps._tunnel_once = fake_tunnel_once
+    # fast-forward the clock past the budget without sleeping: _tunnel
+    # reads time.time() live, so shift the reference by monkeypatching
+    real_time = proxymod.time.time
+    offset = [0.0]
+
+    def fake_time():
+        return real_time() + offset[0]
+
+    proxymod.time = types.SimpleNamespace(time=fake_time,
+                                          sleep=time.sleep,
+                                          strftime=time.strftime)
+    try:
+        client, client_peer = socketpair()
+        result = {}
+        th = run_tunnel_async(ps, client, client_peer, "slow.test", 443, result)
+        th.join(10)
+        client.close(); client_peer.close()
+    finally:
+        proxymod.time = real_time.__self__ if hasattr(real_time, "__self__") else time
+    check("time budget: no flap-retry after >= 6 s of attempts",
+          isinstance(result.get("err"), OSError)
+          and calls == ["smart"], f"calls={calls} err={result.get('err')}")
+
+
 def test_connect_dead_fail_fast():
     check("ConnectDead subclasses OSError",
           issubclass(proxymod.ConnectDead, OSError))
@@ -829,6 +928,9 @@ if __name__ == "__main__":
     test_cached_negative_blocked()
     test_connect_dead_fail_fast()
     test_unconfirmed_nx_not_verified_dead()
+    test_flap_retry_recovers_known_good()
+    test_flap_retry_skips_never_worked()
+    test_flap_retry_time_budget()
 
     print()
     print(f"Summary: {sum(1 for _, c in RESULTS if c)}/{len(RESULTS)} passed")

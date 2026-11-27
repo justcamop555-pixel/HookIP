@@ -575,6 +575,8 @@ class ProxyServer:
         last_err = None
         attempt_errors = []
         saw_dpi = False
+        t_start = time.time()      # flap-retry budget: total elapsed across
+                                   # attempts must stay under ~6 s
         try:
             csock.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
         except OSError as exc:
@@ -696,6 +698,26 @@ class ProxyServer:
             except (OSError, ResolveError) as exc2:
                 attempt_errors.append(f"unfragmented: {exc2}")
                 last_err = exc2
+        # FLAP RETRY: a host that tunneled successfully BEFORE and now
+        # fails every strategy within a few seconds is flapping, not dead
+        # (www.gnu.org's single A record does exactly this: some SYNs land
+        # and complete, the rest die mid-handshake). One more fresh round
+        # is cheap on the rare failure and catches the alive window;
+        # hosts that NEVER succeeded get nothing extra — their failures
+        # stay fast. Skipped for excluded hosts (single attempt by design).
+        if not excl and host in self._strat_pref and (time.time() - t_start) < 6.0:
+            try:
+                ssock = self._tunnel_once(csock, host, port, "smart", first, excl)
+                self.log.info(
+                    f"{host}:{port} recovered on a second round after all "
+                    "strategies failed — the host is flapping (intermittent "
+                    "upstream), not blocked.")
+                self._bounded_state_put(self._strat_pref, host, "smart",
+                                        self._strat_cap)
+                return ssock
+            except (OSError, ResolveError) as exc3:
+                attempt_errors.append(f"flap-retry: {exc3}")
+                last_err = exc3
         raise OSError(
             f"{host}:{port} failed — all {len(strategies)} strategies tried "
             f"({'; '.join(attempt_errors)})")
