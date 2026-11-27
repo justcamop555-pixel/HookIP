@@ -760,6 +760,27 @@ def test_udp_verification():
 
 
 # ---- 9. _start_idx guarded / is_sinkhole uses module socket -----------
+def test_hedge_thread_start_failure_degrades():
+    """Thread.start() failing (thread budget exhausted on a loaded low-end
+    machine) must not lose the lookup — the attempt runs inline."""
+    r = script_resolver({"Cloudflare": [addrs("6.6.6.6")],
+                         "Google": [addrs("7.7.7.7")],
+                         "AdGuard": [addrs("8.8.8.8")],
+                         "ControlD": [addrs("9.9.9.9")]})
+
+    def boom(self):
+        raise RuntimeError("cannot start new thread")
+
+    real_start = threading.Thread.start
+    try:
+        with mock.patch.object(threading.Thread, "start", boom),                 mock.patch.object(dohmod, "dnsmsg", StubDns):
+            ips = r.resolve("degrade.test")
+        check("thread-start failure degrades to inline attempt",
+              ips == ["6.6.6.6"], f"ips={ips}")
+    finally:
+        threading.Thread.start = real_start
+
+
 def test_start_idx_threadsafe():
     r = make_resolver()
     errs = []
@@ -807,6 +828,7 @@ if __name__ == "__main__":
     test_sni_less_and_fallback()
     test_plain_fallback_warn_throttled()
     test_sinkhole_only_answer_raises()
+    test_hedge_thread_start_failure_degrades()
 
     print()
     print(f"Summary: {sum(1 for _, c in RESULTS if c)}/{len(RESULTS)} passed")

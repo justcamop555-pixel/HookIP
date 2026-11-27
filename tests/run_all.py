@@ -30,8 +30,12 @@ def main():
     args = sys.argv[1:]
     quiet = "-q" in args
     args = [a for a in args if a != "-q"]
-    picked = [s for s in SUITES if any(a in s for a in args)] or (
-        SUITES if not args else [])
+    picked = [s for s in SUITES if any(a in s for a in args)]
+    if args and not picked:
+        print(f"no suite matches {args} — known suites: {', '.join(SUITES)}")
+        return 2
+    if not picked:
+        picked = SUITES
 
     results = []
     failed = False

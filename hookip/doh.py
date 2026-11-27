@@ -679,7 +679,13 @@ class Resolver:
                         ready.add(i)
                         done_cv.notify_all()
 
-            threading.Thread(target=run, daemon=True).start()
+            try:
+                threading.Thread(target=run, daemon=True).start()
+            except RuntimeError:
+                # cannot start a thread (thread budget exhausted on a loaded
+                # low-end machine) — run the attempt INLINE instead of losing
+                # the whole lookup; the finally above still signals done_cv
+                run()
             inflight.append(i)
 
         result = None            # ('pos', ips, ttl) winner
