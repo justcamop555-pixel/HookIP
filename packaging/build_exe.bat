@@ -25,6 +25,11 @@ python -m PyInstaller --onefile --windowed --clean ^
   --hidden-import hookip.tlsfrag ^
   --hidden-import hookip.watchdog ^
   --hidden-import hookip.winproxy ^
+  --hidden-import hookip.notify ^
+  --hidden-import hookip.tray ^
+  --hidden-import hookip.tooltips ^
+  --hidden-import hookip.perf ^
+  --hidden-import hookip.dataguard ^
   run_hookip.py
 
 echo.
