@@ -12,18 +12,17 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 def main():
     if "--hookip-watchdog" in sys.argv:
         i = sys.argv.index("--hookip-watchdog")
-        try:
-            backup, ppid, event = sys.argv[i + 1], sys.argv[i + 2], sys.argv[i + 3]
-        except IndexError:
+        args = sys.argv[i + 1:i + 5]      # backup ppid stop_event [beat_event]
+        if len(args) < 3:
             return 2
         from hookip import watchdog
         try:
-            watchdog.main(backup, ppid, event)
+            watchdog.main(*args)
         except Exception:
             # last-resort restore if anything above fails
             try:
                 from hookip import winproxy
-                winproxy.restore_from_file(backup)
+                winproxy.restore_from_file(args[0])
             except Exception:
                 pass
         return 0

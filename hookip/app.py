@@ -1856,7 +1856,9 @@ class App:
                                   "internet' to fix", "warn")
         self._diag_result("Crash protection",
                           "active" if self.watchdog.alive() else "inactive",
-                          "watchdog process" if self.watchdog.alive() else "", "info")
+                          (f"{self.watchdog.watchers()} watchdog process(es) · "
+                           "heartbeat monitored") if self.watchdog.alive() else "",
+                          "info")
         # runtime memory health: the bounded caches should show sane sizes
         if self.proxy:
             pos, neg = self.proxy.resolver.cache_stats()

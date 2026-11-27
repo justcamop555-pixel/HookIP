@@ -24,6 +24,8 @@ from . import APP_NAME
 _k32 = ctypes.WinDLL("kernel32", use_last_error=True)
 _k32.CreateMutexW.restype = wt.HANDLE
 _k32.CreateMutexW.argtypes = [wt.HANDLE, wt.BOOL, wt.LPCWSTR]
+_k32.ReleaseMutex.argtypes = [wt.HANDLE]
+_k32.ReleaseMutex.restype = wt.BOOL
 _k32.CreateEventW.restype = wt.HANDLE
 _k32.CreateEventW.argtypes = [wt.HANDLE, wt.BOOL, wt.BOOL, wt.LPCWSTR]
 _k32.OpenEventW.restype = wt.HANDLE
@@ -370,12 +372,41 @@ def clear_runonce():
 
 # ----------------------------------------------------------------------
 class Watchdog:
-    """Owns the crash-safety watchdog child process."""
+    """Owns the crash-safety watchdog child processes.
+
+    v3: TWO independent children (twins) watch the app, plus a 2 s
+    heartbeat event the children monitor:
+    - each child alone restores the proxy the moment the app process
+      dies (instant reaction via WaitForMultipleObjects);
+    - if one child is killed first (Task Manager 'End task' on one of
+      the identical-looking HookIP.exe rows, an AV heuristic kill, OOM),
+      the twin keeps protecting;
+    - if the app process stays alive but stops beating (wedged accept
+      loop, deadlock — a crash that doesn't terminate the process), the
+      children restore after ~40 s of silence.
+    Twins dedupe the restore/notify through a named event (watchdog.py)."""
 
     def __init__(self):
         self._event = None
+        self._beat = None
+        self._beat_stop = None
+        self._beat_thread = None
+        self._procs = []
         self._proc = None
         self.event_name = None
+        self.beat_name = None
+
+    def _spawn(self, args, flags, env):
+        try:
+            return subprocess.Popen(args, creationflags=flags, close_fds=True, env=env)
+        except OSError:
+            return None
+
+    def _beat_loop(self):
+        # SetEvent every 2 s while the watchdog owns a beat event: the
+        # children treat silence as 'app not responding'
+        while self._beat and self._beat_stop and not self._beat_stop.wait(2.0):
+            _k32.SetEvent(self._beat)
 
     def start(self, port):
         self.stop()
@@ -388,58 +419,84 @@ class Watchdog:
         # explicit reset both prevent it.
         self._start_count = getattr(self, "_start_count", 0) + 1
         self.event_name = f"HookIP_Stop_{pid}_{port}_{self._start_count}"
+        self.beat_name = f"HookIP_Beat_{pid}_{port}_{self._start_count}"
         self._event = _k32.CreateEventW(None, True, False, self.event_name)
         if self._event:
             _k32.ResetEvent(self._event)
-        backup, ppid, event = BACKUP_PATH, str(pid), self.event_name
+        self._beat = _k32.CreateEventW(None, False, False, self.beat_name)  # auto-reset
+        backup, ppid = BACKUP_PATH, str(pid)
+        extra = [self.beat_name] if self._beat else []
         if getattr(sys, "frozen", False):
             # packaged exe: the exe itself understands --hookip-watchdog
-            args = [sys.executable, WATCHDOG_FLAG, backup, ppid, event]
+            args = [sys.executable, WATCHDOG_FLAG, backup, ppid, self.event_name] + extra
             env = None
         else:
             pkg_parent = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             launcher = os.path.join(pkg_parent, "run_hookip.py")
             if os.path.isfile(launcher):
-                args = [sys.executable, launcher, WATCHDOG_FLAG, backup, ppid, event]
+                args = [sys.executable, launcher, WATCHDOG_FLAG, backup, ppid,
+                        self.event_name] + extra
                 env = None
             else:
                 args = [sys.executable, "-c",
                         "import sys; from hookip.watchdog import main; main(*sys.argv[1:])",
-                        backup, ppid, event]
+                        backup, ppid, self.event_name] + extra
                 env = dict(os.environ, PYTHONPATH=pkg_parent)
         flags = 0x08000000  # CREATE_NO_WINDOW
-        self._proc = subprocess.Popen(args, creationflags=flags, close_fds=True, env=env)
+        # TWO children: killing one (Task Manager end-task on the wrong
+        # HookIP.exe row, AV heuristic) must not leave the proxy unwatched
+        self._procs = [self._spawn(args, flags, env) for _ in range(2)]
         # a watchdog that died at birth (broken cwd / python) used to leave
         # crash protection silently OFF for the whole session — verify it
         # actually survived startup, and respawn once before giving up
         time.sleep(0.4)
-        if self._proc.poll() is not None:
-            try:
-                self._proc = subprocess.Popen(args, creationflags=flags,
-                                              close_fds=True, env=env)
-                time.sleep(0.4)
-            except OSError:
-                self._proc = None
+        self._procs = [p if (p is not None and p.poll() is None)
+                       else self._spawn(args, flags, env)
+                       for p in self._procs]
+        self._proc = next((p for p in self._procs if p is not None), None)
+        self._beat_stop = threading.Event()
+        self._beat_thread = threading.Thread(target=self._beat_loop, daemon=True)
+        self._beat_thread.start()
 
     def stop(self):
+        beat_stop = getattr(self, "_beat_stop", None)
+        if beat_stop:
+            beat_stop.set()
+        t = getattr(self, "_beat_thread", None)
+        if t is not None and t.is_alive():
+            t.join(1.0)          # stop beating before closing the beat handle
+        procs = list(getattr(self, "_procs", None) or [])
+        if not procs and getattr(self, "_proc", None):
+            procs = [self._proc]
         if self._event:
             _k32.SetEvent(self._event)
-            # the onefile child reacts to the event instantly (~0.01 s) —
-            # give it that moment so terminate() below stays a rare
-            # fallback: killing the bootloader PID would orphan the inner
-            # child process, and an orphan would resurrect the backup file
-            # from its memory copy ~10 s later (stale-restore hazard)
+            # the onefile children react to the event instantly (~0.01 s) —
+            # give them that moment so terminate() below stays a rare
+            # fallback: killing a bootloader PID can orphan its inner child
             deadline = time.time() + 1.5
-            while time.time() < deadline and self._proc.poll() is None:
+            while time.time() < deadline:
+                if all(p is None or p.poll() is not None for p in procs):
+                    break
                 time.sleep(0.05)
             _k32.CloseHandle(self._event)     # one handle per start cycle
             self._event = None
-        if self._proc and self._proc.poll() is None:
-            try:
-                self._proc.terminate()
-            except OSError:
-                pass
+        for p in procs:
+            if p and p.poll() is None:
+                try:
+                    p.terminate()
+                except OSError:
+                    pass
+        self._procs = []
         self._proc = None
+        if self._beat:
+            _k32.CloseHandle(self._beat)
+            self._beat = None
 
     def alive(self):
-        return bool(self._proc and self._proc.poll() is None)
+        return any(p is not None and p.poll() is None
+                   for p in getattr(self, "_procs", []))
+
+    def watchers(self):
+        """Number of live watchdog children (0–2) — for Diagnostics."""
+        return sum(1 for p in getattr(self, "_procs", [])
+                   if p is not None and p.poll() is None)

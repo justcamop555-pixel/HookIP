@@ -109,7 +109,8 @@ def test_self_check_rebuilds_backup():
          mock.patch.object(wd._k32, "OpenEventW",
                            lambda access, inh, name: None), \
          mock.patch.object(wd, "_restore_and_notify",
-                           lambda p, m: restored.append(1) or True), \
+                           lambda p, m, pid=0, reason=None:
+                           restored.append(1) or True), \
          mock.patch.object(wd, "SELF_CHECK_MS", 300):
         th = threading.Thread(
             target=wd.main, args=(path, str(os.getpid()), FakeEvent.event_name),
@@ -208,11 +209,144 @@ def test_parent_death_restore():
     os.rmdir(d)
 
 
+# ---- 6. heartbeat: app wedged (no beats) -> 'unresponsive' restore -----
+def test_heartbeat_wedge_detection():
+    d = tempfile.mkdtemp()
+    path = os.path.join(d, "backup.json")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write('{"ProxyEnable": 0}')
+    live = _k32.CreateEventW(None, True, False, None)     # parent: never signals
+    stop = _k32.CreateEventW(None, True, False, None)     # stop: never signals
+    beat = _k32.CreateEventW(None, False, False, None)    # beat: nobody beats
+    restored = []
+    with mock.patch.object(wd._k32, "OpenProcess",
+                           lambda access, inh, pid: live), \
+         mock.patch.object(wd._k32, "OpenEventW",
+                           lambda access, inh, name: stop if "Stop" in name else beat), \
+         mock.patch.object(wd, "HEARTBEAT_TIMEOUT_MS", 300), \
+         mock.patch.object(wd, "HEARTBEAT_GRACE_MS", 200), \
+         mock.patch.object(wd, "_restore_and_notify",
+                           lambda p, m, pid=0, reason=None:
+                           restored.append(reason) or True):
+        th = threading.Thread(
+            target=wd.main, args=(path, str(os.getpid()), "HookIP_Stop_x",
+                                  "HookIP_Beat_x"), daemon=True)
+        th.start()
+        th.join(10)
+    _k32.CloseHandle(live); _k32.CloseHandle(stop); _k32.CloseHandle(beat)
+    check("wedged app (no beats) -> restore with 'unresponsive' reason",
+          not th.is_alive() and restored == ["unresponsive"], str(restored))
+
+
+# ---- 7. heartbeat: beats keep the watchdog watching --------------------
+def test_heartbeat_alive_keeps_watching():
+    d = tempfile.mkdtemp()
+    path = os.path.join(d, "backup.json")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write('{"ProxyEnable": 0}')
+    live = _k32.CreateEventW(None, True, False, None)
+    stop = _k32.CreateEventW(None, True, False, None)
+    beat = _k32.CreateEventW(None, False, False, None)
+    restored = []
+    beaten = [0]
+    def beater():
+        while not stopflag.is_set():
+            _k32.SetEvent(beat)
+            time.sleep(0.05)
+    stopflag = threading.Event()
+    threading.Thread(target=beater, daemon=True).start()
+    with mock.patch.object(wd._k32, "OpenProcess",
+                           lambda access, inh, pid: live), \
+         mock.patch.object(wd._k32, "OpenEventW",
+                           lambda access, inh, name: stop if "Stop" in name else beat), \
+         mock.patch.object(wd, "HEARTBEAT_TIMEOUT_MS", 400), \
+         mock.patch.object(wd, "HEARTBEAT_GRACE_MS", 200), \
+         mock.patch.object(wd, "_restore_and_notify",
+                           lambda p, m, pid=0, reason=None:
+                           restored.append(reason) or True):
+        th = threading.Thread(
+            target=wd.main, args=(path, str(os.getpid()), "HookIP_Stop_x",
+                                  "HookIP_Beat_x"), daemon=True)
+        th.start()
+        time.sleep(1.5)                      # far past a 400 ms beat timeout
+        stopflag.set()
+        _k32.SetEvent(stop)                  # now the clean-stop signal
+        th.join(10)
+    _k32.CloseHandle(live); _k32.CloseHandle(stop); _k32.CloseHandle(beat)
+    check("steady beats: no wedge restore", restored == [], str(restored))
+    check("steady beats: watchdog exits on stop event", not th.is_alive())
+
+
+# ---- 8. twin dedupe: signalled done-event stands the twin down ---------
+def test_restore_dedupe():
+    d = tempfile.mkdtemp()
+    path = os.path.join(d, "backup.json")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write('{"ProxyEnable": 0}')
+    pid = os.getpid()
+    done_name = f"HookIP_Restored_{pid}"
+    h_done = _k32.CreateEventW(None, True, False, done_name)
+    _k32.SetEvent(h_done)                    # twin already restored
+    calls = []
+    toasts = []
+    try:
+        with mock.patch.object(wd, "restore_from_file",
+                               lambda p: calls.append(p) or True), \
+             mock.patch.object(wd.notify, "notify",
+                               lambda *a, **k: toasts.append(a[0])):
+            ok = wd._restore_and_notify(path, None, parent_pid=pid)
+    finally:
+        _k32.CloseHandle(h_done)
+        try:
+            _k32.ResetEvent(h_done)
+        except OSError:
+            pass
+    check("twin stand-down: no double restore, no double toast",
+          ok is True and not calls and not toasts, f"calls={calls} toasts={toasts}")
+
+
+# ---- 9. two watchdog children spawn together --------------------------
+def test_twin_children():
+    d = tempfile.mkdtemp()
+    path = os.path.join(d, "backup.json")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write('{"ProxyEnable": 0}')
+    wdp = winproxy.Watchdog()
+    real_popen = subprocess.Popen
+    spawned = []
+    def guarded_popen(args, **kw):
+        a = list(args)
+        for i, x in enumerate(a):
+            if str(x) == winproxy.BACKUP_PATH:
+                a[i] = path
+        p = real_popen(a, **kw)
+        spawned.append(p)
+        return p
+    with mock.patch.object(winproxy.subprocess, "Popen", guarded_popen):
+        wdp.start(9098)
+    time.sleep(1.0)
+    check("twin watchdogs: two children alive", wdp.watchers() == 2,
+          f"watchers={wdp.watchers()} spawned={len(spawned)}")
+    check("beat event created", wdp._beat is not None)
+    wdp.stop()
+    time.sleep(0.8)
+    check("twin watchdogs: both exit on stop", wdp.watchers() == 0)
+    for p in spawned:
+        try:
+            p.terminate()
+        except OSError:
+            pass
+
+
 test_do_restore_memory_fallback()
 test_restore_and_notify_failure()
 test_self_check_rebuilds_backup()
 test_parent_child_cycle()
 test_parent_death_restore()
+test_heartbeat_wedge_detection()
+test_heartbeat_alive_keeps_watching()
+test_restore_dedupe()
+test_twin_children()
 
 print()
 print(f"Summary: {sum(1 for _, c in RESULTS if c)}/{len(RESULTS)} passed")
