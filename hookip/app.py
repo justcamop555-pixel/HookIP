@@ -54,7 +54,20 @@ class App:
         self._log_dir = os.path.join(APP_DIR, "logs")
         Log.prune_session_files(self._log_dir, keep=7)
         # data-theft guard: encrypt legacy plaintext logs from older
-        # versions, then harden the data folder's ACLs (best-effort)
+        # versions (synchronously — migration must finish before the
+        # logger opens any .hlog file, or lines appended in between
+        # would be lost), then harden the folder's ACLs in the
+        # background (best-effort)
+        try:
+            from . import dataguard as _dg
+            _conv, _tot = _dg.migrate_plaintext_logs(self._log_dir)
+            if _conv:
+                self.log.ok(f"Data guard: encrypted {_conv} older plaintext "
+                            f"log file(s) — browsing history is now stored "
+                            f"encrypted.")
+            del _conv, _tot
+        except Exception:
+            pass
         try:
             import threading as _th
             _th.Thread(target=self._startup_dataguard, daemon=True).start()
@@ -121,21 +134,17 @@ class App:
             pass
 
     def _startup_dataguard(self):
-        """One-time (per session) data-theft guard bootstrapping.
+        """Background half of the data-theft guard bootstrap.
 
-        Runs on a worker thread at startup: encrypts any plaintext logs
-        left by older versions and strips inherited ACLs from the data
-        folder so only the current user + SYSTEM can read it. Results
-        are logged and surfaced in Diagnostics → System.
+        Log-file MIGRATION already ran synchronously in __init__ (it
+        must finish before the logger opens any .hlog file). This
+        thread only strips inherited ACLs from the data folder so only
+        the current user + SYSTEM can read it. Results are surfaced in
+        Diagnostics → System.
         """
         from .config import APP_DIR
         try:
             from . import dataguard
-            converted, total = dataguard.migrate_plaintext_logs(self._log_dir)
-            if converted:
-                self.log.ok(f"Data guard: encrypted {converted} older plaintext "
-                            f"log file(s) — browsing history is now stored "
-                            f"encrypted.")
             self._dg_acl_ok = dataguard.harden_dir(APP_DIR)
             if not self._dg_acl_ok:
                 self.log.debug("Data guard: folder ACL hardening unavailable "

@@ -21,10 +21,13 @@ Guard, in layers (all stdlib/ctypes, still no admin):
    Microsoft-account machines resolve unambiguously). Malware running
    as a different (non-admin) account or at low integrity gets nothing.
 4. MIGRATION: at startup, any legacy plaintext .log files left by older
-   versions are encrypted in place and renamed .hlog. An existing
-   .hlog target is never overwritten — new lines are appended to it
-   (atomically) — and the source .log is deleted only after the
-   encrypted write has succeeded.
+   versions are encrypted and merged into .hlog files. The source .log
+   is claimed first by renaming it to foo.log.migrating (a locked file
+   is skipped without writing anything), the claim file is deleted
+   last, a leftover foo.log.migrating from a crashed run is finished on
+   the next run, and the merge skips lines the .hlog already holds —
+   so reruns never duplicate lines and an existing .hlog is never
+   overwritten.
 
 Honest limits (stated in Diagnostics too): a determined attacker
 running as YOUR user account with full access can reverse DPAPI — no
@@ -55,8 +58,18 @@ LOG_MAGIC = "HKLOG1:"
 CFG_MAGIC = "HKCFG1:"
 
 # sentinel: the line IS ours (HKLOG1:) but the blob failed to decrypt
-# (truncated, corrupted, or re-encrypted under a different account)
-UNREADABLE = object()
+# (truncated, corrupted, or re-encrypted under a different account).
+# Falsy by design: `if text:` cannot misread it as real content.
+# Always compare with `is UNREADABLE`.
+class _Unreadable:
+    def __bool__(self):
+        return False
+
+    def __repr__(self):
+        return "<UNREADABLE>"
+
+
+UNREADABLE = _Unreadable()
 
 
 class _DATA_BLOB(ctypes.Structure):
@@ -65,8 +78,12 @@ class _DATA_BLOB(ctypes.Structure):
 
 
 # ---- ctypes declarations: no pointer truncation, no GC accidents ----
-_crypt32 = ctypes.WinDLL("crypt32") if hasattr(ctypes, "WinDLL") else ctypes.windll.crypt32
-_kernel32 = ctypes.windll.kernel32
+# Private WinDLL instances: ctypes.windll.* returns process-wide cached
+# objects, and setting argtypes on them would change behavior for other
+# code in this process. use_last_error=True keeps GetLastError accurate.
+_crypt32 = ctypes.WinDLL("crypt32")
+_kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+_advapi32 = ctypes.WinDLL("advapi32")
 
 _BLOB_PTR = ctypes.POINTER(_DATA_BLOB)
 _crypt32.CryptProtectData.argtypes = [
@@ -92,7 +109,6 @@ _crypt32.CryptUnprotectData.restype = wintypes.BOOL
 _kernel32.LocalFree.argtypes = [wintypes.HLOCAL]
 _kernel32.LocalFree.restype = wintypes.HLOCAL
 
-_advapi32 = ctypes.windll.advapi32
 _advapi32.OpenProcessToken.argtypes = [
     wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
 _advapi32.OpenProcessToken.restype = wintypes.BOOL
@@ -106,6 +122,10 @@ _advapi32.ConvertSidToStringSidW.restype = wintypes.BOOL
 _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
 _kernel32.CloseHandle.restype = wintypes.BOOL
 _kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+
+# CRYPTPROTECT_UI_FORBIDDEN: never surface a DPAPI prompt from a
+# background thread
+_CRYPTPROTECT_UI_FORBIDDEN = 0x1
 
 # entropy blob built ONCE and kept referenced for the process lifetime:
 # the DATA_BLOB points into _ENTROPY_BUF, so the buffer backing the
@@ -255,7 +275,7 @@ def _current_user_sid():
                     ctypes.c_void_p(psid), ctypes.byref(sid_str)):
                 return None
             try:
-                _cached_sid = ctypes.wstring_at(sid_str)
+                _cached_sid = sid_str.value
             finally:
                 _kernel32.LocalFree(ctypes.cast(sid_str, ctypes.c_void_p))
             return _cached_sid
@@ -287,7 +307,8 @@ def harden_dir(path):
         cmd = ["icacls", path, "/inheritance:r",
                "/grant:r", f"*{sid}:(OI)(CI)F",
                "/grant:r", "*S-1-5-18:(OI)(CI)F"]
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=20,
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           errors="replace", timeout=20,
                            creationflags=0x08000000 if os.name == "nt" else 0)
         return r.returncode == 0
     except Exception:
@@ -295,26 +316,25 @@ def harden_dir(path):
 
 
 def acl_is_hardened(path):
-    """True when the directory's own ACE lines carry no '(I)'
-    inheritance flag.
+    """True when the directory has no inherited ACEs.
 
-    Locale-independent: '(I)' is icacls's symbolic inheritance marker
-    and is not localized; we check only the ACE lines (everything after
-    the path header line) so a *file name* containing '(I)' cannot
-    trigger a false 'inherited'. Limitation: this is a report-parse
-    heuristic — icacls gives no structured API without admin — and it
-    assumes icacls prints the path on the first line and ACEs beneath
-    it, which holds on Windows 7 through 11.
+    Checks EVERY icacls output line — including the first, because
+    icacls prints the first ACE on the same line as the path — for
+    ':(I)': icacls's inheritance marker, which always follows the
+    account and a colon and is not localized.
+
+    Limitations: this is a report-parse heuristic (icacls exposes no
+    structured API without admin), and a path containing the literal
+    ':(I)' would produce a false 'not hardened'.
     """
     try:
         r = subprocess.run(["icacls", path], capture_output=True, text=True,
-                           timeout=10,
+                           errors="replace", timeout=10,
                            creationflags=0x08000000 if os.name == "nt" else 0)
         if r.returncode != 0:
             return False
         lines = (r.stdout or "").splitlines()
-        ace_lines = lines[1:]          # line 0 is the path header
-        return not any("(I)" in ln for ln in ace_lines)
+        return not any(":(I)" in ln for ln in lines)
     except Exception:
         return False
 
@@ -328,11 +348,20 @@ def migrate_plaintext_logs(log_dir):
     on "\\n" only (splitlines() would also break on \\x0c/\\x1c-\\x1e
     page/separator controls), encrypt line-by-line.
 
-    An existing foo.hlog target is NEVER overwritten (an interrupted
-    earlier run or a newer version may already be writing it): the
-    newly encrypted lines are merged into a rewritten copy of the
-    existing .hlog via temp + os.replace. The source .log is deleted
-    only after the encrypted write has succeeded.
+    Crash/lock safety: the source .log is first CLAIMED by renaming it
+    to foo.log.migrating — if that rename fails (AV/OneDrive lock), the
+    file is skipped and nothing is written. The .migrating file is then
+    read, merged into foo.hlog, foo.hlog is rewritten atomically via
+    temp + os.replace, and the .migrating file is deleted LAST. If that
+    final delete fails, a rerun finishes the leftover foo.log.migrating
+    instead of ignoring it, and the merge SKIPS lines foo.hlog already
+    holds (compared as decrypted plaintext — DPAPI blobs are not
+    deterministic, so ciphertext cannot be compared) — no duplicates.
+    An existing foo.hlog is NEVER overwritten.
+
+    Concurrency note: the atomic replace covers only the rewrite, not
+    concurrent appends — migration must run BEFORE the logger opens
+    any .hlog files, or lines appended in between are lost.
 
     Returns (converted, total). Best-effort; locked files are skipped.
     """
@@ -340,16 +369,32 @@ def migrate_plaintext_logs(log_dir):
         return (0, 0)
     converted = total = 0
     try:
-        names = [n for n in os.listdir(log_dir) if n.endswith(".log")]
+        names = os.listdir(log_dir)
     except OSError:
         return (0, 0)
-    for name in names:
-        src = os.path.join(log_dir, name)
-        dst = src[:-4] + ".hlog"
+    logs = [n for n in names if n.endswith(".log")]
+    # leftovers from a crashed run (claim rename done, cleanup delete
+    # failed): finish them instead of ignoring
+    orphans = [n for n in names if n.endswith(".log.migrating")
+               and n[:-len(".migrating")] not in logs]
+    for name in logs + orphans:
+        if name.endswith(".log.migrating"):
+            migrating = os.path.join(log_dir, name)
+            base = migrating[:-len(".migrating")]      # ...\\foo.log
+            dst = (base[:-4] if base.endswith(".log") else base) + ".hlog"
+        else:
+            src = os.path.join(log_dir, name)
+            dst = src[:-4] + ".hlog"
+            migrating = src + ".migrating"
         tmp = dst + ".mig"
         total += 1
         try:
-            with open(src, "rb") as fh:
+            # claim first: locked source -> rename fails -> skip, write
+            # nothing (a crash after this point leaves a finishable
+            # .migrating file)
+            if not os.path.exists(migrating):
+                os.replace(src, migrating)
+            with open(migrating, "rb") as fh:
                 raw = fh.read()
             try:
                 text = raw.decode("utf-8")
@@ -371,6 +416,7 @@ def migrate_plaintext_logs(log_dir):
 
             # merge with any existing .hlog (never clobber its content)
             existing = []
+            known = set()   # plaintexts the .hlog already holds
             if os.path.exists(dst):
                 try:
                     with open(dst, "r", encoding="utf-8",
@@ -378,18 +424,30 @@ def migrate_plaintext_logs(log_dir):
                         existing = fh.read().splitlines()
                 except OSError:
                     existing = []
-                if existing and existing[-1].startswith(LOG_MAGIC) is False \
-                        and existing[-1].strip() == "":
+                for ex in existing:
+                    v = decrypt_line(ex)
+                    if isinstance(v, str):
+                        known.add(v)
+                if existing and not existing[-1].strip():
                     existing = existing[:-1]   # drop trailing blank for join
 
-            combined = existing + out
-            with open(tmp, "w", encoding="utf-8") as fh:
+            combined = list(existing)
+            for ln in out:
+                v = decrypt_line(ln)
+                if isinstance(v, str) and v in known and v.strip():
+                    continue                   # rerun-safe: already merged
+                combined.append(ln)
+                if isinstance(v, str):
+                    known.add(v)
+            with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
                 fh.write("\n".join(combined) + "\n")
                 fh.flush()
                 os.fsync(fh.fileno())
             os.replace(tmp, dst)
-            # source is removed only after the encrypted copy is durable
-            os.remove(src)
+            # claim file is deleted LAST — after the encrypted copy is
+            # durable. If this delete fails (AV lock), the leftover
+            # .migrating is finished on the next run without duplicates.
+            os.remove(migrating)
             converted += 1
         except OSError:
             try:
