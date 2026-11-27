@@ -182,6 +182,17 @@ class ProxyServer:
             sock.bind(("127.0.0.1", self.cfg.port))
         except OSError as exc:
             sock.close()
+            werr = getattr(exc, "winerror", None)
+            if werr == 10013:
+                # WSAEACCES: the port is inside a Windows RESERVED port
+                # range (Hyper-V/WSL/Docker reserve big dynamic blocks) or
+                # blocked by policy — 'in use' would send the user chasing
+                # a process that does not exist
+                raise OSError(
+                    f"port {self.cfg.port} is blocked by Windows (access "
+                    "denied) — it falls inside a reserved port range "
+                    "(Hyper-V/WSL/Docker reserve large blocks) or policy. "
+                    "Pick a different port in Settings.") from exc
             raise OSError(
                 f"port {self.cfg.port} is already in use by another program "
                 f"({exc}) — change the port in Settings or close the other app") from exc

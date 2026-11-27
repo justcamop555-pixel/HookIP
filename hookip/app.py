@@ -334,25 +334,40 @@ class App:
             self.port_hint.configure(text="" if ok_p else "1–65535")
             self.frag_hint.configure(text="" if ok_f else "1–255")
             # live availability probe — identical to Start's exclusive bind,
-            # so what it says here is exactly what Start will see
+            # so what it says here is exactly what Start will see.
+            # While the proxy is RUNNING the probe still works for a NEW
+            # port (our listener holds a different one) — with a hint that
+            # the change needs Stop → Start; typing the running port gets
+            # the 'HookIP itself' answer instead of a scary 'in use'.
             avail_txt, avail_fg = "", MUTED
-            if ok_p and not self.running:
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                try:
-                    s.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
-                    p_num = int(self.port_var.get())
-                    s.bind(("127.0.0.1", p_num))
-                    if p_num <= 1023:
-                        avail_txt, avail_fg = "well-known port — may clash", WARN
-                    else:
-                        avail_txt, avail_fg = "free", OK
-                except OSError:
-                    avail_txt, avail_fg = "in use — Start may fail", ERR
-                finally:
+            if ok_p:
+                p_num = int(self.port_var.get())
+                if self.running and p_num == self.cfg.port:
+                    avail_txt, avail_fg = "in use by HookIP (running)", OK
+                else:
+                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                     try:
-                        s.close()
-                    except OSError:
-                        pass
+                        s.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+                        s.bind(("127.0.0.1", p_num))
+                        if self.running:
+                            avail_txt, avail_fg = ("free — press ⏹ Stop, then "
+                                                   "▶ Start to switch"), WARN
+                        elif p_num <= 1023:
+                            avail_txt, avail_fg = "well-known port — may clash", WARN
+                        else:
+                            avail_txt, avail_fg = "free", OK
+                    except OSError as exc:
+                        if getattr(exc, "winerror", None) == 10013:
+                            avail_txt, avail_fg = ("blocked by Windows "
+                                                   "(reserved range) — pick "
+                                                   "another"), ERR
+                        else:
+                            avail_txt, avail_fg = "in use — Start may fail", ERR
+                    finally:
+                        try:
+                            s.close()
+                        except OSError:
+                            pass
             try:
                 self.port_avail.configure(text=avail_txt, fg=avail_fg)
             except (tk.TclError, AttributeError):
@@ -1439,8 +1454,13 @@ class App:
             self.watchdog.start(cfg.port)
             winproxy.set_runonce()
             self.log.ok("System proxy configured. Crash protection active.")
-        except OSError as exc:
-            self.log.warn(f"System proxy not fully configured: {exc}")
+        except Exception as exc:  # noqa: BLE001 — nothing after the proxy is
+            # up may kill the startup sequence: Windows already routes
+            # through HookIP here, so the running flag and the UI MUST be
+            # set regardless (a non-OSError used to leave the app looking
+            # 'stopped' while the system proxy was live)
+            self.log.warn(f"System proxy not fully configured: "
+                          f"{type(exc).__name__}: {exc}")
 
         if cfg.remember:
             # Config.save already swallows OSError (the file keep its old
@@ -1975,11 +1995,22 @@ class App:
                     try:
                         s.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
                         s.bind(("127.0.0.1", port))
-                        self._diag_result("Port availability", "OK", f"{port} is free", "ok")
+                        note = (f" — differs from the running proxy on "
+                                f"{self.cfg.port} (press ⏹ Stop, then ▶ Start "
+                                "to switch)" if self.running else "")
+                        self._diag_result("Port availability", "OK",
+                                          f"{port} is free{note}", "ok")
                     except OSError as exc:
-                        self._diag_result("Port availability", "WARN",
-                                          f"{port} is already in use — Start would "
-                                          f"refuse it ({exc})", "warn")
+                        if getattr(exc, "winerror", None) == 10013:
+                            self._diag_result(
+                                "Port availability", "FAIL",
+                                f"{port} is blocked by Windows (reserved port "
+                                "range — Hyper-V/WSL/Docker reserve large "
+                                "blocks); Start would refuse it", "fail")
+                        else:
+                            self._diag_result("Port availability", "WARN",
+                                              f"{port} is already in use — Start "
+                                              f"would refuse it ({exc})", "warn")
                     finally:
                         s.close()
         except (ValueError, tk.TclError):

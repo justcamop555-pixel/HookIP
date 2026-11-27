@@ -843,6 +843,64 @@ def test_flap_retry_time_budget():
           and calls == ["smart"], f"calls={calls} err={result.get('err')}")
 
 
+def test_bind_error_messages():
+    """Start's bind failure must distinguish 'in use' from Windows-reserved
+    ranges (Hyper-V/WSL reserve large blocks; WinError 10013 there used to
+    be misreported as 'in use by another program')."""
+    ps = make_server()
+    ps.cfg.port = 8936
+    ps.start()
+    ps2 = make_server()
+    ps2.cfg.port = 8936
+    try:
+        ps2.start()
+        check("double bind refused", False, "second start succeeded?!")
+    except OSError as exc:
+        check("double bind refused",
+              "already in use" in str(exc) and "another program" in str(exc),
+              str(exc)[:90])
+
+    def fake_bind(addr):
+        err = OSError(10013, "An attempt was made to access a socket "
+                              "in a way forbidden by its access permissions")
+        err.winerror = 10013
+        raise err
+
+    ps3 = make_server()
+    ps3.cfg.port = 8937
+    real_socket = proxymod.socket.socket
+
+    class FakeSock:
+        def setsockopt(self, *a):
+            pass
+
+        def bind(self, addr):
+            fake_bind(addr)
+
+        def close(self):
+            pass
+
+    proxymod.socket = types.SimpleNamespace(
+        socket=lambda *a, **k: FakeSock(), AF_INET=socket.AF_INET,
+        SOCK_STREAM=socket.SOCK_STREAM, SOL_SOCKET=socket.SOL_SOCKET,
+        SO_EXCLUSIVEADDRUSE=socket.SO_EXCLUSIVEADDRUSE,
+        IPPROTO_TCP=socket.IPPROTO_TCP, TCP_NODELAY=socket.TCP_NODELAY)
+    try:
+        try:
+            ps3.start()
+            check("10013 reported as reserved range", False, "no raise")
+        except OSError as exc:
+            check("10013 reported as reserved range (not 'in use')",
+                  "reserved port range" in str(exc) and "in use" not in str(exc),
+                  str(exc)[:90])
+    finally:
+        proxymod.socket = real_socket
+    try:
+        ps.stop()
+    except OSError:
+        pass
+
+
 def test_connect_dead_fail_fast():
     check("ConnectDead subclasses OSError",
           issubclass(proxymod.ConnectDead, OSError))
@@ -931,6 +989,7 @@ if __name__ == "__main__":
     test_flap_retry_recovers_known_good()
     test_flap_retry_skips_never_worked()
     test_flap_retry_time_budget()
+    test_bind_error_messages()
 
     print()
     print(f"Summary: {sum(1 for _, c in RESULTS if c)}/{len(RESULTS)} passed")
