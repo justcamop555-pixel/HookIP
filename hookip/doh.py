@@ -596,15 +596,17 @@ class Resolver:
         blocked = [ip for ip in ips if is_sinkhole(ip)]
         if blocked:
             ips = [ip for ip in ips if not is_sinkhole(ip)]
-        # the Secure-DNS degradation notice: warn once per 5 minutes when
-        # DoH was enabled but a plaintext path produced the address
-        if source and source != "doh" and self.cfg.doh_enabled:
-            self._plain_fallback_warn(host, source)
             self.log.debug(f"resolve {host}: dropped sinkhole answer(s) {', '.join(blocked)}")
             if not ips:
                 with self._lock:
                     self._neg_cache[host] = (now + 120, "all resolvers returned a sinkhole")
                 raise ResolveError(f"no addresses for {host} (all resolvers returned a sinkhole)")
+        # the Secure-DNS degradation notice: warn once per 5 minutes when
+        # DoH was enabled but a plaintext path produced the address (after
+        # the sinkhole filter so a rejected answer never consumes the
+        # throttle slot, and only for a genuinely usable answer)
+        if source and source != "doh" and self.cfg.doh_enabled and ips:
+            self._plain_fallback_warn(host, source)
 
         ttl = min(300, max(10, int(ttl)))
         with self._lock:

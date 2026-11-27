@@ -33,11 +33,14 @@ Write-Host "⚓ Installing HookIP -> $dest" -ForegroundColor Cyan
 
 # downloads with mirror fallback: GitHub first, then same-bytes mirrors
 # (integrity is still enforced by the SHA-256 check below)
-function Get-Asset($url, $out) {
-    foreach ($u in @($url) + ($mirrors | ForEach-Object { "$_$url" })) {
+function Get-Asset($url, $out, $minBytes = 1KB) {
+    # minBytes must fit the asset: the .sha256 file is ~100 BYTES — the
+    # old fixed 1 KB gate deleted a perfectly valid checksum file and
+    # silently downgraded verification
+    foreach ($u in @($url) + ($mirrors | ForEach-Object { "$($_)$url" })) {
         try {
             Invoke-WebRequest -Uri $u -OutFile $out -UseBasicParsing -UserAgent $UA
-            if ((Get-Item $out -ErrorAction SilentlyContinue).Length -gt 1KB) { return $true }
+            if ((Get-Item $out -ErrorAction SilentlyContinue).Length -ge $minBytes) { return $true }
         } catch { }
     }
     return $false
@@ -118,7 +121,7 @@ try {
             $chk = Invoke-RestMethod "https://api.github.com/repos/$repo/releases/latest" -UserAgent $UA
             $chkAsset = $chk.assets | Where-Object name -eq "HookIP.exe.sha256"
             if ($chkAsset) {
-                if (Get-Asset $chkAsset.browser_download_url $hashFile) { } else { Remove-Item $hashFile -ErrorAction SilentlyContinue }
+                if (Get-Asset $chkAsset.browser_download_url $hashFile 16) { } else { Remove-Item $hashFile -ErrorAction SilentlyContinue }
             }
         } catch { }
     }

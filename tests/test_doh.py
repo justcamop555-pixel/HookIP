@@ -252,6 +252,36 @@ def test_cname_no_double_release():
 
 
 # ---- 4. _frag_send chunk semantics -----------------------------------
+def test_sinkhole_only_answer_raises():
+    """A sinkhole-only answer must RAISE 'all resolvers returned a
+    sinkhole' regardless of which source produced it — a refactor once
+    nested that raise inside the plaintext-warn condition, so a DoH
+    (source='doh') sinkhole-only answer fell through as an empty list."""
+    r = make_resolver(pool_max=2)
+    r._via_doh = lambda host, qtype: (["0.0.0.0"], 120, "ok (rcode 0)")
+    try:
+        r.resolve("blocked.example")
+        check("DoH sinkhole-only raises", False, "no raise")
+    except ResolveError as exc:
+        check("DoH sinkhole-only raises with sinkhole reason",
+              "sinkhole" in str(exc), str(exc)[:80])
+
+    # same via the TCP fallback path (source='tcp') — and the rejected
+    # sinkhole answer must NOT consume the plaintext-warn throttle
+    r2 = make_resolver(pool_max=2)
+    r2._via_doh = lambda host, qtype: ([], 120, "error: all failed")
+    r2._via_tcp_dns = lambda *a, **k: (["0.0.0.0"], 60)
+    r2._via_udp_dns = lambda *a, **k: ([], 0)
+    r2._via_system = lambda *a, **k: ([], 0)
+    try:
+        r2.resolve("blocked2.example")
+        check("TCP sinkhole-only raises", False, "no raise")
+    except ResolveError as exc:
+        warns = [m for (lvl, m) in r2.log.lines if lvl == "warn"]
+        check("TCP sinkhole-only raises, no plaintext warn",
+              "sinkhole" in str(exc) and not warns, str(exc)[:80])
+
+
 def test_plain_fallback_warn_throttled():
     """DoH on but unreachable -> the address came from plaintext DNS: that
     Secure-DNS degradation is logged as WARN, throttled to one entry per
@@ -781,6 +811,7 @@ if __name__ == "__main__":
     test_start_idx_threadsafe()
     test_sni_less_and_fallback()
     test_plain_fallback_warn_throttled()
+    test_sinkhole_only_answer_raises()
 
     print()
     print(f"Summary: {sum(1 for _, c in RESULTS if c)}/{len(RESULTS)} passed")
