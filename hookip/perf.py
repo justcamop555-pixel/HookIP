@@ -59,6 +59,8 @@ class Profile:
             self.domain_cap = 200
             self.dash_interval_ms = 1000     # redraw less often
             self.idle_dash_interval_ms = 3000
+            self.log_buffer = 1200           # in-memory history entries
+            self.log_screen_lines = 1000     # max lines in the on-screen log
         elif self.tier == "high":
             self.max_connections = 512
             self.doh_pool_per_resolver = 4
@@ -67,6 +69,8 @@ class Profile:
             self.domain_cap = 600
             self.dash_interval_ms = 500
             self.idle_dash_interval_ms = 2000
+            self.log_buffer = 3000
+            self.log_screen_lines = 2500
         else:  # mid
             self.max_connections = 256
             self.doh_pool_per_resolver = 2
@@ -75,6 +79,8 @@ class Profile:
             self.domain_cap = 400
             self.dash_interval_ms = 700
             self.idle_dash_interval_ms = 2500
+            self.log_buffer = 2500
+            self.log_screen_lines = 2000
 
     def describe(self):
         ram = f"{self.ram_gb:.0f} GB RAM" if self.ram_gb else "RAM n/a"

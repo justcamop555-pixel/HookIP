@@ -18,6 +18,7 @@ from . import dnsmsg
 from . import logutil
 from .config import Config, SETTINGS_PATH, DEFAULTS
 from .logutil import Log
+from .perf import profile
 from .proxy import ProxyServer, Stats
 from .tooltips import Tooltip
 from . import winproxy
@@ -1763,8 +1764,9 @@ class App:
             entries = self.log.drain()
             if entries:
                 self._log_all.extend(entries)
-                if len(self._log_all) > 3000:
-                    self._log_all = self._log_all[-3000:]
+                buf_cap = profile().log_buffer      # tier-scaled, matches Log
+                if len(self._log_all) > buf_cap:
+                    self._log_all = self._log_all[-buf_cap:]
                 new_entries = [e for e in entries
                                if logutil.LEVEL_RANK.get(e[0], 1) >= self._log_min_rank]
                 if new_entries:
@@ -1781,13 +1783,14 @@ class App:
                     # bottom — otherwise scrolling up gets yanked back down
                     if at_bottom:
                         self.log_text.see("end")
+            keep = profile().log_screen_lines
             lines = int(self.log_text.index("end-1c").split(".")[0])
-            if lines > 2500:
+            if lines > keep:
                 # the trim was silently IGNORED while the widget is
                 # 'disabled' (Tk ignores delete on a disabled Text) — the
                 # on-screen log grew without bound in long sessions
                 self.log_text.configure(state="normal")
-                self.log_text.delete("1.0", f"{lines - 2000}.0")
+                self.log_text.delete("1.0", f"{lines - (keep - 500)}.0")
                 self.log_text.configure(state="disabled")
             self.root.after(250, self._pump_log)
         except Exception as exc:  # noqa: BLE001 — never stop the log pump;

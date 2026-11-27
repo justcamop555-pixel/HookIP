@@ -6,12 +6,18 @@ import glob
 from collections import deque
 
 from . import dataguard
+from .perf import profile
 
 LEVEL_RANK = {"debug": 0, "info": 1, "ok": 1, "warn": 2, "error": 3}
 
 
 class Log:
-    def __init__(self, maxlen=3000):
+    def __init__(self, maxlen=None):
+        # default buffer scales with the hardware tier (perf.py): a 2-core
+        # laptop keeps 1200 entries, a desktop 3000 — the file sink always
+        # gets everything regardless
+        if maxlen is None:
+            maxlen = profile().log_buffer
         self._lock = threading.Lock()
         self._buf = deque(maxlen=maxlen)
         self._subs = []

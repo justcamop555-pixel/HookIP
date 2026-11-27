@@ -655,18 +655,30 @@ class Resolver:
         # connections release/drop inside _doh_attempt, which runs to
         # completion in its worker thread regardless).
         holders = {}                      # idx -> [attempt result]
-        inflight = []                     # (idx, thread)
+        ready = set()                     # completed attempt indices
+        inflight = []                     # running attempt indices (launch order)
+        done_cv = threading.Condition()   # workers notify on completion —
+        # the old loop polled thread.is_alive() every 20 ms, waking the
+        # calling thread ~50x/s during EVERY lookup: a real CPU cost on
+        # 2-core machines with many parallel connections (and it added up
+        # to 20 ms of latency per lookup). The condition wake is instant.
         state = {"next": 0, "hedge_deadline": None}
 
         def _launch(i):
             name, dns_host, ip = order[i]
             holders[i] = []
-            t = threading.Thread(
-                target=lambda: holders[i].append(
-                    self._doh_attempt(name, dns_host, ip, host, qtype, query)),
-                daemon=True)
-            inflight.append((i, t))
-            t.start()
+
+            def run():
+                try:
+                    holders[i].append(
+                        self._doh_attempt(name, dns_host, ip, host, qtype, query))
+                finally:
+                    with done_cv:
+                        ready.add(i)
+                        done_cv.notify_all()
+
+            threading.Thread(target=run, daemon=True).start()
+            inflight.append(i)
 
         result = None            # ('pos', ips, ttl) winner
         verified = None          # CNAME-path VerifiedNegative message
@@ -687,17 +699,25 @@ class Resolver:
                 continue
             if not inflight:
                 break
-            # wait a tick for any attempt to finish
-            done = None
-            for k, (_i, t2) in enumerate(inflight):
-                if not t2.is_alive():
-                    done = k
-                    break
-            if done is None:
-                time.sleep(0.02)
+            # event-driven wait: workers notify the moment an attempt
+            # finishes; the timeout only bounds the hedge-deadline checks
+            if not ready:
+                timeout = 0.05
+                if state["hedge_deadline"] is not None:
+                    timeout = max(0.01, min(timeout,
+                                            state["hedge_deadline"] - time.time()))
+                with done_cv:
+                    if not ready:
+                        done_cv.wait(timeout)
+            if not ready:
+                continue          # hedge deadline may have passed — loop
+            done_idx = next((i for i in inflight if i in ready), None)
+            if done_idx is None:
                 continue
-            _i, _t2 = inflight.pop(done)
-            res = holders[_i][0] if holders[_i] else ("err", f"{_i}: no result", None)
+            ready.discard(done_idx)
+            inflight.remove(done_idx)
+            res = holders[done_idx][0] if holders[done_idx] else (
+                "err", f"{done_idx}: no result", None)
             kind = res[0]
             if kind == "pos":
                 result = res
