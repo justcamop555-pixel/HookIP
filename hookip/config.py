@@ -76,14 +76,28 @@ class Config:
     @classmethod
     def load(cls):
         try:
-            with open(SETTINGS_PATH, "r", encoding="utf-8") as fh:
-                raw = fh.read()
+            with open(SETTINGS_PATH, "rb") as fh:
+                raw_bytes = fh.read()
         except OSError:
             return cls()
+        try:
+            raw = raw_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            raw = ""
         if raw.startswith(dataguard.CFG_MAGIC):
             # encrypted-at-rest settings (the normal case)
             plain = dataguard.decrypt_bytes(raw)
             if plain is None:
+                # ours but UNREADABLE (corrupt blob / copied from another
+                # account): quarantine instead of silently falling back
+                # to defaults — falling back here would wipe the user's
+                # site list on the next save. os.replace moves the bad
+                # file aside; save() writes a fresh settings.json and
+                # never touches the .bad file.
+                try:
+                    os.replace(SETTINGS_PATH, SETTINGS_PATH + ".bad")
+                except OSError:
+                    pass
                 return cls()
             try:
                 return cls(json.loads(plain.decode("utf-8")))

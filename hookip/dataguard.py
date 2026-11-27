@@ -25,15 +25,20 @@ Guard, in layers (all stdlib/ctypes, still no admin):
    is claimed first by renaming it to foo.log.migrating (a locked file
    is skipped without writing anything), the claim file is deleted
    last, a leftover foo.log.migrating from a crashed run is finished on
-   the next run, and the merge skips lines the .hlog already holds —
-   so reruns never duplicate lines and an existing .hlog is never
-   overwritten.
+   the next run, and each merge writes ONE encrypted idempotency marker
+   ("# migrated <name> sha256=<hex>") as the last line of the migrated
+   block — a rerun scans the .hlog for that marker and skips the merge
+   if the same source file was already migrated, so no duplicates and
+   an existing .hlog is never overwritten.
 
 Honest limits (stated in Diagnostics too): a determined attacker
 running as YOUR user account with full access can reverse DPAPI — no
 user-space app can stop that. This guard defeats bulk folder-theft,
 cross-account snooping and anything that exfiltrates files to read
-elsewhere. Antivirus/Defender stays the wall for live malware.
+elsewhere. Antivirus/Defender stays the wall for live malware. Also
+note: encrypting and deleting plaintext does not erase it from free
+disk space, OneDrive version history or existing backups — full
+erasure needs those layers too.
 
 Return conventions:
 - decrypt_line: None = "not our format"; UNREADABLE = "our format but
@@ -45,7 +50,9 @@ Return conventions:
 """
 import base64
 import ctypes
+import hashlib
 import os
+import re
 import subprocess
 from ctypes import wintypes
 
@@ -81,7 +88,7 @@ class _DATA_BLOB(ctypes.Structure):
 # Private WinDLL instances: ctypes.windll.* returns process-wide cached
 # objects, and setting argtypes on them would change behavior for other
 # code in this process. use_last_error=True keeps GetLastError accurate.
-_crypt32 = ctypes.WinDLL("crypt32")
+_crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
 _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 _advapi32 = ctypes.WinDLL("advapi32")
 
@@ -150,13 +157,20 @@ def _crypt(data, decrypt):
     if decrypt:
         ok = _crypt32.CryptUnprotectData(ctypes.byref(pin), None,
                                          ctypes.byref(_ENTROPY_BLOB),
-                                         None, None, 0, ctypes.byref(pout))
+                                         None, None,
+                                         _CRYPTPROTECT_UI_FORBIDDEN,
+                                         ctypes.byref(pout))
     else:
         ok = _crypt32.CryptProtectData(ctypes.byref(pin), None,
                                        ctypes.byref(_ENTROPY_BLOB),
-                                       None, None, 0, ctypes.byref(pout))
+                                       None, None,
+                                       _CRYPTPROTECT_UI_FORBIDDEN,
+                                       ctypes.byref(pout))
     if not ok:
-        raise OSError("CryptProtectData/CryptUnprotectData failed")
+        # use_last_error=True on _crypt32 makes get_last_error() valid
+        # here; the real error code lands in Diagnostics
+        raise OSError(f"DPAPI {'CryptUnprotectData' if decrypt else 'CryptProtectData'}"
+                      f" failed: {ctypes.WinError(ctypes.get_last_error())}")
     try:
         out = ctypes.string_at(pout.pbData, pout.cbData)
     finally:
@@ -325,7 +339,11 @@ def acl_is_hardened(path):
 
     Limitations: this is a report-parse heuristic (icacls exposes no
     structured API without admin), and a path containing the literal
-    ':(I)' would produce a false 'not hardened'.
+    ':(I)' would produce a false 'not hardened'. It also proves only
+    that no ACEs are INHERITED: an explicit ACE for another principal
+    still reads as hardened, and harden_dir's /grant:r does not remove
+    such entries — acceptable for a freshly created data folder, whose
+    ACL starts empty apart from what harden_dir grants.
     """
     try:
         r = subprocess.run(["icacls", path], capture_output=True, text=True,
@@ -340,24 +358,47 @@ def acl_is_hardened(path):
 
 
 # --------------------------------------------------------- migration
+_MARKER_RE = re.compile(r"^# migrated .+ sha256=([0-9a-f]{64})$")
+
+
+def _decode_legacy(raw):
+    """utf-8, then cp1252 (smart quotes/dashes), then latin-1 (cannot
+    fail) — plain latin-1 would mangle cp1252's 0x80-0x9F bytes into
+    control characters."""
+    for enc in ("utf-8", "cp1252", "latin-1"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("latin-1")   # unreachable; latin-1 never fails
+
+
 def migrate_plaintext_logs(log_dir):
     """Encrypt legacy .log files (older versions wrote plaintext).
 
-    Each file: read BINARY, decode UTF-8 with a latin-1 fallback (so
+    Per file: read BINARY, decode utf-8 -> cp1252 -> latin-1 (so
     non-UTF-8 bytes survive instead of being 'replace'-altered), split
-    on "\\n" only (splitlines() would also break on \\x0c/\\x1c-\\x1e
-    page/separator controls), encrypt line-by-line.
+    on "\n" only (splitlines() would also break on \x0c/\x1c-\x1e
+    page/separator controls), normalize CRLF, encrypt line-by-line.
 
     Crash/lock safety: the source .log is first CLAIMED by renaming it
     to foo.log.migrating — if that rename fails (AV/OneDrive lock), the
     file is skipped and nothing is written. The .migrating file is then
-    read, merged into foo.hlog, foo.hlog is rewritten atomically via
-    temp + os.replace, and the .migrating file is deleted LAST. If that
-    final delete fails, a rerun finishes the leftover foo.log.migrating
-    instead of ignoring it, and the merge SKIPS lines foo.hlog already
-    holds (compared as decrypted plaintext — DPAPI blobs are not
-    deterministic, so ciphertext cannot be compared) — no duplicates.
-    An existing foo.hlog is NEVER overwritten.
+    read, merged into foo.hlog (as the last lines, followed by ONE
+    encrypted idempotency marker "# migrated <original file name>
+    sha256=<hex of the raw source bytes>"), foo.hlog is rewritten
+    atomically via temp + os.replace, and the .migrating file is
+    deleted LAST. If that final delete fails, a rerun finishes the
+    leftover foo.log.migrating instead of ignoring it: the existing
+    .hlog is scanned for a marker with the same sha256 — found means
+    the merge already happened, so the merge is skipped, the claim is
+    deleted and the file counts as converted (NO duplicate lines;
+    fresh .log claims never need the scan). If foo.hlog exists but
+    cannot be READ (AV lock), the whole file is aborted with the claim
+    left in place for the next run — an unreadable .hlog is never
+    overwritten. Leftover claims are processed BEFORE their .log, and
+    a .log whose claim still exists after that pass is skipped until
+    the next run. An existing foo.hlog is NEVER overwritten.
 
     Concurrency note: the atomic replace covers only the rewrite, not
     concurrent appends — migration must run BEFORE the logger opens
@@ -372,34 +413,44 @@ def migrate_plaintext_logs(log_dir):
         names = os.listdir(log_dir)
     except OSError:
         return (0, 0)
+    # leftover claims FIRST (their .log must not be claimed while the
+    # claim from an unfinished pass is still in place), then fresh .log
+    leftovers = [n for n in names if n.endswith(".log.migrating")]
     logs = [n for n in names if n.endswith(".log")]
-    # leftovers from a crashed run (claim rename done, cleanup delete
-    # failed): finish them instead of ignoring
-    orphans = [n for n in names if n.endswith(".log.migrating")
-               and n[:-len(".migrating")] not in logs]
-    for name in logs + orphans:
-        if name.endswith(".log.migrating"):
+    for name in leftovers + logs:
+        is_leftover = name.endswith(".log.migrating")
+        if is_leftover:
             migrating = os.path.join(log_dir, name)
-            base = migrating[:-len(".migrating")]      # ...\\foo.log
+            base = migrating[:-len(".migrating")]      # ...\foo.log
             dst = (base[:-4] if base.endswith(".log") else base) + ".hlog"
+            orig_name = base
+            src = None              # never referenced on the leftover path
         else:
             src = os.path.join(log_dir, name)
             dst = src[:-4] + ".hlog"
             migrating = src + ".migrating"
+            orig_name = name
         tmp = dst + ".mig"
-        total += 1
         try:
-            # claim first: locked source -> rename fails -> skip, write
-            # nothing (a crash after this point leaves a finishable
-            # .migrating file)
-            if not os.path.exists(migrating):
+            if is_leftover:
+                if not os.path.exists(migrating):
+                    continue        # vanished since listdir; nothing to do
+            else:
+                # a .log whose claim still exists (unfinished leftover
+                # pass above) is skipped THIS run — the second rename
+                # must not clobber the existing claim
+                if os.path.exists(migrating):
+                    continue
+                total += 1
+                # claim first: locked source -> rename fails -> skip,
+                # write nothing (a crash after this point leaves a
+                # finishable .migrating file, handled on the next run
+                # as a leftover entry)
                 os.replace(src, migrating)
             with open(migrating, "rb") as fh:
                 raw = fh.read()
-            try:
-                text = raw.decode("utf-8")
-            except UnicodeDecodeError:
-                text = raw.decode("latin-1")
+            src_sha = hashlib.sha256(raw).hexdigest()
+            text = _decode_legacy(raw)
             had_trailing_nl = text.endswith("\n")
             lines = text.split("\n")
             if had_trailing_nl:
@@ -414,31 +465,27 @@ def migrate_plaintext_logs(log_dir):
                     continue
                 out.append(encrypt_line(ln))
 
-            # merge with any existing .hlog (never clobber its content)
+            # read the existing .hlog (never clobber its content). If it
+            # cannot be read, ABORT this file: the claim stays for the
+            # next run and nothing is written — overwriting a locked
+            # .hlog with only the migrated lines would destroy data.
             existing = []
-            known = set()   # plaintexts the .hlog already holds
             if os.path.exists(dst):
-                try:
-                    with open(dst, "r", encoding="utf-8",
-                              errors="replace") as fh:
-                        existing = fh.read().splitlines()
-                except OSError:
-                    existing = []
-                for ex in existing:
-                    v = decrypt_line(ex)
-                    if isinstance(v, str):
-                        known.add(v)
+                with open(dst, "r", encoding="utf-8", errors="replace") as fh:
+                    existing = fh.read().splitlines()
+                if is_leftover and _has_marker(existing, src_sha):
+                    # merge already happened on an earlier run — just
+                    # finish the claim cleanup
+                    os.remove(migrating)
+                    converted += 1
+                    continue
                 if existing and not existing[-1].strip():
                     existing = existing[:-1]   # drop trailing blank for join
 
-            combined = list(existing)
-            for ln in out:
-                v = decrypt_line(ln)
-                if isinstance(v, str) and v in known and v.strip():
-                    continue                   # rerun-safe: already merged
-                combined.append(ln)
-                if isinstance(v, str):
-                    known.add(v)
+            # idempotency marker: last line of the migrated block
+            marker = encrypt_line(
+                f"# migrated {orig_name} sha256={src_sha}")
+            combined = existing + out + [marker]
             with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
                 fh.write("\n".join(combined) + "\n")
                 fh.flush()
@@ -446,13 +493,25 @@ def migrate_plaintext_logs(log_dir):
             os.replace(tmp, dst)
             # claim file is deleted LAST — after the encrypted copy is
             # durable. If this delete fails (AV lock), the leftover
-            # .migrating is finished on the next run without duplicates.
+            # .migrating is finished on the next run via the marker.
             os.remove(migrating)
             converted += 1
-        except OSError:
+        except Exception:  # noqa: BLE001 — migration must never crash startup
             try:
                 if os.path.exists(tmp):
                     os.remove(tmp)
             except OSError:
                 pass
     return (converted, total)
+
+
+def _has_marker(lines, src_sha):
+    """True when one of the (encrypted) .hlog lines decrypts to an
+    idempotency marker carrying the same source-file sha256."""
+    for ex in lines:
+        v = decrypt_line(ex)
+        if isinstance(v, str):
+            m = _MARKER_RE.match(v.strip())
+            if m and m.group(1) == src_sha:
+                return True
+    return False
