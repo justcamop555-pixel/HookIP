@@ -142,6 +142,7 @@ class ProxyServer:
         self._tunnel_detail = {}              # host -> (strategy, dns_ms, conn_ms, segs, total_ms)
         self._detail_lock = threading.Lock()
         self._cut_seen = {}                   # host -> ts (mid-transfer cut dedupe)
+        self._failnote_seen = {}              # host -> ts (repeat-failure note dedupe)
         self._conns_lock = threading.Lock()
         self._conn_limit = threading.BoundedSemaphore(MAX_CONNECTIONS)
         self.running = False
@@ -268,8 +269,16 @@ class ProxyServer:
                         del self._fails[h]
             self._fails[host] = (time.time() + 60, count, capped)
         if capped:
-            self.log.debug(f"{host}: marked as repeat-failure — "
-                           "next connections will try a single strategy")
+            # dedupe the per-host DEBUG note: a browser retry-storm against a
+            # dead host used to print 'marked as repeat-failure' on EVERY
+            # connection (the user's pstream.net session showed it ~40×)
+            now_s = time.time()
+            if len(self._failnote_seen) > 500:
+                self._failnote_seen.clear()
+            if now_s - self._failnote_seen.get(host, 0) > 60:
+                self._failnote_seen[host] = now_s
+                self.log.debug(f"{host}: marked as repeat-failure — "
+                               "next connections will try a single strategy")
 
     def _recent_fail(self, host):
         with self._fails_lock:
@@ -330,9 +339,11 @@ class ProxyServer:
             self.log.info(f"{exc}")
         except (OSError, ResolveError, ValueError) as exc:
             msg = f"{exc}"
-            if ("NXDOMAIN" in msg or "sinkhole" in msg or "rcode 2" in msg):
-                # VERIFIED dead: resolvers confirm the name does not exist or
-                # is deliberately sunk — a feature working, not a proxy failure
+            if ("NXDOMAIN" in msg or "sinkhole" in msg or "rcode 2" in msg
+                    or "NODATA" in msg or "SERVFAIL" in msg):
+                # VERIFIED dead: resolvers confirm the name does not exist,
+                # has no address records, or is deliberately sunk — a feature
+                # working, not a proxy failure
                 blocked = True
                 key = host or msg[:80]
                 now_s = time.time()
@@ -361,7 +372,12 @@ class ProxyServer:
             if opened:
                 self.stats.conn_close(failed, blocked)
             self._forget(csock)
-            self._conn_limit.release()
+            try:
+                self._conn_limit.release()
+            except ValueError:
+                # insurance: _handle is always entered after an acquire in the
+                # accept loop, but never let an accounting slip kill a thread
+                pass
             for s in (csock, ssock):
                 if s:
                     try:

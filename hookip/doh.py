@@ -238,7 +238,7 @@ class Resolver:
         self.log = log
         self.chunk = chunk
         self._cache = {}                      # name -> (expiry, ips)
-        self._neg_cache = {}                  # name -> expiry
+        self._neg_cache = {}                  # name -> (expiry, reason)
         self._lock = threading.Lock()
         self._start_idx = 0
         self._lat = {}                          # resolver name -> EMA latency (s)
@@ -319,8 +319,10 @@ class Resolver:
         now = time.time()
         with self._lock:
             neg = self._neg_cache.get(host)
-            if neg and neg > now:
-                raise ResolveError(f"{host}: cached NXDOMAIN")
+            if neg and neg[0] > now:
+                # reason stored with the entry (NXDOMAIN / NODATA / sinkhole) —
+                # the old code always said 'NXDOMAIN' even when it wasn't
+                raise ResolveError(f"{host}: {neg[1]} (cached)")
             hit = self._cache.get(host)
             if hit and hit[0] > now:
                 return list(hit[1])
@@ -339,8 +341,8 @@ class Resolver:
             now = time.time()
             with self._lock:
                 neg = self._neg_cache.get(host)
-                if neg and neg > now:
-                    raise ResolveError(f"{host}: cached NXDOMAIN")
+                if neg and neg[0] > now:
+                    raise ResolveError(f"{host}: {neg[1]} (cached)")
                 hit = self._cache.get(host)
                 if hit and hit[0] > now:
                     return list(hit[1])
@@ -359,28 +361,49 @@ class Resolver:
         Called at most once per host at a time (in-flight coalescing)."""
         ips = []
         ttl = 120
-        verified_neg = None
+        verified_neg = None    # trusted negative verdict string (NXDOMAIN / NODATA)
+        doh_note = None        # detailed last DoH verdict (helps messaging)
         try:
             if self.cfg.doh_enabled:
-                ips, ttl = self._via_doh(host, qtype)
+                ips, ttl, doh_note = self._via_doh(host, qtype)
             if not ips:
                 ips, ttl = self._via_tcp_dns(host, qtype)
         except VerifiedNegative as exc:
             verified_neg = str(exc)
             ips, ttl = [], ttl
-        if not ips and not verified_neg:
+        if not ips and verified_neg is None:
             ips, ttl = self._via_udp_dns(host, qtype)
-        if not ips and not verified_neg:
+        if not ips and verified_neg is None:
             ips, ttl = self._via_system(host, qtype)
         if not ips:
+            # A resolver that ANSWERED (rcode 0) but has no usable records is
+            # a trusted verdict: the name exists but has no A/AAAA addresses
+            # right now (NODATA). The old code discarded that and let the
+            # LAST resolver's SERVFAIL win, then cached the wrong reason.
+            if verified_neg is None and doh_note:
+                verified_neg = doh_note
+            if verified_neg:
+                # store the reason WITHOUT the host (the cached-raise adds it)
+                reason = (verified_neg.split(": ", 1)[1]
+                          if verified_neg.startswith(host + ": ") else verified_neg)
+            else:
+                reason = "no addresses (DNS unreachable or dead domain)"
             neg_ttl = 300 if verified_neg else 120
             with self._lock:
-                self._neg_cache[host] = now + neg_ttl
+                self._neg_cache[host] = (now + neg_ttl, reason)
             if not verified_neg and self.cfg.doh_enabled:
                 # IPv6-only host? one AAAA pass before giving up — connecting
                 # through the tunnel to an IPv6 address works fine
                 try:
-                    ips, ttl = self._via_doh(host, dnsmsg.TYPE_AAAA)
+                    ips, ttl, note_aaaa = self._via_doh(host, dnsmsg.TYPE_AAAA)
+                    if not ips and note_aaaa:
+                        # the name exists (a resolver answered) but has no A
+                        # AND no AAAA records — genuinely addressless: upgrade
+                        # the cached verdict from 'DNS unreachable' to the
+                        # verified NODATA story
+                        with self._lock:
+                            self._neg_cache[host] = (now + 300, note_aaaa)
+                        reason = note_aaaa
                     if ips:
                         ips = [ip for ip in ips if not is_sinkhole(ip)]
                         # the negative mark above is WRONG now (the name has
@@ -401,8 +424,8 @@ class Resolver:
                     except (ResolveError, OSError):
                         ips = []
             if not ips:
-                raise ResolveError(verified_neg or
-                                   f"no addresses for {host} (DNS unreachable or dead domain)")
+                raise ResolveError(reason if reason.startswith("no addresses for ")
+                                   else f"no addresses for {host} ({reason})")
 
         blocked = [ip for ip in ips if is_sinkhole(ip)]
         if blocked:
@@ -410,7 +433,7 @@ class Resolver:
             self.log.debug(f"resolve {host}: dropped sinkhole answer(s) {', '.join(blocked)}")
             if not ips:
                 with self._lock:
-                    self._neg_cache[host] = now + 120
+                    self._neg_cache[host] = (now + 120, "all resolvers returned a sinkhole")
                 raise ResolveError(f"no addresses for {host} (all resolvers returned a sinkhole)")
 
         ttl = min(300, max(10, int(ttl)))
@@ -425,7 +448,7 @@ class Resolver:
                 self._cache = alive
             if len(self._neg_cache) > 2048:
                 now2 = time.time()
-                self._neg_cache = {h: e for h, e in self._neg_cache.items() if e > now2}
+                self._neg_cache = {h: e for h, e in self._neg_cache.items() if e[0] > now2}
             self._cache[host] = (now + ttl, list(ips))
         self.log.debug(f"resolve {host} -> {', '.join(ips[:4])} (ttl {ttl}s)")
         return list(ips)
@@ -451,6 +474,8 @@ class Resolver:
         order.sort(key=lambda r: self._lat.get(r[0], 1.0))
         query = dnsmsg.encode_query(host, qtype)
         last_err = None
+        nodata = []           # resolvers that ANSWERED but have no records
+        rec = "AAAA" if qtype == dnsmsg.TYPE_AAAA else "A"
         for name, dns_host, ip in order:
             conn = None
             try:
@@ -512,7 +537,12 @@ class Resolver:
                 with self._lock:
                     self.verbose_stats[name] = self.verbose_stats.get(name, 0) + 1
                 if ips:
-                    return ips, ttl
+                    return ips, ttl, None
+                # rcode 0 with no usable records: the name exists but has no
+                # address records right now (NODATA) — a TRUSTED verdict from
+                # this resolver (it spoke authoritatively over DoH)
+                nodata.append(name)
+                last_err = f"{name}: rcode 0 but no {rec} records (NODATA)"
             except VerifiedNegative:
                 raise
             except (OSError, ResolveError, ValueError, ssl.SSLError) as exc:
@@ -522,13 +552,24 @@ class Resolver:
             finally:
                 if conn is not None:
                     self._release_doh(conn)
-        if last_err:
+        note = None
+        if nodata:
+            # at least one resolver answered authoritatively: the name has no
+            # usable address record right now — this is a real verdict, not a
+            # resolver outage (the old code reported the LAST resolver's
+            # SERVFAIL as the reason and WARNed, then poisoned the negative
+            # cache with 'NXDOMAIN')
+            note = (f"no {rec} records (NODATA, verified via DoH "
+                    f"{', '.join(nodata)})")
+            self.log.debug(f"DoH verdict for {host}: {note} "
+                           f"(other resolvers: {last_err})")
+        elif last_err:
             # policy verdicts (sinkhole/empty) are expected for ad domains —
             # DEBUG keeps the detail without spamming WARN on every retry
             level = "debug" if ("sinkhole" in last_err or "rcode 0" in last_err
                                 or "no answer" in last_err) else "warn"
             getattr(self.log, level)(f"DoH failed for {host}: {last_err}")
-        return [], 120
+        return [], 120, note
 
     def _via_tcp_dns(self, host, qtype):
         query = dnsmsg.encode_query(host, qtype)
@@ -603,7 +644,7 @@ class Resolver:
         with self._lock:
             now = time.time()
             pos = sum(1 for e in self._cache.values() if e[0] > now)
-            neg = sum(1 for e in self._neg_cache.values() if e > now)
+            neg = sum(1 for e in self._neg_cache.values() if e[0] > now)
         return pos, neg
 
     def cache_hosts(self):
