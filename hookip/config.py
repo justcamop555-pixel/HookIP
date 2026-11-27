@@ -84,10 +84,21 @@ class Config:
     def save(self):
         try:
             os.makedirs(APP_DIR, exist_ok=True)
-            with open(SETTINGS_PATH, "w", encoding="utf-8") as fh:
+            # atomic write: settings.json is replaced only after the temp
+            # file is fully on disk — a crash or power loss mid-save can no
+            # longer corrupt the settings file (it used to truncate it)
+            tmp = SETTINGS_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
                 json.dump(self._data, fh, indent=2)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, SETTINGS_PATH)
         except OSError:
-            pass
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
 
     def snapshot(self):
         return dict(self._data)

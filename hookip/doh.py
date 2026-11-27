@@ -8,6 +8,7 @@ import threading
 import time
 
 from . import dnsmsg
+from .perf import profile
 
 RESOLVERS = [
     ("Cloudflare", "cloudflare-dns.com", "1.1.1.1"),
@@ -247,7 +248,7 @@ class Resolver:
         self.verbose_stats = {}               # resolver -> success count
         self._pool = {}                       # resolver name -> [_DoHConn, ...]
         self._pool_lock = threading.Lock()
-        self._pool_max = 3                    # conns per resolver (parallel lookups)
+        self._pool_max = profile().doh_pool_per_resolver  # hardware-scaled
 
     def _doh_session(self, name, dns_host, ip):
         """Check out a pooled keep-alive connection with its per-connection
@@ -438,15 +439,17 @@ class Resolver:
 
         ttl = min(300, max(10, int(ttl)))
         with self._lock:
-            if len(self._cache) > 4096:
+            cap = profile().cache_cap
+            neg_cap = profile().neg_cache_cap
+            if len(self._cache) > cap:
                 # marathon sessions: drop expired entries first, then the
                 # oldest — the cache must never grow without bound
                 now2 = time.time()
                 alive = {h: e for h, e in self._cache.items() if e[0] > now2}
-                if len(alive) > 4096:
-                    alive = dict(sorted(alive.items(), key=lambda kv: kv[1][0])[:2048])
+                if len(alive) > cap:
+                    alive = dict(sorted(alive.items(), key=lambda kv: kv[1][0])[:cap // 2])
                 self._cache = alive
-            if len(self._neg_cache) > 2048:
+            if len(self._neg_cache) > neg_cap:
                 now2 = time.time()
                 self._neg_cache = {h: e for h, e in self._neg_cache.items() if e[0] > now2}
             self._cache[host] = (now + ttl, list(ips))

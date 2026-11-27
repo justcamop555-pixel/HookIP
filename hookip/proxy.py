@@ -8,9 +8,10 @@ import time
 from collections import deque
 
 from . import tlsfrag
+from .perf import profile
 from .doh import Resolver, ResolveError
 
-MAX_CONNECTIONS = 256
+_MAX_CONNECTIONS = profile().max_connections
 
 
 class ClientAbortError(OSError):
@@ -74,12 +75,13 @@ class Stats:
 
     def top_domains(self, k=15):
         with self.lock:
-            if len(self.domains) > 600:
+            cap = profile().domain_cap
+            if len(self.domains) > cap:
                 # long sessions meet thousands of unique hosts; keeping every
                 # one grows memory and makes this sort (2×/s) grind. Drop the
-                # least-trafficked half when the table gets fat.
+                # least-trafficked half when the table gets fat (hardware-scaled).
                 keep = sorted(self.domains.items(),
-                              key=lambda kv: -(kv[1][1] + kv[1][2]))[:300]
+                              key=lambda kv: -(kv[1][1] + kv[1][2]))[:cap // 2]
                 self.domains = dict(keep)
             items = sorted(self.domains.items(), key=lambda kv: -(kv[1][1] + kv[1][2]))
             return [(h, c, u, d) for h, (c, u, d) in items[:k]]
@@ -144,7 +146,7 @@ class ProxyServer:
         self._cut_seen = {}                   # host -> ts (mid-transfer cut dedupe)
         self._failnote_seen = {}              # host -> ts (repeat-failure note dedupe)
         self._conns_lock = threading.Lock()
-        self._conn_limit = threading.BoundedSemaphore(MAX_CONNECTIONS)
+        self._conn_limit = threading.BoundedSemaphore(_MAX_CONNECTIONS)
         self.running = False
 
     # ------------------------------------------------------------------
@@ -368,6 +370,12 @@ class ProxyServer:
             else:
                 failed = True
                 self.log.warn(msg)   # messages are host:port-complete by design
+        except Exception as exc:  # noqa: BLE001 — contain the unexpected;
+            # an unknown error type must still mark the connection failed and
+            # release the slot cleanly (stats/semaphore stay balanced)
+            failed = True
+            self.log.error(f"{host or 'connection'}: internal handler error "
+                           f"({type(exc).__name__}: {exc})")
         finally:
             if opened:
                 self.stats.conn_close(failed, blocked)

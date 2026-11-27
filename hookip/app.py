@@ -100,9 +100,18 @@ class App:
         self.root.after(15000, self.check_updates)
         self._log_pos = 0  # kept for compatibility; pump now uses drain()
         self.root.after(250, self._pump_log)
-        self.root.after(500, self._refresh_dashboard)
+        try:
+            from .perf import profile as _p
+            self.root.after(_p().dash_interval_ms, self._refresh_dashboard)
+        except Exception:
+            self.root.after(500, self._refresh_dashboard)
         self._watch_activation()
         self.log.info(f"{APP_NAME} {__version__} ready. Press Start to turn the proxy on.")
+        try:
+            from .perf import profile
+            self.log.debug(f"Performance profile: {profile().describe()}")
+        except Exception:
+            pass
 
     def _watch_activation(self):
         """Watch the named event a second instance signals to bring this
@@ -1142,7 +1151,6 @@ class App:
     def start_proxy(self):
         if self.running:
             return
-        self._apply_settings_from_ui()
         cfg = self.cfg
         try:
             port = int(self.port_var.get())
@@ -1283,6 +1291,11 @@ class App:
                 "downloads, Windows services) do not go through HookIP and "
                 "may refuse to connect here regardless of the proxy. Browsing "
                 "through HookIP is unaffected.")
+        except Exception as exc:  # noqa: BLE001 — a probe must never crash
+            # its worker thread (an unexpected error here used to surface as
+            # a dead thread with no explanation)
+            self.log.debug(f"Restricted-network probe stopped: "
+                           f"{type(exc).__name__}: {exc}")
 
     def _on_accept_death(self):
         """The listener died while Windows still points at it — without this
@@ -1382,10 +1395,6 @@ class App:
             except tk.TclError:
                 pass
         self.nb.select(0 if running else self.nb.index(self.nb.select()))
-
-    # ------------------------------------------------------------------
-    def _apply_settings_from_ui(self):
-        pass  # read directly in start_proxy
 
     @staticmethod
     def _log_semantic_tag(msg):
@@ -1520,7 +1529,8 @@ class App:
                             pass
                 else:
                     self._wd_restarts = 0
-            self._draw_spark()
+            if self.root.state() != "iconic":
+                self._draw_spark()
             if self.root.state() == "iconic":
                 # minimized: skip the expensive top-domains redraw (stats keep
                 # accumulating; the watchdog check above still ran)
@@ -1544,7 +1554,12 @@ class App:
             except Exception:
                 pass
         try:
-            self.root.after(500, self._refresh_dashboard)
+            # hardware-scaled cadence: redraw less often on weak machines,
+            # and drop to the idle cadence when nothing is flowing
+            from .perf import profile
+            p = profile()
+            interval = p.dash_interval_ms if self.running else p.idle_dash_interval_ms
+            self.root.after(interval, self._refresh_dashboard)
         except (tk.TclError, RuntimeError):
             return
 
@@ -1722,6 +1737,11 @@ class App:
         self._diag_result("Environment", "info",
                           f"HookIP {__version__} · Python {sys.version.split()[0]} · "
                           f"{platform.system()} {platform.release()} ({platform.machine()})")
+        try:
+            from .perf import profile
+            self._diag_result("Performance profile", "info", profile().describe())
+        except Exception:
+            pass
         cur = winproxy.read_current()
         self._diag_result("System proxy", "info", winproxy.describe(cur))
         # stale-proxy detection: registry points at HookIP while we're off
@@ -1999,8 +2019,39 @@ def run():
         root.destroy()
         return
     root = tk.Tk()
-    app = App(root)
-    root.mainloop()
+    try:
+        app = App(root)
+        root.mainloop()
+    except Exception:
+        # GUARD: a startup crash used to die silently (window blinks and
+        # vanishes). Show what happened, and restore any proxy we changed.
+        import traceback
+        err = "".join(traceback.format_exception_only(
+            sys.exc_info()[0], sys.exc_info()[1])).strip()
+        try:
+            from .logutil import Log
+            l = Log()
+            l.error(f"Startup failure: {err}")
+            l.session_end()
+            l.close_file()
+        except Exception:
+            pass
+        try:
+            if winproxy.has_backup():
+                winproxy.restore_from_file()
+            elif winproxy._is_ours(winproxy.read_current()):
+                winproxy.remove_proxy()
+        except Exception:
+            pass
+        try:
+            messagebox.showerror(
+                APP_NAME,
+                "HookIP failed to start:" + chr(10) * 2 + err[:600] +
+                "Your internet settings were left untouched." + chr(10) +
+                "Details are in the newest log file under "
+                "%LOCALAPPDATA%" + chr(92) + "HookIP" + chr(92) + "logs.")
+        except Exception:
+            pass
     try:
         import ctypes
         ctypes.windll.kernel32.CloseHandle(mutex)
