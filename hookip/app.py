@@ -13,7 +13,7 @@ import traceback
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
-from . import __version__, APP_NAME
+from . import __version__, __build_id__, APP_NAME
 from . import dnsmsg
 from . import logutil
 from .config import Config, SETTINGS_PATH, DEFAULTS
@@ -97,7 +97,8 @@ class App:
         self.running = False
         self.watchdog = winproxy.Watchdog()
 
-        root.title(f"{APP_NAME} v{__version__}")
+        root.title(f"{APP_NAME} v{__version__}"
+                   + (f" · build {__build_id__}" if __build_id__ else ""))
         root.geometry("880x640")
         root.minsize(760, 560)
         root.configure(bg=BG)
@@ -445,10 +446,17 @@ class App:
                                        sha_asset, prerelease)))
     @staticmethod
     def _ver_tuple(s):
+        """Numeric compare that tolerates pre-release AND build-ID suffixes:
+        'v1.2.0-beta' and '1.2.0+build.42' both compare as (1, 2, 0).
+        (The old parser crashed on '+' and returned (0,), which made any
+        build-ID build look OLDER than the release and offered a
+        downgrade.) Unparseable -> (0,) so it never claims newer."""
         try:
-            # tolerate pre-release tags: v1.2.0-beta compares as (1, 2, 0)
-            return tuple(int(p) for p in
-                         s.lstrip("v").split("-")[0].split(".")[:3])
+            core = str(s).strip().lstrip("vV").split("+", 1)[0].split("-", 1)[0]
+            parts = [int(p) for p in core.split(".")[:3] if p.strip().isdigit()]
+            if not parts:
+                return (0,)
+            return tuple(parts + [0] * (3 - len(parts)))
         except ValueError:
             return (0,)
 
@@ -475,11 +483,29 @@ class App:
                     pass
                 return
             self._update_url = url
-            newer = self._ver_tuple(latest) > self._ver_tuple(__version__)
-            # pre-release builds (v1.2.0-beta) are opt-in: automatic checks
-            # stay on the stable channel and only mention them; a MANUAL
-            # check offers the download
-            if prerelease and not getattr(self, "_update_manual", False):
+            remote = self._ver_tuple(latest)
+            local = self._ver_tuple(__version__)
+            newer = remote > local
+            if remote < local:
+                # this build is NEWER than anything published — a local
+                # build ID not uploaded to GitHub yet. Never offer a
+                # downgrade; say so plainly and stay quiet until the
+                # release catches up.
+                self.update_label.configure(
+                    text=f"build ahead of GitHub (v{__version__} > {latest})",
+                    fg=MUTED)
+                self.update_pill.configure(
+                    text=f"✓ v{__version__} — not published yet", fg=MUTED)
+                self._dl_btn.pack_forget()
+                self.log.ok(
+                    f"Update check: this build (v{__version__}"
+                    + (f" build {__build_id__}" if __build_id__ else "")
+                    + f") is newer than the latest GitHub release ({latest}) "
+                    "— nothing to update until it is published.")
+            elif prerelease and not getattr(self, "_update_manual", False):
+                # pre-release builds (v1.2.0-beta) are opt-in: automatic
+                # checks stay on the stable channel and only mention them;
+                # a MANUAL check offers the download
                 self.update_label.configure(
                     text=f"pre-release {latest} exists — stable stays installed",
                     fg=MUTED)
@@ -1819,7 +1845,9 @@ class App:
         self._diag_section("System")
         import platform
         self._diag_result("Environment", "info",
-                          f"HookIP {__version__} · Python {sys.version.split()[0]} · "
+                          f"HookIP {__version__}"
+                          + (f" build {__build_id__}" if __build_id__ else "")
+                          + f" · Python {sys.version.split()[0]} · "
                           f"{platform.system()} {platform.release()} ({platform.machine()})")
         try:
             from .perf import profile
