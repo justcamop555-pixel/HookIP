@@ -1045,6 +1045,17 @@ class App:
                 "'Everything' also reveals per-connection detail; the "
                 "log file on disk (.hlog, encrypted) always keeps it all.")
         self.log_filter.bind("<<ComboboxSelected>>", lambda _e: self._apply_log_filter())
+        # text search on top of the level filter — live substring match
+        self._log_query = ""
+        tk.Label(bar, text="🔍 Find:", bg=PANEL, fg=MUTED).pack(side="left", padx=(10, 4))
+        self.log_search = tk.Entry(bar, bg="#171c26", fg=FG, bd=0,
+                                   insertbackground=FG, width=18)
+        self.log_search.pack(side="left")
+        Tooltip(self.log_search,
+                "Show only lines containing this text (e.g. a hostname "
+                "or an error word). Leave empty to see everything; "
+                "combines with the 'Show' level filter.")
+        self.log_search.bind("<KeyRelease>", lambda _e: self._apply_log_filter())
         save_btn = tk.Button(bar, text="Save log…", command=self._export_log,
                              bg="#202634", fg=FG, bd=0, padx=10, pady=3,
                              activebackground="#2a3244", activeforeground=FG,
@@ -1062,6 +1073,26 @@ class App:
                              cursor="hand2")
         copy_btn.pack(side="right", padx=(0, 6))
         Tooltip(copy_btn, "Copy the complete log to the clipboard.")
+        folder_btn = tk.Button(bar, text="Logs folder", command=self._open_log_folder,
+                               bg="#202634", fg=FG, bd=0, padx=10, pady=3,
+                               activebackground="#2a3244", activeforeground=FG,
+                               cursor="hand2")
+        folder_btn.pack(side="right", padx=(0, 6))
+        Tooltip(folder_btn,
+                "Open the folder with the encrypted session logs "
+                "(%LOCALAPPDATA%\\HookIP\\logs) in Explorer.")
+        # 'jump to latest' appears only when the reader scrolled up while
+        # new lines kept arriving (the view no longer follows silently)
+        self.jump_latest = tk.Button(bar, text="↓ latest", fg="#8ab4f8",
+                                     bg="#202634", bd=0, padx=8, pady=2,
+                                     activebackground="#2a3244",
+                                     activeforeground="#8ab4f8", cursor="hand2",
+                                     command=self._jump_to_latest)
+        self.jump_latest.pack(side="right", padx=(0, 6))
+        self.jump_latest.pack_forget()
+        Tooltip(self.jump_latest,
+                "You scrolled up while new lines arrived — click to jump "
+                "back to the live tail (it follows again automatically).")
         sf_lbl = tk.Label(bar, text=f"Session file: {self._log_file}", bg=PANEL,
                           fg=MUTED, font=("Segoe UI", 8))
         sf_lbl.pack(side="right", padx=8)
@@ -1074,7 +1105,14 @@ class App:
         self.log_text = tk.Text(logf, bg="#0d1017", fg=FG, insertbackground=FG,
                                 font=("Consolas", 9), state="disabled", wrap="none",
                                 height=10)
-        self.log_text.pack(fill="both", expand=True)
+        logwrap = tk.Frame(logf, bg=PANEL)
+        logwrap.pack(fill="both", expand=True)
+        sb_x = tk.Scrollbar(logwrap, orient="horizontal", command=self.log_text.xview)
+        self.log_text.configure(xscrollcommand=sb_x.set)
+        # wrap='none' with NO horizontal scrollbar used to clip long lines
+        # (hostnames, error text) — you could see they existed, never read them
+        self.log_text.pack(in_=logwrap, side="top", fill="both", expand=True)
+        sb_x.pack(side="bottom", fill="x")
         Tooltip(self.log_text,
                 "Live log view — filtered by the 'Show' selector above. "
                 "Use 'Save log…' for the complete unfiltered (decrypted) "
@@ -1759,6 +1797,30 @@ class App:
             return "dim"
         return None
 
+    def _log_entry_visible(self, level, msg):
+        """One place decides what the on-screen log shows: the 'Show'
+        importance filter AND the 🔍 Find box (live substring match)."""
+        if logutil.LEVEL_RANK.get(level, 1) < self._log_min_rank:
+            return False
+        q = getattr(self, "_log_query", "")
+        return not q or q in str(msg).lower()
+
+    def _jump_to_latest(self):
+        try:
+            self.log_text.see("end")
+        except tk.TclError:
+            pass
+        self.jump_latest.pack_forget()
+
+    def _open_log_folder(self):
+        path = self._log_dir
+        try:
+            os.makedirs(path, exist_ok=True)
+            subprocess.Popen(["explorer", os.fspath(path)])
+            self.log.info(f"Opened the logs folder: {path}")
+        except OSError as exc:
+            self.log.error(f"Could not open the logs folder: {exc}")
+
     def _pump_log(self):
         try:
             entries = self.log.drain()
@@ -1767,8 +1829,7 @@ class App:
                 buf_cap = profile().log_buffer      # tier-scaled, matches Log
                 if len(self._log_all) > buf_cap:
                     self._log_all = self._log_all[-buf_cap:]
-                new_entries = [e for e in entries
-                               if logutil.LEVEL_RANK.get(e[0], 1) >= self._log_min_rank]
+                new_entries = [e for e in entries if self._log_entry_visible(e[0], e[2])]
                 if new_entries:
                     self.log_text.configure(state="normal")
                     # decide BEFORE inserting — insertion itself shifts the view
@@ -1780,9 +1841,19 @@ class App:
                         self.log_text.insert("end", f"{msg}\n", tags)
                     self.log_text.configure(state="disabled")
                     # follow new lines only when the reader was already at the
-                    # bottom — otherwise scrolling up gets yanked back down
+                    # bottom — otherwise scrolling up gets yanked back down,
+                    # and the ↓ latest button tells them what they are missing
                     if at_bottom:
                         self.log_text.see("end")
+                        try:
+                            self.jump_latest.pack_forget()
+                        except (tk.TclError, AttributeError):
+                            pass
+                    else:
+                        try:
+                            self.jump_latest.pack(side="right", padx=(0, 6))
+                        except (tk.TclError, AttributeError):
+                            pass
             keep = profile().log_screen_lines
             lines = int(self.log_text.index("end-1c").split(".")[0])
             if lines > keep:
@@ -1811,18 +1882,23 @@ class App:
         names = ["Everything", "Info and above", "Warnings and above", "Errors only"]
         ranks = [0, 1, 2, 3]
         self._log_min_rank = ranks[names.index(self.log_filter.get())]
+        try:
+            self._log_query = self.log_search.get().strip().lower()
+        except (tk.TclError, AttributeError):
+            self._log_query = ""
         # re-render the visible log from the in-app history
         try:
             self.log_text.configure(state="normal")
             self.log_text.delete("1.0", "end")
             for level, ts, msg, _date in self._log_all:
-                if logutil.LEVEL_RANK.get(level, 1) >= self._log_min_rank:
+                if self._log_entry_visible(level, msg):
                     extra = self._log_semantic_tag(msg)
                     tags = (level, extra) if extra else (level,)
                     self.log_text.insert("end", f"[{ts}] ", "ts")
                     self.log_text.insert("end", f"{msg}\n", tags)
             self.log_text.configure(state="disabled")
             self.log_text.see("end")
+            self.jump_latest.pack_forget()
         except tk.TclError:
             pass
 
