@@ -53,7 +53,14 @@ class App:
         from .config import APP_DIR
         self._log_dir = os.path.join(APP_DIR, "logs")
         Log.prune_session_files(self._log_dir, keep=7)
-        self._log_file = os.path.join(self._log_dir, time.strftime("hookip_%Y%m%d_%H%M%S.log"))
+        # data-theft guard: encrypt legacy plaintext logs from older
+        # versions, then harden the data folder's ACLs (best-effort)
+        try:
+            import threading as _th
+            _th.Thread(target=self._startup_dataguard, daemon=True).start()
+        except Exception:
+            pass
+        self._log_file = os.path.join(self._log_dir, time.strftime("hookip_%Y%m%d_%H%M%S.hlog"))
         self.log.attach_file(self._log_file)
         self._hook_exception_logging()
         self.stats = Stats()
@@ -112,6 +119,32 @@ class App:
             self.log.debug(f"Performance profile: {profile().describe()}")
         except Exception:
             pass
+
+    def _startup_dataguard(self):
+        """One-time (per session) data-theft guard bootstrapping.
+
+        Runs on a worker thread at startup: encrypts any plaintext logs
+        left by older versions and strips inherited ACLs from the data
+        folder so only the current user + SYSTEM can read it. Results
+        are logged and surfaced in Diagnostics → System.
+        """
+        from .config import APP_DIR
+        try:
+            from . import dataguard
+            converted, total = dataguard.migrate_plaintext_logs(self._log_dir)
+            if converted:
+                self.log.ok(f"Data guard: encrypted {converted} older plaintext "
+                            f"log file(s) — browsing history is now stored "
+                            f"encrypted.")
+            self._dg_acl_ok = dataguard.harden_dir(APP_DIR)
+            if not self._dg_acl_ok:
+                self.log.debug("Data guard: folder ACL hardening unavailable "
+                               "(OneDrive/AV lock?) — file encryption still active.")
+            else:
+                self.log.debug("Data guard: folder ACL hardened (current user + "
+                               "SYSTEM only).")
+        except Exception as exc:  # noqa: BLE001 — the guard must never block startup
+            self.log.debug(f"Data guard bootstrap skipped: {type(exc).__name__}: {exc}")
 
     def _watch_activation(self):
         """Watch the named event a second instance signals to bring this
@@ -1727,7 +1760,12 @@ class App:
         self._diag_result("Excluded domains", "OK", f"{len(pats)} valid pattern(s)", "ok")
         try:
             Config.save(self.cfg)
-            self._diag_result("Settings file", "OK", SETTINGS_PATH, "ok")
+            from . import dataguard as _dg
+            enc = _dg.is_encrypted_file(SETTINGS_PATH, _dg.CFG_MAGIC)
+            self._diag_result("Settings file", "OK",
+                              SETTINGS_PATH + " · encrypted at rest" if enc
+                              else SETTINGS_PATH + " · plaintext (re-encrypts on next save)",
+                              "ok")
         except OSError as exc:
             self._diag_result("Settings file", "WARN", f"cannot save: {exc}", "warn")
 
@@ -1740,6 +1778,33 @@ class App:
         try:
             from .perf import profile
             self._diag_result("Performance profile", "info", profile().describe())
+        except Exception:
+            pass
+        try:
+            from . import dataguard
+            log_files = [n for n in (os.listdir(self._log_dir)
+                                     if os.path.isdir(self._log_dir) else [])
+                         if n.startswith("hookip_") and (n.endswith(".hlog") or n.endswith(".log"))]
+            n_enc = sum(1 for n in log_files if n.endswith(".hlog"))
+            n_plain = len(log_files) - n_enc
+            cfg_enc = (not os.path.exists(SETTINGS_PATH)) or dataguard.is_encrypted_file(
+                SETTINGS_PATH, dataguard.CFG_MAGIC)
+            acl_ok = getattr(self, "_dg_acl_ok", False) or dataguard.acl_is_hardened(APP_DIR)
+            if n_plain == 0 and cfg_enc and acl_ok:
+                self._diag_result(
+                    "Data protection", "OK",
+                    f"logs encrypted {n_enc}/{len(log_files)} · settings encrypted · "
+                    "folder locked to your account")
+            else:
+                missing = []
+                if n_plain:
+                    missing.append(f"{n_plain} plaintext log(s) pending encryption")
+                if not cfg_enc:
+                    missing.append("settings file readable")
+                if not acl_ok:
+                    missing.append("folder ACL default")
+                self._diag_result("Data protection", "WARN",
+                                  " · ".join(missing) + " — retry on next start", "warn")
         except Exception:
             pass
         cur = winproxy.read_current()

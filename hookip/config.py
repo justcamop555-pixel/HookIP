@@ -3,6 +3,7 @@ import json
 import os
 
 from . import APP_NAME
+from . import dataguard
 
 APP_DIR = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), APP_NAME)
 SETTINGS_PATH = os.path.join(APP_DIR, "settings.json")
@@ -76,9 +77,23 @@ class Config:
     def load(cls):
         try:
             with open(SETTINGS_PATH, "r", encoding="utf-8") as fh:
-                data = json.load(fh)
-            return cls(data)
-        except (OSError, ValueError):
+                raw = fh.read()
+        except OSError:
+            return cls()
+        if raw.startswith(dataguard.CFG_MAGIC):
+            # encrypted-at-rest settings (the normal case)
+            plain = dataguard.decrypt_bytes(raw)
+            if plain is None:
+                return cls()
+            try:
+                return cls(json.loads(plain.decode("utf-8")))
+            except ValueError:
+                return cls()
+        # legacy plaintext file (older version / manual edit): honor it;
+        # the next save() re-encrypts it
+        try:
+            return cls(json.loads(raw))
+        except ValueError:
             return cls()
 
     def save(self):
@@ -89,7 +104,10 @@ class Config:
             # longer corrupt the settings file (it used to truncate it)
             tmp = SETTINGS_PATH + ".tmp"
             with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump(self._data, fh, indent=2)
+                # DPAPI-encrypted at rest: a copied settings.json shows no
+                # bypassed-site list, no port, nothing to profile
+                fh.write(dataguard.encrypt_bytes(
+                    json.dumps(self._data, indent=2).encode("utf-8")))
                 fh.flush()
                 os.fsync(fh.fileno())
             os.replace(tmp, SETTINGS_PATH)

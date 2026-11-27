@@ -123,6 +123,27 @@ HookIP/
 | Remember settings | on | Persists everything to `%LOCALAPPDATA%\HookIP\settings.json` |
 | Hide to tray on X | on | X hides to the tray with the proxy running; off = X really exits |
 
+## Data protection (anti-theft guard)
+
+HookIP encrypts everything it writes to disk, because its log files are
+effectively a browsing history and `settings.json` is a list of bypassed
+sites — exactly what folder-scanning malware harvests:
+
+- **Session logs are DPAPI-encrypted line-by-line** (`.hlog` files). A log
+  file copied off the machine is opaque base64 blobs — no domains, no
+  verdicts, nothing to grep.
+- **`settings.json` is encrypted whole.** Older plaintext files are
+  honored once and re-encrypted on the next save.
+- **The data folder is ACL-hardened**: inherited access is stripped so
+  only your account and SYSTEM can read `%LOCALAPPDATA%\HookIP` —
+  other (non-admin) accounts get nothing.
+
+Honest limits: nothing a user-space app can do stops determined malware
+running *as your own account* with full access — that is your
+antivirus's job. This guard defeats bulk folder-theft, cross-account
+snooping and reading the stolen files anywhere else. Status is shown in
+**Diagnostics → System → Data protection**.
+
 ## 🩺 If something stops working
 
 - **Microsoft Store / UWP apps**: Windows blocks them from loopback proxies; HookIP tells

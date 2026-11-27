@@ -5,6 +5,8 @@ import os
 import glob
 from collections import deque
 
+from . import dataguard
+
 LEVEL_RANK = {"debug": 0, "info": 1, "ok": 1, "warn": 2, "error": 3}
 
 
@@ -27,12 +29,21 @@ class Log:
                 self._subs.remove(callback)
 
     def attach_file(self, path):
-        """Mirror every log entry into a session file."""
+        """Mirror every log entry into a DPAPI-encrypted session file.
+
+        Each line is encrypted individually before it touches disk, so a
+        stolen log file shows no browsing history. A .log path is
+        redirected to .hlog automatically.
+        """
         with self._lock:
             try:
+                if path.endswith(".log"):
+                    path = path[:-4] + ".hlog"
                 os.makedirs(os.path.dirname(path), exist_ok=True)
                 self._file = open(path, "a", encoding="utf-8")
-                self._file.write(f"# HookIP session log started {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                self._file.write(dataguard.encrypt_line(
+                    f"# HookIP session log started {time.strftime('%Y-%m-%d %H:%M:%S')}",
+                    magic=dataguard.LOG_MAGIC) + "\n")
                 self._file.flush()
             except OSError:
                 self._file = None
@@ -50,8 +61,9 @@ class Log:
     def prune_session_files(log_dir, keep=7):
         """Delete old session logs, newest `keep` are kept."""
         try:
-            files = sorted(glob.glob(os.path.join(log_dir, "hookip_*.log")),
-                           key=os.path.getmtime, reverse=True)
+            files = [p for pat in ("hookip_*.log", "hookip_*.hlog")
+                     for p in glob.glob(os.path.join(log_dir, pat))]
+            files = sorted(files, key=os.path.getmtime, reverse=True)
             for old in files[keep:]:
                 os.remove(old)
         except OSError:
@@ -62,7 +74,8 @@ class Log:
         with self._lock:
             if self._file:
                 try:
-                    self._file.write(f"[{time.strftime('%Y-%m-%d')} {ts}] [{level.upper():5}] {msg}\n")
+                    plain = f"[{time.strftime('%Y-%m-%d')} {ts}] [{level.upper():5}] {msg}"
+                    self._file.write(dataguard.encrypt_line(plain) + "\n")
                     self._file.flush()
                 except OSError:
                     pass
