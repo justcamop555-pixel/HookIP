@@ -7,7 +7,12 @@ TYPE_AAAA = 28
 
 
 def encode_query(name, qtype=TYPE_A):
-    name = name.rstrip(".").encode("idna") if any(ord(c) > 127 for c in name) else name.encode("ascii")
+    # a trailing dot is a legal FQDN form (CONNECT 'Host: example.com.')
+    # and must be stripped BEFORE encoding — the ASCII path would else
+    # emit an empty label before the terminator and every resolver
+    # would answer FormErr/ignore
+    name = name.rstrip(".")
+    name = name.encode("idna") if any(ord(c) > 127 for c in name) else name.encode("ascii")
     labels = b"".join(bytes([len(p)]) + p for p in name.split(b".")) + b"\x00"
     header = struct.pack(">HHHHHH", int.from_bytes(os.urandom(2), "big"), 0x0100, 1, 0, 0, 0)
     return header + labels + struct.pack(">HH", qtype, 1)
@@ -41,19 +46,40 @@ def _read_name(data, off):
     return ".".join(p for p in parts if p), end
 
 
-def parse_response(data):
+def parse_response(data, qname=None):
     """Return (rcode, answers) where answers = [(name, type, ttl, value_str)].
-    Malformed/truncated input raises ValueError — never IndexError/struct.error
-    (a hostile or corrupt answer must not crash a resolver thread)."""
+
+    qname (optional): the question name. When given, only answer records
+    that belong to the question are returned — the record's own name must
+    equal qname (case-insensitive, trailing dot ignored, IDN-normalized)
+    or the current CNAME-chain target. Over DoH this is belt-and-braces;
+    over UDP the transaction ID and the connected socket are the only
+    other checks, so an answer stuffed with unrelated A records is
+    otherwise accepted.
+    Malformed/truncated input raises ValueError — never IndexError/
+    struct.error (a hostile or corrupt answer must not crash a resolver
+    thread)."""
     try:
-        return _parse_response_inner(data)
+        return _parse_response_inner(data, qname)
     except ValueError:
         raise
     except (IndexError, struct.error):
         raise ValueError("malformed DNS message")
 
 
-def _parse_response_inner(data):
+def _norm_name(name):
+    """Comparable form of a DNS name: no trailing dot, lowercased,
+    IDN names converted to their punycode form."""
+    n = (name or "").rstrip(".")
+    if any(ord(c) > 127 for c in n):
+        try:
+            n = n.encode("idna").decode("ascii")
+        except (UnicodeError, OSError):
+            pass
+    return n.lower()
+
+
+def _parse_response_inner(data, qname=None):
     if len(data) < 12:
         raise ValueError("short DNS message")
     qd, an, _ns, _ar = struct.unpack(">HHHH", data[4:12])
@@ -64,6 +90,16 @@ def _parse_response_inner(data):
         if off + 4 > len(data):
             raise ValueError("truncated question")
         off += 4
+    expect = _norm_name(qname) if qname else None
+    alias = None            # current CNAME-chain target (normalized)
+
+    def _owned(rec_name):
+        """Record belongs to the question (or the alias chain so far)?"""
+        if expect is None:
+            return True
+        n = _norm_name(rec_name)
+        return n == expect or (alias is not None and n == alias)
+
     answers = []
     for _ in range(an):
         name, off = _read_name(data, off)
@@ -76,13 +112,17 @@ def _parse_response_inner(data):
             raise ValueError("truncated record data")
         off += rdlen
         if rtype == TYPE_A and rdlen == 4:
-            answers.append((name, rtype, ttl, ".".join(str(b) for b in rdata)))
+            if _owned(name):
+                answers.append((name, rtype, ttl, ".".join(str(b) for b in rdata)))
         elif rtype == TYPE_AAAA and rdlen == 16:
-            groups = [rdata[i:i + 2].hex() for i in range(0, 16, 2)]
-            answers.append((name, rtype, ttl, _compact_v6(groups)))
+            if _owned(name):
+                groups = [rdata[i:i + 2].hex() for i in range(0, 16, 2)]
+                answers.append((name, rtype, ttl, _compact_v6(groups)))
         elif rtype == 5:  # CNAME — parse so callers can follow if needed
             cname, _ = _read_name(data, off - rdlen)
-            answers.append((name, rtype, ttl, cname))
+            if _owned(name):
+                answers.append((name, rtype, ttl, cname))
+                alias = _norm_name(cname)   # next records belong to this
     return rcode, answers
 
 

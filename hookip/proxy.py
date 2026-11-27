@@ -387,8 +387,14 @@ class ProxyServer:
             self.log.info(f"{exc}")
         except (OSError, ResolveError, ValueError) as exc:
             msg = f"{exc}"
-            if ("NXDOMAIN" in msg or "sinkhole" in msg or "rcode 2" in msg
-                    or "NODATA" in msg or "SERVFAIL" in msg):
+            # "unconfirmed" NXDOMAIN is deliberately NOT here: a single-vote
+            # NXDOMAIN is exactly the case the vote exists for — it must fall
+            # through to the 'DNS could not resolve' branch (a network/DNS
+            # problem), not be dressed up as a verified dead upstream.
+            # ("rcode 2"/"SERVFAIL" checks removed: rcode text only ever
+            # reached the logs, never a raised message — dead branches.)
+            if (("NXDOMAIN" in msg and "unconfirmed" not in msg)
+                    or "sinkhole" in msg or "NODATA" in msg):
                 # VERIFIED dead: resolvers confirm the name does not exist,
                 # has no address records, or is deliberately sunk — a feature
                 # working, not a proxy failure

@@ -301,15 +301,17 @@ class Resolver:
                     else:
                         stale.append(c)
                 self._pool[name] = conns
+                # reservation check AND increment in ONE lock section —
+                # split sections let N threads all pass the same check
+                if len(conns) + self._pending.get(name, 0) < self._pool_max:
+                    self._pending[name] = self._pending.get(name, 0) + 1
+                    reserved = True
             for c in stale:
                 c.close()
             for conn in conns:
                 if conn._reqlock.acquire(blocking=False):
                     conn.used = time.time()   # refresh at checkout
                     return conn
-            if len(conns) + self._pending.get(name, 0) < self._pool_max:
-                self._pending[name] = self._pending.get(name, 0) + 1
-                reserved = True
             # CONFLICT FIX: connection setup (TCP+TLS, up to ~3.5 s) must NOT
             # happen while holding _pool_lock — every other resolver's checkout
             # would stall behind it. Create outside, register after (the
@@ -318,22 +320,32 @@ class Resolver:
                 try:
                     new_conn = _DoHConn(ip, dns_host,
                                         chunk=max(1, self.chunk), keepalive=True)
-                finally:
+                except BaseException:
                     # reservation released whether creation succeeded or failed
                     with self._pool_lock:
-                        self._pending[name] = max(0, self._pending.get(name, 1) - 1)
-                if new_conn._reqlock.acquire(blocking=False):
-                    with self._pool_lock:
-                        self._pool.setdefault(name, []).append(new_conn)
-                    new_conn.used = time.time()   # refresh at checkout
-                    return new_conn
-                new_conn.close()      # someone else filled the slot meanwhile
-                continue
+                        self._pending[name] -= 1
+                    raise
+                new_conn._reqlock.acquire()   # we just built it — it is ours
+                with self._pool_lock:
+                    # decrement + append in ONE section: split, a gap shows
+                    # a slot free that is about to be filled again
+                    self._pending[name] -= 1
+                    self._pool.setdefault(name, []).append(new_conn)
+                new_conn.used = time.time()   # refresh at checkout
+                return new_conn
             # all slots busy and pool full — wait for the first conn
             with self._pool_lock:
                 conns = self._pool.get(name, [])
                 fallback = conns[0] if conns else None
-            if fallback is None or not fallback._reqlock.acquire(timeout=4):
+            if fallback is None:
+                # every slot is reserved-but-not-yet-registered: spinning
+                # here would burn CPU at full speed for up to 3.5 s while
+                # the other thread completes its TLS handshake (worst on
+                # the low hardware tier, 1 conn per resolver + hedging)
+                time.sleep(0.01)
+                continue
+            if not fallback._reqlock.acquire(timeout=4):
+                time.sleep(0.01)
                 continue          # race: slot freed or conn died — re-scan
             if not fallback.healthy():
                 fallback._reqlock.release()
@@ -692,7 +704,7 @@ class Resolver:
                 resp = conn.request(dns_host, query)
             if not resp:
                 raise ResolveError("empty response")
-            rcode, answers = dnsmsg.parse_response(resp)
+            rcode, answers = dnsmsg.parse_response(resp, qname=host)
             dt = time.time() - t0
             self._note_latency(name, dt, ok=True)
             self.log.debug(f"DoH {name}: {host} rcode={rcode} in {dt:.2f}s")
@@ -726,10 +738,21 @@ class Resolver:
                             # the finally below (the first retry path does this)
                             conn = self._doh_session(name, dns_host, ip)
                             resp2 = conn.request(dns_host, follow)
-                        _rc, ans2 = dnsmsg.parse_response(resp2)
+                        _rc, ans2 = dnsmsg.parse_response(resp2, qname=v)
                         if _rc == 3:
-                            raise VerifiedNegative(
-                                f"{host}: NXDOMAIN (verified via DoH {name})")
+                            # the alias target does not exist — one resolver's
+                            # word is a VOTE, not a verdict: a policy/filtering
+                            # resolver can NX a legit name. Count it like the
+                            # direct-query vote instead of raising a
+                            # single-resolver VerifiedNegative.
+                            self._release_doh(conn)
+                            return ("nx", name, None)
+                        if _rc != 0:
+                            # SERVFAIL/REFUSED on the follow-up is NOT NODATA
+                            # (the old code fell through and treated it as an
+                            # authoritative empty answer)
+                            self._release_doh(conn)
+                            return ("err", f"{name}: rcode {_rc} on CNAME follow-up", None)
                         ips = dnsmsg.extract_ips(ans2, qtype)
                         ttl = _min_ttl(ans2) or ttl
                         break
@@ -773,7 +796,7 @@ class Resolver:
                         if not part:
                             break
                         resp += part
-                rcode, answers = dnsmsg.parse_response(resp)
+                rcode, answers = dnsmsg.parse_response(resp, qname=host)
                 if rcode == 3:
                     nx_seen.append(ip)
                     if doh_nx_vote:
@@ -817,7 +840,7 @@ class Resolver:
                 self.log.debug(f"UDP DNS {ip}: reply transaction ID mismatch — ignored")
                 continue
             try:
-                rcode, answers = dnsmsg.parse_response(resp)
+                rcode, answers = dnsmsg.parse_response(resp, qname=host)
                 # NXDOMAIN over plaintext UDP is NOT trusted (may be injected)
                 if rcode != 0:
                     continue

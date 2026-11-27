@@ -217,7 +217,15 @@ def decrypt_line(line):
 
 
 def encrypt_bytes(data):
-    """Whole-file payload -> 'HKCFG1:<base64 dpapi blob>' as str."""
+    """Whole-file payload -> 'HKCFG1:<base64 dpapi blob>' as str.
+
+    bytes or bytearray as-is; str is accepted too (encoded utf-8);
+    anything else raises TypeError."""
+    if isinstance(data, str):
+        data = data.encode("utf-8")
+    if not isinstance(data, (bytes, bytearray, memoryview)):
+        # bytes(int) silently builds a zero-filled buffer — reject it
+        raise TypeError(f"encrypt_bytes expects bytes or str, got {type(data).__name__}")
     blob = _crypt(bytes(data), decrypt=False)
     return CFG_MAGIC + base64.b64encode(blob).decode("ascii")
 
@@ -361,6 +369,14 @@ def acl_is_hardened(path):
 _MARKER_RE = re.compile(r"^# migrated .+ sha256=([0-9a-f]{64})$")
 
 
+def is_marker(text):
+    """True when text (a decrypted or plaintext log line) is a migration
+    idempotency marker: '# migrated <basename> sha256=<hex>'. Public so
+    callers (and tests) classify marker lines without reaching into the
+    private regex."""
+    return isinstance(text, str) and bool(_MARKER_RE.match(text.strip()))
+
+
 def _decode_legacy(raw):
     """utf-8, then cp1252 (smart quotes/dashes), then latin-1 (cannot
     fail) — plain latin-1 would mangle cp1252's 0x80-0x9F bytes into
@@ -423,7 +439,10 @@ def migrate_plaintext_logs(log_dir):
             migrating = os.path.join(log_dir, name)
             base = migrating[:-len(".migrating")]      # ...\foo.log
             dst = (base[:-4] if base.endswith(".log") else base) + ".hlog"
-            orig_name = base
+            # marker carries the BASENAME only — an absolute path would
+            # leak the folder layout into the (decrypted) log and break
+            # marker matching after the folder moves
+            orig_name = os.path.basename(base)
             src = None              # never referenced on the leftover path
         else:
             src = os.path.join(log_dir, name)
@@ -435,6 +454,7 @@ def migrate_plaintext_logs(log_dir):
             if is_leftover:
                 if not os.path.exists(migrating):
                     continue        # vanished since listdir; nothing to do
+                total += 1          # leftovers count like fresh sources
             else:
                 # a .log whose claim still exists (unfinished leftover
                 # pass above) is skipped THIS run — the second rename
@@ -449,7 +469,24 @@ def migrate_plaintext_logs(log_dir):
                 os.replace(src, migrating)
             with open(migrating, "rb") as fh:
                 raw = fh.read()
-            src_sha = hashlib.sha256(raw).hexdigest()
+            src_sha = hashlib.sha256(raw).hexdigest()   # over the RAW bytes
+
+            # read the existing .hlog FIRST and settle the leftover-marker
+            # case BEFORE any decode/encrypt work — a claim whose merge
+            # already happened needs neither (reordering per review)
+            existing = []
+            if os.path.exists(dst):
+                with open(dst, "r", encoding="utf-8", errors="replace") as fh:
+                    existing = fh.read().splitlines()
+                if is_leftover and _has_marker(existing, src_sha):
+                    # merge already happened on an earlier run — just
+                    # finish the claim cleanup
+                    os.remove(migrating)
+                    converted += 1
+                    continue
+                if existing and not existing[-1].strip():
+                    existing = existing[:-1]   # drop trailing blank for join
+
             text = _decode_legacy(raw)
             had_trailing_nl = text.endswith("\n")
             lines = text.split("\n")
@@ -464,23 +501,6 @@ def migrate_plaintext_logs(log_dir):
                     out.append(ln)          # blanks / already-encrypted stay
                     continue
                 out.append(encrypt_line(ln))
-
-            # read the existing .hlog (never clobber its content). If it
-            # cannot be read, ABORT this file: the claim stays for the
-            # next run and nothing is written — overwriting a locked
-            # .hlog with only the migrated lines would destroy data.
-            existing = []
-            if os.path.exists(dst):
-                with open(dst, "r", encoding="utf-8", errors="replace") as fh:
-                    existing = fh.read().splitlines()
-                if is_leftover and _has_marker(existing, src_sha):
-                    # merge already happened on an earlier run — just
-                    # finish the claim cleanup
-                    os.remove(migrating)
-                    converted += 1
-                    continue
-                if existing and not existing[-1].strip():
-                    existing = existing[:-1]   # drop trailing blank for join
 
             # idempotency marker: last line of the migrated block
             marker = encrypt_line(
@@ -510,8 +530,6 @@ def _has_marker(lines, src_sha):
     idempotency marker carrying the same source-file sha256."""
     for ex in lines:
         v = decrypt_line(ex)
-        if isinstance(v, str):
-            m = _MARKER_RE.match(v.strip())
-            if m and m.group(1) == src_sha:
-                return True
+        if is_marker(v) and _MARKER_RE.match(v.strip()).group(1) == src_sha:
+            return True
     return False

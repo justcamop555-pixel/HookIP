@@ -776,6 +776,38 @@ def test_connect_dead_fail_fast():
     client.close(); client_peer.close()
 
 
+def test_unconfirmed_nx_not_verified_dead():
+    # a SINGLE-vote NXDOMAIN must reach the 'DNS could not resolve' warning,
+    # not the 'blocked/dead upstream' verdict (that is the point of the vote)
+    ps = make_server()
+    client, client_peer = socketpair()
+    def fake_tunnel(csock, host, port):
+        raise ResolveError(f"{host}: no addresses ({host}: NXDOMAIN "
+                           "(unconfirmed, single resolver))")
+    ps._tunnel = fake_tunnel
+    result = {}
+    def run():
+        try:
+            ps._handle(client)
+            result["done"] = True
+        except Exception as e:
+            result["err"] = repr(e)
+    client_peer.sendall(b"CONNECT unconfirmed.test:443 HTTP/1.1\r\nHost: x\r\n\r\n")
+    th = threading.Thread(target=run, daemon=True)
+    th.start()
+    th.join(10)
+    tot, act, up, down, failed, blocked = ps.stats.totals()
+    check("unconfirmed NX: blocked=True, failed=False",
+          blocked == 1 and failed == 0 and act == 0,
+          f"blocked={blocked} failed={failed} {result}")
+    warn_lines = [m for lvl, m in ps.log.lines if lvl == "warn"]
+    check("unconfirmed NX logged as DNS problem, NOT dead upstream",
+          any("DNS could not resolve" in m for m in warn_lines)
+          and not any("blocked/dead upstream" in m for m in warn_lines),
+          str(warn_lines[:1]))
+    client.close(); client_peer.close()
+
+
 if __name__ == "__main__":
 
     test_parse_head_body()
@@ -796,6 +828,7 @@ if __name__ == "__main__":
     test_upstream_skips_dns()
     test_cached_negative_blocked()
     test_connect_dead_fail_fast()
+    test_unconfirmed_nx_not_verified_dead()
 
     print()
     print(f"Summary: {sum(1 for _, c in RESULTS if c)}/{len(RESULTS)} passed")

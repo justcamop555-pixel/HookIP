@@ -159,6 +159,10 @@ def test_pool_max_burst_creation():
     check("burst: all 12 workers served",
           len(results) == 12 and all(not isinstance(x, tuple) for x in results),
           f"served={len(results)}/12")
+    with r._pool_lock:
+        pending_left = r._pending.get("Cloudflare", 0)
+    check("burst: pending counter returns to zero", pending_left == 0,
+          str(pending_left))
 
 
 # ---- 2. in-use stale conn is not closed by cleanup -------------------
@@ -225,7 +229,7 @@ def test_cname_no_double_release():
         def encode_query(h, q): return b""
 
         @staticmethod
-        def parse_response(resp): return (0, [(5, 5, 300, "alias.example.com")])
+        def parse_response(resp, qname=None): return (0, [(5, 5, 300, "alias.example.com")])
 
         @staticmethod
         def extract_ips(answers, q): return []
@@ -294,8 +298,9 @@ class StubDns:
         return b"Q" + h.encode()
 
     @staticmethod
-    def parse_response(resp):
+    def parse_response(resp, qname=None):
         # resp is a dict from the fake conn: {"rcode": n, "answers": [...]}
+        # (qname accepted for compatibility with the real wire parser)
         return resp["rcode"], resp["answers"]
 
     @staticmethod
@@ -492,6 +497,45 @@ def test_cross_type_fallback():
           calls == ["nx1"], str(calls))
 
 
+# ---- 12. CNAME follow-up: NX is a vote, SERVFAIL is not NODATA ---------
+def test_cname_followup_verdicts():
+    import hookip.dnsmsg as dnsmsg
+    real_resolvers = dohmod.RESOLVERS
+
+    def scripted_resolver():
+        r = make_resolver()
+
+        def session(name, dns_host, ip):
+            c = FakeConn(ip, name)
+            c.default = {"rcode": 0,
+                         "answers": [(("chain.test"), 5, 300, "target.test")]}
+            c.script = [followup]
+            assert c._reqlock.acquire(blocking=False)
+            return c
+
+        r._doh_session = session
+        return r
+
+    # one resolver NXing the alias target: a VOTE, not a verdict
+    followup = {"rcode": 3, "answers": []}
+    r = scripted_resolver()
+    with mock.patch.object(dohmod, "RESOLVERS", real_resolvers[:1]), \
+         mock.patch.object(dohmod, "dnsmsg", StubDns):
+        ips, ttl, note = r._via_doh("chain.test", 1)
+    check("CNAME follow-up NX counts as ONE vote (unconfirmed)",
+          ips == [] and note == "NXDOMAIN (unconfirmed, single resolver)",
+          str(note))
+
+    # SERVFAIL on the follow-up is an error, NOT an authoritative NODATA
+    followup = {"rcode": 2, "answers": []}
+    r2 = scripted_resolver()
+    with mock.patch.object(dohmod, "RESOLVERS", real_resolvers[:1]), \
+         mock.patch.object(dohmod, "dnsmsg", StubDns):
+        ips, ttl, note = r2._via_doh("chain.test", 1)
+    check("CNAME follow-up SERVFAIL is not NODATA",
+          ips == [] and note is None, f"note={note} ips={ips}")
+
+
 # ---- 7. hedging ------------------------------------------------------
 def test_hedging():
     # resolver 1 hangs, resolver 2 answers fast -> total well under 0.4+5
@@ -567,7 +611,7 @@ def test_udp_verification():
         FakeUDP.instances.clear()
         FakeUDP.reply = b"\xab\xcd" + b"resp"
         StubDns.parse_response = staticmethod(
-            lambda resp: (0, [(("n"), 1, 60, "6.6.6.6")]))
+            lambda resp, qname=None: (0, [(("n"), 1, 60, "6.6.6.6")]))
         StubDns.extract_ips = staticmethod(
             lambda answers, qt: [v for (_n, t, _ttl, v) in answers])
         with mock.patch.object(dohmod.socket, "socket", FakeUDP), \
@@ -620,6 +664,7 @@ if __name__ == "__main__":
     test_unconfirmed_cached_60s()
     test_tcp_confirms_doh_vote()
     test_cross_type_fallback()
+    test_cname_followup_verdicts()
     test_hedging()
     test_udp_verification()
     test_start_idx_threadsafe()

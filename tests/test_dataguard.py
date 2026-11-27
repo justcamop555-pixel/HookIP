@@ -5,6 +5,7 @@ Skips with a clear message on non-Windows (DPAPI + icacls only exist there).
 """
 import base64
 import ctypes
+import hashlib
 import json
 import os
 import shutil
@@ -284,6 +285,66 @@ def _acl_case_rc(returncode):
 check("acl_is_hardened: nonzero rc -> False", _acl_case_rc(2) is False)
 check("acl_is_hardened: not fooled by dir NAME with '(I)'",
       _acl_case(PATH + " weird (I) name account:(F)") is True)
+
+
+# ---------------- fourth-pass items ------------------------------------
+# encrypt_bytes accepts str
+encs = dg.encrypt_bytes("plaintext settings")
+check("encrypt_bytes(str) round-trips",
+      encs.startswith(dg.CFG_MAGIC)
+      and dg.decrypt_bytes(encs) == b"plaintext settings")
+try:
+    dg.encrypt_bytes(12345)
+    check("encrypt_bytes(non-str/bytes) raises TypeError", False, "no raise")
+except TypeError:
+    check("encrypt_bytes(non-str/bytes) raises TypeError", True)
+
+# is_marker public helper
+check("is_marker: marker line recognized",
+      dg.is_marker("# migrated hookip_a.log sha256=" + "a" * 64))
+check("is_marker: non-marker rejected",
+      not dg.is_marker("[INFO] tunnel github.com:443")
+      and not dg.is_marker(dg.UNREADABLE)
+      and not dg.is_marker(None)
+      and not dg.is_marker("# migrated x sha256=short"))
+
+# marker records the file's BASENAME (never an absolute path)
+d_base = tempfile.mkdtemp()
+with open(os.path.join(d_base, "hookip_n.log"), "wb") as fh:
+    fh.write(b"[INFO] tunnel example.org:443\n")
+dg.migrate_plaintext_logs(d_base)
+vbase = [dg.decrypt_line(x) for x in hlog_lines(os.path.join(d_base, "hookip_n.hlog"))]
+mline = next((v for v in vbase if v and v.startswith("# migrated ")), "")
+check("marker carries the basename, no path separators",
+      "hookip_n.log" in mline and os.sep not in mline and ":" not in mline.split(" ")[2],
+      repr(mline))
+shutil.rmtree(d_base, ignore_errors=True)
+
+# leftover claims count in `total`, and a leftover with an already-merged
+# marker finishes with NO decrypt/encrypt duplication
+d_left = tempfile.mkdtemp()
+hlog = os.path.join(d_left, "hookip_l.hlog")
+with open(os.path.join(d_left, "hookip_l.log"), "wb") as fh:
+    fh.write(b"[INFO] tunnel steam.com:443\n")
+convL, totL = dg.migrate_plaintext_logs(d_left)
+check("fresh migrate: (1, 1)", (convL, totL) == (1, 1), f"{convL}/{totL}")
+# simulate a crashed final delete: claim file still present, merge done
+# rebuild the exact raw sha of the source we wrote
+raw_sha = hashlib.sha256(b"[INFO] tunnel steam.com:443\n").hexdigest()
+with open(hlog, "a", encoding="utf-8", newline="\n") as fh:
+    fh.write(dg.encrypt_line(f"# migrated hookip_l.log sha256={raw_sha}") + "\n")
+with open(os.path.join(d_left, "hookip_l.log.migrating"), "wb") as fh:
+    fh.write(b"[INFO] tunnel steam.com:443\n")
+convL2, totL2 = dg.migrate_plaintext_logs(d_left)
+check("leftover: counted in total and converted via marker",
+      (convL2, totL2) == (1, 1), f"{convL2}/{totL2}")
+check("leftover: claim removed",
+      not [n for n in os.listdir(d_left) if n.endswith(".migrating")])
+vleft = [dg.decrypt_line(x) for x in hlog_lines(hlog)]
+check("leftover: no duplicate payload lines",
+      sum(1 for v in vleft if v == "[INFO] tunnel steam.com:443") == 1,
+      str(len(vleft)))
+shutil.rmtree(d_left, ignore_errors=True)
 
 print()
 print(f"Summary: {sum(1 for _, c in RESULTS if c)}/{len(RESULTS)} passed")
