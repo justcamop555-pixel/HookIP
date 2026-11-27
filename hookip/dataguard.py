@@ -1,4 +1,4 @@
-"""Data-theft guard: encrypts everything sensitive HookIP keeps on disk.
+r"""Data-theft guard: encrypts everything sensitive HookIP keeps on disk.
 
 Threat: malware running on this machine bulk-copies folders (browsers,
 apps, %LOCALAPPDATA%) looking for browsing history, site lists and
@@ -7,11 +7,10 @@ settings.json IS a list of bypassed sites — in plaintext, both are a
 bounty for that scan.
 
 Guard, in layers (all stdlib/ctypes, still no admin):
-1. LOG ENCRYPTION (DPAPI): every session log line is encrypted
-   individually (CryptProtectData, user scope + app entropy) before it
-   touches disk. A copied .hlog file is opaque base64 blobs — no
-   domains, no verdicts, nothing to grep. Lines stay appendable, so
-   logging keeps working exactly as before.
+1. LOG ENCRYPTION (DPAPI + per-install key): every session log line is
+   encrypted individually (CryptProtectData, user scope + a random
+   32-byte per-install key) before it touches disk. A copied .hlog file
+   is opaque base64 blobs — no domains, no verdicts, nothing to grep.
 2. SETTINGS ENCRYPTION: settings.json is encrypted whole. A plaintext
    file found at load (older version / manual edit) is honored once and
    re-encrypted on the next save.
@@ -30,11 +29,25 @@ Guard, in layers (all stdlib/ctypes, still no admin):
    block — a rerun scans the .hlog for that marker and skips the merge
    if the same source file was already migrated, so no duplicates and
    an existing .hlog is never overwritten.
+5. ENTROPY UPGRADE: one-time re-encryption of log lines and settings
+   that were still written with the legacy static entropy.
+
+Why the per-install key: the original entropy was a constant in the
+public source AND inside the exe, so any generic DPAPI decryptor — or
+anything that greps embedded strings out of the binary — could decrypt
+every HookIP file at rest. The key is now random per install and lives
+ONLY in the registry (HKCU\Software\HookIP\DataKey): a bulk copy of the
+%LOCALAPPDATA%\HookIP folder alone decrypts to nothing, and offline
+DPAPI-dump tools fail without the key. The legacy entropy is kept as a
+READ fallback so pre-upgrade files stay readable, and upgrade_entropy()
+re-encrypts them on the first run after the update.
 
 Honest limits (stated in Diagnostics too): a determined attacker
-running as YOUR user account with full access can reverse DPAPI — no
-user-space app can stop that. This guard defeats bulk folder-theft,
-cross-account snooping and anything that exfiltrates files to read
+running as YOUR user account with full access can reverse DPAPI, and
+targeted malware that also dumps the registry key value can read
+everything the current code wrote — no user-space app can stop that.
+This guard defeats bulk folder-theft, cross-account snooping, offline
+DPAPI-dump toolchains and anything that exfiltrates files to read
 elsewhere. Antivirus/Defender stays the wall for live malware. Also
 note: encrypting and deleting plaintext does not erase it from free
 disk space, OneDrive version history or existing backups — full
@@ -53,16 +66,64 @@ import ctypes
 import hashlib
 import os
 import re
+import secrets
 import subprocess
+import threading
+import winreg
 from ctypes import wintypes
 
-# app-specific entropy so a raw DPAPI blob dumped from another app's
-# context cannot be replayed against HookIP files blindly
-_ENTROPY = b"HookIP-dataguard-v1"
+# ---- per-install encryption key (v2) --------------------------------
+# The original entropy was the static string below: public in the repo
+# source AND embedded in every built exe, so any generic DPAPI-decryption
+# tool — or anything that dumps embedded strings from the binary — could
+# decrypt every file at rest. The key is now random per install, stored
+# OUTSIDE the data folder (so a bulk folder copy alone is useless) and
+# OUTSIDE the binary (so string-scanning the exe finds nothing).
+_KEY_REGISTRY_PATH = r"Software\HookIP"
+_KEY_REGISTRY_VALUE = "DataKey"
+_KEY_LEN = 32
+_LEGACY_ENTROPY = b"HookIP-dataguard-v1"   # read fallback for pre-upgrade
+                                           # blobs; never used for new writes
 
-# file magic prefixes: identify guarded formats at a glance
-LOG_MAGIC = "HKLOG1:"
-CFG_MAGIC = "HKCFG1:"
+_entropy = None            # bytes actually used for NEW blobs
+_legacy_fallback = False   # registry unusable -> degraded to static entropy
+_key_lock = threading.Lock()
+_KEY_BUF = None            # keeps the key bytes alive for the process
+_ENTROPY_BLOB = None       # DATA_BLOB over the per-install key (lazy)
+
+
+def _load_key():
+    """Load (or create) the per-install key. Called on every crypto call
+    but does real work once per process; thread-safe."""
+    global _entropy, _legacy_fallback, _ENTROPY_BLOB, _KEY_BUF
+    with _key_lock:
+        if _ENTROPY_BLOB is not None:
+            return
+        key = None
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                _KEY_REGISTRY_PATH) as k:
+                raw, _typ = winreg.QueryValueEx(k, _KEY_REGISTRY_VALUE)
+            if isinstance(raw, bytes) and len(raw) == _KEY_LEN:
+                key = raw
+        except OSError:
+            key = None
+        if key is None:
+            key = secrets.token_bytes(_KEY_LEN)
+            try:
+                with winreg.CreateKey(winreg.HKEY_CURRENT_USER,
+                                      _KEY_REGISTRY_PATH) as k:
+                    winreg.SetValueEx(k, _KEY_REGISTRY_VALUE, 0,
+                                      winreg.REG_BINARY, key)
+            except OSError:
+                # no usable registry access: degrade to the legacy static
+                # entropy (old behavior) rather than failing every write
+                key = _LEGACY_ENTROPY
+                _legacy_fallback = True
+        _entropy = key
+        _KEY_BUF = ctypes.create_string_buffer(key, len(key))
+        _ENTROPY_BLOB = _DATA_BLOB(
+            len(key), ctypes.cast(_KEY_BUF, ctypes.POINTER(ctypes.c_char)))
 
 # sentinel: the line IS ours (HKLOG1:) but the blob failed to decrypt
 # (truncated, corrupted, or re-encrypted under a different account).
@@ -82,6 +143,11 @@ UNREADABLE = _Unreadable()
 class _DATA_BLOB(ctypes.Structure):
     _fields_ = [("cbData", wintypes.DWORD),
                 ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+# legacy-entropy DATA_BLOB built once at import (static bytes)
+_LEGACY_BUF = ctypes.create_string_buffer(_LEGACY_ENTROPY, len(_LEGACY_ENTROPY))
+_LEGACY_BLOB = _DATA_BLOB(
+    len(_LEGACY_ENTROPY), ctypes.cast(_LEGACY_BUF, ctypes.POINTER(ctypes.c_char)))
 
 
 # ---- ctypes declarations: no pointer truncation, no GC accidents ----
@@ -134,12 +200,9 @@ _kernel32.GetCurrentProcess.restype = wintypes.HANDLE
 # background thread
 _CRYPTPROTECT_UI_FORBIDDEN = 0x1
 
-# entropy blob built ONCE and kept referenced for the process lifetime:
-# the DATA_BLOB points into _ENTROPY_BUF, so the buffer backing the
-# pointer can never be garbage-collected mid-call
-_ENTROPY_BUF = ctypes.create_string_buffer(_ENTROPY, len(_ENTROPY))
-_ENTROPY_BLOB = _DATA_BLOB(
-    len(_ENTROPY), ctypes.cast(_ENTROPY_BUF, ctypes.POINTER(ctypes.c_char)))
+# file magic prefixes: identify guarded formats at a glance
+LOG_MAGIC = "HKLOG1:"
+CFG_MAGIC = "HKCFG1:"
 
 
 def _blob(data):
@@ -151,25 +214,48 @@ def _blob(data):
     return blob, buf
 
 
+def _unprotect_once(blob, ent_blob):
+    """One CryptUnprotectData attempt with the given entropy blob.
+    Returns bytes or None (never raises for a failed decrypt)."""
+    pin, keep_in = _blob(blob)
+    pout = _DATA_BLOB()
+    ok = _crypt32.CryptUnprotectData(ctypes.byref(pin), None,
+                                     ctypes.byref(ent_blob),
+                                     None, None,
+                                     _CRYPTPROTECT_UI_FORBIDDEN,
+                                     ctypes.byref(pout))
+    if not ok:
+        return None
+    try:
+        return ctypes.string_at(pout.pbData, pout.cbData)
+    finally:
+        _kernel32.LocalFree(ctypes.cast(pout.pbData, ctypes.c_void_p))
+
+
 def _crypt(data, decrypt):
+    if decrypt:
+        _load_key()
+        # current key first (one call in the common case); pre-upgrade
+        # blobs fall back to the legacy static entropy
+        out = _unprotect_once(data, _ENTROPY_BLOB)
+        if out is None and not _legacy_fallback and _entropy != _LEGACY_ENTROPY:
+            out = _unprotect_once(data, _LEGACY_BLOB)
+        if out is None:
+            raise OSError("DPAPI CryptUnprotectData failed: blob not "
+                          "decryptable with the per-install or legacy key")
+        return out
+    _load_key()
     pin, keep_in = _blob(data)
     pout = _DATA_BLOB()
-    if decrypt:
-        ok = _crypt32.CryptUnprotectData(ctypes.byref(pin), None,
-                                         ctypes.byref(_ENTROPY_BLOB),
-                                         None, None,
-                                         _CRYPTPROTECT_UI_FORBIDDEN,
-                                         ctypes.byref(pout))
-    else:
-        ok = _crypt32.CryptProtectData(ctypes.byref(pin), None,
-                                       ctypes.byref(_ENTROPY_BLOB),
-                                       None, None,
-                                       _CRYPTPROTECT_UI_FORBIDDEN,
-                                       ctypes.byref(pout))
+    ok = _crypt32.CryptProtectData(ctypes.byref(pin), None,
+                                   ctypes.byref(_ENTROPY_BLOB),
+                                   None, None,
+                                   _CRYPTPROTECT_UI_FORBIDDEN,
+                                   ctypes.byref(pout))
     if not ok:
         # use_last_error=True on _crypt32 makes get_last_error() valid
         # here; the real error code lands in Diagnostics
-        raise OSError(f"DPAPI {'CryptUnprotectData' if decrypt else 'CryptProtectData'}"
+        raise OSError("DPAPI CryptProtectData"
                       f" failed: {ctypes.WinError(ctypes.get_last_error())}")
     try:
         out = ctypes.string_at(pout.pbData, pout.cbData)
@@ -363,6 +449,98 @@ def acl_is_hardened(path):
         return not any(":(I)" in ln for ln in lines)
     except Exception:
         return False
+
+
+# ------------------------------------------------- entropy upgrade
+
+def _blob_is_legacy(blob):
+    """True when `blob` decrypts with the legacy static entropy (and not
+    already with the per-install key). False for current/foreign/corrupt
+    blobs — nothing to upgrade."""
+    _load_key()
+    if _unprotect_once(blob, _ENTROPY_BLOB) is not None:
+        return False
+    if _legacy_fallback or _entropy == _LEGACY_ENTROPY:
+        return False
+    return _unprotect_once(blob, _LEGACY_BLOB) is not None
+
+
+def _needs_upgrade(line, magic):
+    """For a single guarded line/blob: True = written with the legacy
+    static entropy and should be re-encrypted. Foreign/plaintext/blank
+    and corrupt lines are False (left exactly as they are)."""
+    if not isinstance(line, str):
+        return False
+    line = line.strip()
+    if not line.startswith(magic):
+        return False
+    try:
+        blob = base64.b64decode(line[len(magic):], validate=True)
+    except Exception:
+        return False
+    return _blob_is_legacy(blob)
+
+
+def settings_needs_entropy_upgrade(path):
+    """True when the settings file still holds a legacy-entropy HKCFG1:
+    blob — fixing it is one plain save (Config.save re-encrypts whole)."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            return _needs_upgrade(fh.read(), CFG_MAGIC)
+    except OSError:
+        return False
+
+
+def upgrade_entropy(log_dir):
+    """Re-encrypt legacy-entropy lines inside .hlog files, in place.
+
+    Runs once per file: the first encrypted line is probed — a file with
+    no legacy blob costs one DPAPI attempt and is skipped (cheap repeat
+    runs). Upgraded files are rewritten atomically (tmp + os.replace);
+    a crash leaves the original intact and the rerun redoes it.
+    Never raises; locked files are skipped. Returns (files, lines)."""
+    if not os.path.isdir(log_dir):
+        return (0, 0)
+    files_done = lines_done = 0
+    try:
+        names = sorted(n for n in os.listdir(log_dir) if n.endswith(".hlog"))
+    except OSError:
+        return (0, 0)
+    for name in names:
+        path = os.path.join(log_dir, name)
+        tmp = path + ".upg"
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                lines = fh.read().splitlines()
+            # probe the first encrypted line (blank lines ahead of it
+            # must not mask a legacy file)
+            probe = next((ln for ln in lines if ln.startswith(LOG_MAGIC)), None)
+            if probe is None or not _needs_upgrade(probe, LOG_MAGIC):
+                continue
+            out = []
+            for ln in lines:
+                # rewrite ONLY blobs still on the legacy static entropy —
+                # already-current lines are left byte-identical
+                if ln.startswith(LOG_MAGIC) and _needs_upgrade(ln, LOG_MAGIC):
+                    v = decrypt_line(ln)          # dual-entropy read
+                    if isinstance(v, str):
+                        out.append(encrypt_line(v))
+                        lines_done += 1
+                        continue
+                out.append(ln)   # current / blank / foreign / unreadable stay
+            with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write("\n".join(out) + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, path)
+            files_done += 1
+        except Exception:  # noqa: BLE001 — the upgrade must never crash startup
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
+    return (files_done, lines_done)
 
 
 # --------------------------------------------------------- migration

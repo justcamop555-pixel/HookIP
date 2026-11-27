@@ -66,6 +66,15 @@ class App:
                             f"log file(s) — browsing history is now stored "
                             f"encrypted.")
             del _conv, _tot
+            # one-time: re-encrypt lines still written with the legacy
+            # static entropy (public in the old source) under the
+            # per-install key — must also finish before the logger opens
+            _u_files, _u_lines = _dg.upgrade_entropy(self._log_dir)
+            if _u_files:
+                self.log.ok(f"Data guard: re-encrypted {_u_lines} log line(s) "
+                            f"in {_u_files} file(s) with the per-install key "
+                            "— old generically-decryptable data is gone.")
+            del _u_files, _u_lines
         except Exception:
             pass
         try:
@@ -145,6 +154,14 @@ class App:
         from .config import APP_DIR
         try:
             from . import dataguard
+            # settings still on the legacy static entropy? one save fixes it
+            try:
+                if dataguard.settings_needs_entropy_upgrade(SETTINGS_PATH):
+                    self.cfg.save()
+                    self.log.debug("Data guard: settings re-encrypted with "
+                                   "the per-install key.")
+            except Exception:
+                pass
             self._dg_acl_ok = dataguard.harden_dir(APP_DIR)
             if not self._dg_acl_ok:
                 self.log.debug("Data guard: folder ACL hardening unavailable "
@@ -1827,8 +1844,9 @@ class App:
             if n_plain == 0 and cfg_enc and acl_ok:
                 self._diag_result(
                     "Data protection", "OK",
-                    f"logs encrypted {n_enc}/{len(log_files)} · settings encrypted · "
-                    "folder locked to your account")
+                    f"logs encrypted {n_enc}/{len(log_files)} · settings "
+                    "encrypted (per-install key) · folder locked to your "
+                    "account")
             else:
                 missing = []
                 if n_plain:
