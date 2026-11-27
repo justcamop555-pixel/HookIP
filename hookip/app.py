@@ -317,20 +317,36 @@ class App:
         import json as _json
         import urllib.request
         import urllib.error
-        latest, url, offline, asset = None, None, False, None
+        latest, url, offline, asset, sha_asset, prerelease = (None, None, False,
+                                                              None, None, False)
+
+        def fetch(req, timeout=10):
+            # The system proxy may point at HookIP itself; if the request
+            # fails mid-transition, retry DIRECT (no system proxy) so a
+            # starting/stopping tunnel never fakes an 'offline' verdict.
+            try:
+                return urllib.request.urlopen(req, timeout=timeout)
+            except OSError:
+                opener = urllib.request.build_opener(
+                    urllib.request.ProxyHandler({}))
+                return opener.open(req, timeout=timeout)
+
         try:
             req = urllib.request.Request(
                 f"https://api.github.com/repos/{self.UPDATE_REPO}/releases/latest",
                 headers={"User-Agent": "HookIP-updater", "Accept": "application/vnd.github+json"})
-            with urllib.request.urlopen(req, timeout=10) as r:
+            with fetch(req) as r:
                 data = _json.loads(r.read().decode("utf-8"))
                 latest = data.get("tag_name", "")
                 url = data.get("html_url") or \
                     f"https://github.com/{self.UPDATE_REPO}/releases"
+                prerelease = bool(data.get("prerelease"))
                 for a in data.get("assets") or []:
-                    if str(a.get("name", "")).lower().endswith(".exe"):
+                    nm = str(a.get("name", "")).lower()
+                    if nm.endswith(".exe") and not asset:
                         asset = a.get("browser_download_url")
-                        break
+                    elif nm.endswith(".sha256") and not sha_asset:
+                        sha_asset = a.get("browser_download_url")
         except urllib.error.HTTPError as exc:
             offline = exc.code in (403, 429, 500, 502, 503)
             # 404: private repo — try the redirect form (works once public)
@@ -339,11 +355,14 @@ class App:
                     req2 = urllib.request.Request(
                         f"https://github.com/{self.UPDATE_REPO}/releases/latest",
                         headers={"User-Agent": "HookIP-updater"})
-                    with urllib.request.urlopen(req2, timeout=10) as r2:
+                    with fetch(req2) as r2:
                         tag = r2.geturl().rsplit("/tag/", 1)[-1]
                         if tag and tag != "latest":
                             # the redirect fallback succeeded — we are NOT offline
-                            latest, url, offline = tag, f"https://github.com/{self.UPDATE_REPO}/releases/tag/{tag}", False
+                            latest, url, offline = (tag,
+                                f"https://github.com/{self.UPDATE_REPO}/releases/tag/{tag}",
+                                False)
+                            prerelease = "-" in tag
                 except OSError:
                     pass
         except OSError:
@@ -352,7 +371,8 @@ class App:
             # malformed API response must not kill the worker (it used to
             # leave the update check permanently stuck on 'already running')
             offline = True
-        self._ui_queue.put(("update", (latest, url, offline, asset)))
+        self._ui_queue.put(("update", (latest, url, offline, asset,
+                                       sha_asset, prerelease)))
     @staticmethod
     def _ver_tuple(s):
         try:
@@ -362,7 +382,8 @@ class App:
         except ValueError:
             return (0,)
 
-    def _update_result(self, latest, url, offline=False, asset=None):
+    def _update_result(self, latest, url, offline=False, asset=None,
+                       sha_asset=None, prerelease=False):
         self._update_running = False
         try:
             if not latest:
@@ -376,9 +397,25 @@ class App:
                 self._dl_btn.pack_forget()
                 self.log.debug("Update check: no reachable release info "
                                + ("(offline)." if offline else "(private repo)."))
+                # offline is usually transient (or our own tunnel mid-restart)
+                # — re-check in 30 min instead of waiting 12 h
+                try:
+                    self.root.after(30 * 60 * 1000, self.check_updates)
+                except (tk.TclError, RuntimeError):
+                    pass
                 return
             self._update_url = url
-            if self._ver_tuple(latest) > self._ver_tuple(__version__):
+            newer = self._ver_tuple(latest) > self._ver_tuple(__version__)
+            # pre-release builds (v1.2.0-beta) are opt-in: automatic checks
+            # stay on the stable channel and only mention them; a MANUAL
+            # check offers the download
+            if prerelease and not getattr(self, "_update_manual", False):
+                self.update_label.configure(
+                    text=f"pre-release {latest} exists — stable stays installed",
+                    fg=MUTED)
+                self.update_pill.configure(text=f"✓ v{__version__}", fg=MUTED)
+                self._dl_btn.pack_forget()
+            elif newer:
                 self.update_label.configure(text=f"update available: {latest}", fg=WARN)
                 self.update_pill.configure(text=f"⬆ {latest} — click to update", fg=WARN)
                 self.log.ok(f"Update available: {latest} — you are on v{__version__}.")
@@ -389,16 +426,18 @@ class App:
                 # one-click download straight from the release (public repo)
                 if asset:
                     self._update_asset_url = asset
+                    self._update_sha_url = sha_asset
                     self._pending_ver = latest
                     self._dl_btn.configure(text=f"⬇ Download {latest}", state="normal")
                     self._dl_btn.pack(side="left", padx=(10, 0))
                     self.log.info("A one-click download is available in "
                                   "Settings → Updates.")
                 if getattr(self, "_update_manual", False):
+                    pr = "\n(This is a pre-release build.)" if prerelease else ""
                     if messagebox.askyesno(
                             APP_NAME,
                             f"HookIP {latest} is available\n(you have "
-                            f"v{__version__}).\n\nOpen the Releases page?"):
+                            f"v{__version__}).{pr}\n\nOpen the Releases page?"):
                         import webbrowser
                         webbrowser.open(url or
                                         f"https://github.com/{self.UPDATE_REPO}/releases")
@@ -422,18 +461,63 @@ class App:
         threading.Thread(target=self._download_worker, args=(url,), daemon=True).start()
 
     def _download_worker(self, url):
+        import hashlib
         import urllib.request
+        import urllib.error
+
+        def fetch(u, timeout=30):
+            # system proxy (our own tunnel) first; direct retry if it fails
+            try:
+                return urllib.request.urlopen(
+                    urllib.request.Request(u, headers={"User-Agent": "HookIP-updater"}),
+                    timeout=timeout)
+            except (OSError, urllib.error.URLError):
+                opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+                return opener.open(
+                    urllib.request.Request(u, headers={"User-Agent": "HookIP-updater"}),
+                    timeout=timeout)
+
+        dest_dir = os.path.join(os.path.expanduser("~"), "Downloads")
+        tmp = dest = None
         try:
-            dest_dir = os.path.join(os.path.expanduser("~"), "Downloads")
             os.makedirs(dest_dir, exist_ok=True)
-            dest = os.path.join(dest_dir, f"HookIP_{getattr(self, '_pending_ver', 'update')}.exe")
-            req = urllib.request.Request(url, headers={"User-Agent": "HookIP-updater"})
-            with urllib.request.urlopen(req, timeout=30) as r, open(dest, "wb") as fh:
+            dest = os.path.join(
+                dest_dir, f"HookIP_{getattr(self, '_pending_ver', 'update').lstrip('v')}.exe")
+            tmp = dest + ".part"   # partial downloads never masquerade as the exe
+            data = b""
+            with fetch(url) as r:
                 while True:
                     chunk = r.read(65536)
                     if not chunk:
                         break
-                    fh.write(chunk)
+                    data += chunk
+            # verify against the release's published checksum — a corrupted
+            # download is deleted, not left behind to be run by mistake
+            expected = None
+            sha_url = getattr(self, "_update_sha_url", None)
+            if sha_url:
+                try:
+                    with fetch(sha_url, timeout=15) as sr:
+                        txt = sr.read(512).decode("utf-8", "replace")
+                    expected = txt.split()[0].strip().lower() if txt.split() else None
+                except (OSError, urllib.error.URLError):
+                    expected = None
+            if expected:
+                actual = hashlib.sha256(data).hexdigest()
+                if actual != expected:
+                    self.log.error(
+                        f"Update download FAILED the checksum check "
+                        f"({actual[:16]}… ≠ {expected[:16]}…) — the file was "
+                        "deleted. Try again or download from the Releases page.")
+                    notify.notify("HookIP — update download failed",
+                                  "The downloaded file did not match its "
+                                  "checksum and was deleted. Try again.",
+                                  timeout_s=12)
+                    return
+                self.log.ok("Downloaded update verified against the release checksum.")
+            with open(tmp, "wb") as fh:
+                fh.write(data)
+            os.replace(tmp, dest)   # atomic: the exe appears only when complete
             self.log.ok(f"Update downloaded to {dest} — close HookIP, then run "
                         "the new file to update.")
             notify.notify("HookIP update downloaded",
@@ -441,6 +525,11 @@ class App:
                           "file to update.", timeout_s=12)
             self._ui_queue.put(("dl_done", ()))
         except OSError as exc:
+            if tmp:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
             self.log.error(f"Update download failed: {exc} — use 'click to "
                            "update' to get it from the Releases page.")
             self._ui_queue.put(("dl_done", ()))
