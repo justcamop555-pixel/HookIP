@@ -8,7 +8,6 @@ import sys
 import tempfile
 import threading
 import time
-import types
 import unittest.mock as mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -258,7 +257,7 @@ def test_heartbeat_alive_keeps_watching():
     stop = _k32.CreateEventW(None, True, False, None)
     beat = _k32.CreateEventW(None, False, False, None)
     restored = []
-    beaten = [0]
+
     def beater():
         while not stopflag.is_set():
             _k32.SetEvent(beat)

@@ -429,7 +429,7 @@ def banner_server(port):
                 return
             try:
                 c.sendall(b"SSH-2.0-OpenSSH banner\r\n")
-                c.settimeout(5)
+                c.settimeout(1)   # was 5 s: stretched the suite for nothing
                 try:
                     c.recv(100)
                 except OSError:
@@ -516,7 +516,6 @@ def test_thread_start_failure_releases_slot():
     ps._lsock = listener
     ps.on_accept_death = None
     counter = {"n": 0}
-    real_thread = threading.Thread
 
     class FakeThread:
         def __init__(self, *a, **k):
@@ -589,6 +588,13 @@ def get_pac(ps, excluded):
     ps.cfg.excluded = excluded
     a, b = socketpair()
     ps._serve_pac(b)
+    # _serve_pac wrote the whole response — close our write side so the
+    # reader sees EOF immediately instead of waiting out the full 2 s
+    # receive timeout on every call (test_pac made 4 such calls)
+    try:
+        b.shutdown(socket.SHUT_WR)
+    except OSError:
+        pass
     a.settimeout(2)
     data = b""
     try:

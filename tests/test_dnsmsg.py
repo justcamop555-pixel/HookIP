@@ -84,8 +84,64 @@ def test_qname_filter():
     check("qname matching is case/dot insensitive", len(answers) == 1, str(answers))
 
 
+# ---- 3. compression pointers + record shapes -------------------------
+def test_compression_pointers():
+    """Real resolvers pointer-compress owner names — the answer records
+    must decode through 0xC0 pointers (with the resume position right)."""
+    q = enc_name("ptr.test")
+    # header(12) + question(name+qtype+qclass); answer owner = pointer to
+    # the question's name at offset 12
+    answer = (b"\xc0\x0c" + struct.pack(">HHIH", dm.TYPE_A, 1, 60, 4)
+              + b"\x0a\x0b\x0c\x0d")
+    resp = (struct.pack(">HHHHHH", 0x1234, 0x8180, 1, 1, 0, 0) + q
+            + struct.pack(">HH", dm.TYPE_A, 1) + answer)
+    rcode, answers = dm.parse_response(resp, qname="ptr.test")
+    vals = [v for (_n, t, _ttl, v) in answers if t == dm.TYPE_A]
+    check("0xC0 pointer owner name decodes",
+          rcode == 0 and vals == ["10.11.12.13"], str(answers))
+
+    # pointer + A record parses right after (resume position exactness)
+    q2 = enc_name("ptr2.test")
+    resp2 = (struct.pack(">HHHHHH", 0x1234, 0x8180, 1, 1, 0, 0) + q2
+             + struct.pack(">HH", dm.TYPE_A, 1) + (
+        b"\xc0\x0c" + struct.pack(">HHIH", dm.TYPE_A, 1, 30, 4) + b"\x01\x02\x03\x04"))
+    rcode, answers2 = dm.parse_response(resp2, qname="ptr2.test")
+    check("pointer + A record parses after", rcode == 0
+          and [v for (_n, t, _ttl, v) in answers2 if t == dm.TYPE_A] == ["1.2.3.4"],
+          str(answers2))
+
+    # truncated packet must raise ValueError, not crash the process
+    try:
+        dm.parse_response(resp[:len(resp) - 2], qname="ptr.test")
+        check("truncated packet rejected", False, "no raise")
+    except ValueError:
+        check("truncated packet rejected", True)
+
+
+def test_rcode_and_aaaa():
+    resp = build_resp("gone.test", [])
+    # flip rcode to 3 (NXDOMAIN) in the header
+    resp = resp[:2] + struct.pack(">H", 0x8183) + resp[4:]
+    rcode, answers = dm.parse_response(resp, qname="gone.test")
+    check("NXDOMAIN rcode surfaces as 3", rcode == 3 and answers == [])
+
+    resp6 = build_resp("v6.test", [
+        ("v6.test", dm.TYPE_AAAA, 120,
+         bytes.fromhex("26064700470000000000000000000011"))])
+    rcode, answers = dm.parse_response(resp6, qname="v6.test")
+    ips = dm.extract_ips(answers, dm.TYPE_AAAA)
+    check("AAAA extracted, zero-compressed",
+          ips == ["2606:4700:4700::11"], str(ips))
+
+    # TTL comes through parseable
+    ttl = [t for (_n, _t, t, _v) in answers if _t == dm.TYPE_AAAA][0]
+    check("AAAA ttl parsed", ttl == 120)
+
+
 test_trailing_dot()
 test_qname_filter()
+test_compression_pointers()
+test_rcode_and_aaaa()
 print()
 print(f"Summary: {sum(1 for _, c in RESULTS if c)}/{len(RESULTS)} passed")
 sys.exit(0 if all(c for _, c in RESULTS) else 1)

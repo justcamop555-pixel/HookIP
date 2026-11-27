@@ -9,7 +9,6 @@ import unittest.mock as mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import socket  # noqa: E402
 from hookip import doh as dohmod  # noqa: E402
 from hookip.doh import Resolver, ResolveError, VerifiedNegative  # noqa: E402
 
@@ -133,7 +132,6 @@ def test_pool_max_burst_creation():
         def __init__(self, *a, **kw):
             with creation_lock:
                 FakeConn.created += 1
-                n_now = FakeConn.created
             creation_barrier.wait(3)      # all creators overlap
             super().__init__(*a, **kw)
 
@@ -211,7 +209,6 @@ def test_cname_no_double_release():
     # request 1 returns a CNAME answer; request 2 (the follow) dies
     conn1.script = [(5, None, 300, "alias.example.com")]
     calls = {"n": 0}
-    real_session = r._doh_session
 
     def session(name, dns_host, ip):
         calls["n"] += 1
@@ -355,7 +352,7 @@ def test_sni_less_and_fallback():
     real_conn = dohmod._DoHConn
     dohmod._DoHConn = RecordingConn
     try:
-        c = r._new_conn("Cloudflare", "1.1.1.1", "cloudflare-dns.com")
+        r._new_conn("Cloudflare", "1.1.1.1", "cloudflare-dns.com")
         check("SNI-less default (validate by IP SAN)",
               captured["modes"] == [True], str(captured["modes"]))
         check("mode cached 'ip'", r._sni_mode.get("Cloudflare") == "ip",
@@ -378,7 +375,7 @@ def test_sni_less_and_fallback():
         captured.clear()
         dohmod._DoHConn = CertFailConn
         r2 = make_resolver()
-        c2 = r2._new_conn("NoSAN", "9.9.9.9", "dns.nosan.example")
+        r2._new_conn("NoSAN", "9.9.9.9", "dns.nosan.example")
         check("cert w/o IP SAN falls back to hostname SNI",
               captured.get("modes") == [True, False], str(captured.get("modes")))
         check("fallback mode cached 'host'", r2._sni_mode.get("NoSAN") == "host",
@@ -640,7 +637,6 @@ def test_cross_type_fallback():
 
 # ---- 12. CNAME follow-up: NX is a vote, SERVFAIL is not NODATA ---------
 def test_cname_followup_verdicts():
-    import hookip.dnsmsg as dnsmsg
     real_resolvers = dohmod.RESOLVERS
 
     def scripted_resolver():
@@ -774,8 +770,7 @@ def test_start_idx_threadsafe():
                 with mock.patch.object(dohmod, "dnsmsg", StubDns):
                     # exercise the rotation read/write path via the lock
                     with r._lock:
-                        order = [dohmod.RESOLVERS[(r._start_idx + i) % len(dohmod.RESOLVERS)]
-                                 for i in range(len(dohmod.RESOLVERS))]
+                        # rotation read+write under the lock, as production does
                         r._start_idx = (r._start_idx + 1) % len(dohmod.RESOLVERS)
             except RuntimeError as e:
                 errs.append(e)
