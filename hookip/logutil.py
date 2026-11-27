@@ -36,17 +36,28 @@ class Log:
         redirected to .hlog automatically.
         """
         with self._lock:
+            # a previous file sink (re-attach) must not leak its handle
+            old, self._file = self._file, None
+            if old:
+                try:
+                    old.close()
+                except OSError:
+                    pass
             try:
                 if path.endswith(".log"):
                     path = path[:-4] + ".hlog"
                 os.makedirs(os.path.dirname(path), exist_ok=True)
-                self._file = open(path, "a", encoding="utf-8")
-                self._file.write(dataguard.encrypt_line(
+                fh = open(path, "a", encoding="utf-8")
+                fh.write(dataguard.encrypt_line(
                     f"# HookIP session log started {time.strftime('%Y-%m-%d %H:%M:%S')}",
                     magic=dataguard.LOG_MAGIC) + "\n")
-                self._file.flush()
+                fh.flush()
+                self._file = fh
             except OSError:
-                self._file = None
+                try:
+                    fh.close()
+                except (OSError, NameError, UnboundLocalError):
+                    pass
 
     def close_file(self):
         with self._lock:
@@ -70,11 +81,15 @@ class Log:
             pass
 
     def _emit(self, level, ts, msg, screen=True):
-        entry = (level, ts, msg)
+        date = time.strftime("%Y-%m-%d")
+        entry = (level, ts, msg, date)   # date travels with the entry:
+                                         # a session spanning midnight must
+                                         # not export every line under
+                                         # today's date
         with self._lock:
             if self._file:
                 try:
-                    plain = f"[{time.strftime('%Y-%m-%d')} {ts}] [{level.upper():5}] {msg}"
+                    plain = f"[{date} {ts}] [{level.upper():5}] {msg}"
                     self._file.write(dataguard.encrypt_line(plain) + "\n")
                     self._file.flush()
                 except OSError:
@@ -83,7 +98,7 @@ class Log:
             subs = list(self._subs) if screen else []
         for cb in subs:
             try:
-                cb(*entry)
+                cb(*entry[:3])      # subscriber contract stays 3-arg
             except Exception:
                 pass
 
@@ -125,13 +140,12 @@ class Log:
             return list(self._buf)
 
     def export_text(self, min_rank=0):
-        """All buffered entries, formatted (with date) for reports/bug filing."""
+        """All buffered entries, formatted (per-entry date) for reports."""
         with self._lock:
             entries = list(self._buf)
-        today = time.strftime("%Y-%m-%d")
         lines = []
-        for level, ts, msg in entries:
+        for level, ts, msg, date in entries:
             if LEVEL_RANK.get(level, 1) < min_rank:
                 continue
-            lines.append(f"[{today} {ts}] [{level.upper():5}] {msg}")
+            lines.append(f"[{date} {ts}] [{level.upper():5}] {msg}")
         return "\n".join(lines)

@@ -1486,7 +1486,7 @@ class App:
                     self.log_text.configure(state="normal")
                     # decide BEFORE inserting — insertion itself shifts the view
                     at_bottom = self.log_text.yview()[1] >= 0.98
-                    for level, ts, msg in new_entries:
+                    for level, ts, msg, _date in new_entries:
                         extra = self._log_semantic_tag(msg)
                         tags = (level, extra) if extra else (level,)
                         self.log_text.insert("end", f"[{ts}] ", "ts")
@@ -1523,7 +1523,7 @@ class App:
             self.log_text.configure(state="normal")
             self.log_text.delete("1.0", "end")
             today = time.strftime("%Y-%m-%d")
-            for level, ts, msg in self._log_all:
+            for level, ts, msg, _date in self._log_all:
                 if logutil.LEVEL_RANK.get(level, 1) >= self._log_min_rank:
                     extra = self._log_semantic_tag(msg)
                     tags = (level, extra) if extra else (level,)
@@ -1538,9 +1538,11 @@ class App:
         rank = self._log_min_rank if min_rank is None else min_rank
         today = time.strftime("%Y-%m-%d")
         lines = [f"HookIP {__version__} log — {today}"]
-        for level, ts, msg in self._log_all:
+        for level, ts, msg, date in self._log_all:
             if logutil.LEVEL_RANK.get(level, 1) >= rank:
-                lines.append(f"[{today} {ts}] [{level.upper():5}] {msg}")
+                # per-entry date: a session spanning midnight must not
+                # export older lines under today's date
+                lines.append(f"[{date} {ts}] [{level.upper():5}] {msg}")
         return "\n".join(lines)
 
     def _export_log(self):
