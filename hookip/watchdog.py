@@ -72,6 +72,36 @@ def _do_restore(backup_path, mem_backup):
     return False
 
 
+def _log_marker(backup_path, reason):
+    """Write the crash record where the user can actually find it:
+    (1) a marker file the NEXT app session turns into a visible log
+    entry (a fresh session used to start with no hint of why the
+    previous one vanished), (2) an encrypted line appended to the
+    newest session .hlog so the post-mortem trail lives in the file.
+    Never raises."""
+    appdir = os.path.dirname(backup_path)
+    try:
+        with open(os.path.join(appdir, "last_crash.txt"), "w",
+                  encoding="utf-8") as fh:
+            fh.write(f"{reason or 'stopped unexpectedly'}\t"
+                     f"{time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+    except OSError:
+        pass
+    try:
+        import glob as _glob
+        from . import dataguard as _dg
+        logs = sorted(_glob.glob(os.path.join(appdir, "logs", "hookip_*.hlog")),
+                      key=os.path.getmtime)
+        if logs:
+            plain = (f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [WARN ] "
+                     f"Session ended unexpectedly ({reason or 'crash'}) — "
+                     "internet settings restored by the watchdog.")
+            with open(logs[-1], "a", encoding="utf-8") as fh:
+                fh.write(_dg.encrypt_line(plain, magic=_dg.LOG_MAGIC) + "\n")
+    except Exception:
+        pass
+
+
 def _restore_and_notify(backup_path, mem_backup, parent_pid=0, reason=None):
     """Restore + user feedback. Never raises. Twin-safe: a named mutex
     lets exactly one watchdog in (the winner acquires instantly; the
@@ -130,6 +160,7 @@ def _restore_and_notify(backup_path, mem_backup, parent_pid=0, reason=None):
                 "settings.", timeout_s=30)
     except Exception:
         pass                        # a dead notifier must not kill the restore
+    _log_marker(backup_path, reason)
     if h_done:
         try:
             _k32.SetEvent(h_done)

@@ -206,6 +206,16 @@ def test_parent_death_restore():
     check("child reacts instantly (no 1 s poll)", dt < 2.0, f"{dt:.2f}s")
     if os.path.exists(path):
         os.remove(path)
+    # the child writes its crash marker (last_crash.txt) next to the
+    # backup during restore — wait for that moment, then remove both
+    marker = os.path.join(d, "last_crash.txt")
+    for _ in range(100):
+        if os.path.exists(marker):
+            break
+        time.sleep(0.05)
+    check("child logged its crash marker", os.path.exists(marker))
+    if os.path.exists(marker):
+        os.remove(marker)
     os.rmdir(d)
 
 

@@ -280,6 +280,7 @@ class Resolver:
         self.verbose_stats = {}               # resolver -> success count
         self._pool = {}                       # resolver name -> [_DoHConn, ...]
         self._sni_mode = {}                   # resolver -> 'ip' | 'host'
+        self._last_plain_warn = 0.0           # throttles the DoH-fallback warn
         self._pool_lock = threading.Lock()
         self._pool_max = profile().doh_pool_per_resolver  # hardware-scaled
         self._pending = {}                    # resolver -> conns being created
@@ -450,6 +451,24 @@ class Resolver:
             if ev:
                 ev.set()
 
+    def _plain_fallback_warn(self, host, source):
+        """Secure-DNS degradation notice: DoH was on but could not answer,
+        and the address came from plaintext DNS. Logged as WARN (throttled
+        to one entry per 5 minutes — per-host detail stays at debug)."""
+        with self._lock:
+            last = self._last_plain_warn
+        if time.time() - last <= 300:
+            self.log.debug(f"plaintext {source} DNS resolved {host} "
+                           "(DoH unavailable — warn throttled)")
+            return
+        with self._lock:
+            self._last_plain_warn = time.time()
+        self.log.warn(
+            f"Secure DNS (DoH) unreachable — {host} was resolved via "
+            f"plaintext {source.upper()} DNS, which is visible to the "
+            "network. HookIP keeps trying DoH for new lookups; if this "
+            "repeats on every lookup, this network is blocking DoH.")
+
     def _lookup_uncached(self, host, qtype, now):
         """Full resolver chain (DoH → TCP → UDP → system) with caching.
         Called at most once per host at a time (in-flight coalescing)."""
@@ -457,9 +476,12 @@ class Resolver:
         ttl = 120
         verified_neg = None    # trusted negative verdict string (NXDOMAIN / NODATA)
         doh_note = None        # detailed last DoH verdict (helps messaging)
+        source = None          # where the winning answer came from (logging)
         try:
             if self.cfg.doh_enabled:
                 ips, ttl, doh_note = self._via_doh(host, qtype)
+                if ips:
+                    source = "doh"
             else:
                 ips, ttl, doh_note = [], 120, None
             if not ips:
@@ -475,13 +497,19 @@ class Resolver:
                     raise           # a confirming vote is a verdict, not noise
                 except (ResolveError, OSError):
                     ips, ttl = [], ttl
+                if ips:
+                    source = "tcp"
         except VerifiedNegative as exc:
             verified_neg = str(exc)
             ips, ttl = [], ttl
         if not ips and verified_neg is None:
             ips, ttl = self._via_udp_dns(host, qtype)
+            if ips:
+                source = "udp"
         if not ips and verified_neg is None:
             ips, ttl = self._via_system(host, qtype)
+            if ips:
+                source = "system"
         if not ips:
             # A resolver that ANSWERED (rcode 0) but has no usable records
             # is a trusted verdict (NODATA). A single unconfirmed DoH
@@ -516,6 +544,8 @@ class Resolver:
                 try:
                     if self.cfg.doh_enabled:
                         ips, ttl, other_note = self._via_doh(host, other)
+                        if ips:
+                            source = "doh"
                 except (ResolveError, OSError):
                     ips, other_note = [], None
                 if not ips:
@@ -524,6 +554,8 @@ class Resolver:
                             host, other,
                             doh_nx_vote=bool(other_note and other_note.startswith(
                                 "NXDOMAIN (unconfirmed")))
+                        if ips:
+                            source = "tcp"
                     except (ResolveError, OSError):
                         ips = []
                 if ips:
@@ -564,6 +596,10 @@ class Resolver:
         blocked = [ip for ip in ips if is_sinkhole(ip)]
         if blocked:
             ips = [ip for ip in ips if not is_sinkhole(ip)]
+        # the Secure-DNS degradation notice: warn once per 5 minutes when
+        # DoH was enabled but a plaintext path produced the address
+        if source and source != "doh" and self.cfg.doh_enabled:
+            self._plain_fallback_warn(host, source)
             self.log.debug(f"resolve {host}: dropped sinkhole answer(s) {', '.join(blocked)}")
             if not ips:
                 with self._lock:

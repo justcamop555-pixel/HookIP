@@ -16,6 +16,7 @@ class Log:
         self._buf = deque(maxlen=maxlen)
         self._subs = []
         self._file = None
+        self.file_error = None     # last file-sink failure, surfaced once
         self.verbose = False
 
     def subscribe(self, callback):
@@ -53,11 +54,15 @@ class Log:
                     magic=dataguard.LOG_MAGIC) + "\n")
                 fh.flush()
                 self._file = fh
-            except OSError:
+            except OSError as exc:
                 try:
                     fh.close()
                 except (OSError, NameError, UnboundLocalError):
                     pass
+                # a silent failure used to leave the UI claiming a session
+                # file that does not exist; remember it so the app can say so
+                if not self.file_error:
+                    self.file_error = str(exc)
 
     def close_file(self):
         with self._lock:

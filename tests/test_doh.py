@@ -252,6 +252,38 @@ def test_cname_no_double_release():
 
 
 # ---- 4. _frag_send chunk semantics -----------------------------------
+def test_plain_fallback_warn_throttled():
+    """DoH on but unreachable -> the address came from plaintext DNS: that
+    Secure-DNS degradation is logged as WARN, throttled to one entry per
+    5 minutes (per-host detail stays at debug)."""
+    r = make_resolver(pool_max=2)
+
+    def fail_doh(host, qtype):
+        # real _via_doh never raises — it returns empty + a verdict note
+        return ([], 120, "error: all resolvers failed")
+
+    def fake_tcp(host, qtype, doh_nx_vote=False):
+        return (["1.2.3.4"], 60)
+
+    r._via_doh = fail_doh
+    r._via_tcp_dns = fake_tcp
+    r._via_udp_dns = lambda *a, **k: ([], 0)
+    r._via_system = lambda *a, **k: ([], 0)
+    r._cache.clear()
+    r._neg_cache.clear()
+    ips = r.resolve("example.com")
+    warns = [m for (lvl, m) in r.log.lines if lvl == "warn"]
+    check("DoH outage warns (plaintext TCP used)",
+          ips == ["1.2.3.4"] and len(warns) == 1 and "plaintext TCP" in warns[0],
+          f"ips={ips} warns={warns[:1]}")
+    r._cache.clear()
+    r._neg_cache.clear()
+    r.resolve("example.com")                 # again within 5 min
+    warns2 = [m for (lvl, m) in r.log.lines if lvl == "warn"]
+    check("fallback warn throttled (one per 5 min)", len(warns2) == 1,
+          f"warns={len(warns2)}")
+
+
 def test_sni_less_and_fallback():
     """SNI-less DoH: the ClientHello must validate by IP SAN (no resolver
     name in SNI — that was the Secure-DNS bypass: a DPI filter could block
@@ -748,6 +780,7 @@ if __name__ == "__main__":
     test_udp_verification()
     test_start_idx_threadsafe()
     test_sni_less_and_fallback()
+    test_plain_fallback_warn_throttled()
 
     print()
     print(f"Summary: {sum(1 for _, c in RESULTS if c)}/{len(RESULTS)} passed")

@@ -96,6 +96,27 @@ class App:
             pass
         self._log_file = os.path.join(self._log_dir, time.strftime("hookip_%Y%m%d_%H%M%S.hlog"))
         self.log.attach_file(self._log_file)
+        if getattr(self.log, "file_error", None):
+            self.log.warn("Session log file could NOT be created — this "
+                          "session is memory-only. Check disk space and "
+                          "permissions for %LOCALAPPDATA%\\HookIP\\logs.")
+        self.log.ok(f"HookIP v{__version__} started — session log: "
+                    f"{os.path.basename(self._log_file)}")
+        try:
+            marker = os.path.join(APP_DIR, "last_crash.txt")
+            if os.path.isfile(marker):
+                with open(marker, encoding="utf-8") as fh:
+                    reason, ts = (fh.read().strip().split("\t", 1) + [""])[0:2]
+                try:
+                    os.remove(marker)
+                except OSError:
+                    pass
+                self.log.warn(f"Last session ended unexpectedly "
+                              f"({reason or 'crash'}) at {ts} — crash "
+                              "protection restored your internet. This "
+                              "session is a fresh start.")
+        except OSError:
+            pass
         self._hook_exception_logging()
         self.stats = Stats()
         self.pac_token = self.cfg.pac_token or secrets.token_hex(8)
@@ -129,6 +150,7 @@ class App:
             except Exception:
                 pass
         self.proxy = None
+        self._live_port = None          # the port the proxy actually bound
         self.running = False
         self.watchdog = winproxy.Watchdog()
 
@@ -1479,7 +1501,11 @@ class App:
             self.log.info("Check the red-highlighted field in Settings.")
             return
 
+        prev_port = getattr(self, "_live_port", None)
         self.log.info(f"Starting proxy on 127.0.0.1:{cfg.port} …")
+        if prev_port and prev_port != cfg.port:
+            self.log.info(f"Proxy port switched: {prev_port} → {cfg.port} "
+                          "— change noted for diagnostics.")
         # restricted-network support: if Windows already points at the
         # network's own proxy (WPAD/PAC or manual), HookIP must tunnel
         # THROUGH it — direct connects are blocked on such Wi-Fi
@@ -1500,6 +1526,7 @@ class App:
             self.proxy = ProxyServer(cfg, self.log, self.stats, self.pac_token)
             self.proxy.on_accept_death = self._on_accept_death
             self.proxy.start()
+            self._live_port = cfg.port
         except OSError as exc:
             self.log.error(f"Cannot bind port {cfg.port}: {exc}")
             self.proxy = None
@@ -1519,7 +1546,14 @@ class App:
                 winproxy.apply_both(cfg.port, self.pac_token, bypass=bypass)
             self.watchdog.start(cfg.port)
             winproxy.set_runonce()
-            self.log.ok("System proxy configured. Crash protection active.")
+            self.log.ok("System proxy configured.")
+            # the watchdog can die at birth (AV heuristic, broken cwd) and
+            # respawns once internally — 'crash protection active' used to
+            # be logged even when zero children actually survived
+            n_w = self.watchdog.watchers()
+            (self.log.ok if n_w >= 2 else self.log.warn)(
+                f"Crash protection: {n_w}/2 watchdog process(es) watching "
+                "this session (heartbeat monitored).")
         except Exception as exc:  # noqa: BLE001 — nothing after the proxy is
             # up may kill the startup sequence: Windows already routes
             # through HookIP here, so the running flag and the UI MUST be
@@ -1659,6 +1693,8 @@ class App:
             self.proxy.stop()
             self.proxy = None
         try:
+            # _live_port is deliberately KEPT across Stop: the next Start
+            # can then log 'port switched: a → b' for the diagnostics
             self.watchdog.stop()
             winproxy.clear_runonce()
             if winproxy.restore_from_file():
