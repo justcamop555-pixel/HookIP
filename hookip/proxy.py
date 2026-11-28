@@ -6,6 +6,7 @@ import socket
 import threading
 import time
 from collections import deque
+from typing import Callable
 
 from . import tlsfrag
 from .perf import profile
@@ -241,7 +242,9 @@ class ProxyServer:
             pass
         self._strat_dirty = False
         self._strat_save_at = time.time() + 300
-        self.on_accept_death = None           # app hook: emergency restore
+        # app hook: emergency restore (callback taking no arguments;
+        # annotated so assigning the app's callable type-checks)
+        self.on_accept_death: Callable[[], None] | None = None
         self._blocked_seen = {}               # host -> last 'blocked/dead' log ts
         self._lsock = None
         self._accept_thread = None
@@ -342,8 +345,13 @@ class ProxyServer:
         accept_errors = 0
         try:
             while self.running:
+                # local snapshot: stop() can close/clear the socket between
+                # iterations (and static analysis cannot narrow the attr)
+                lsock = self._lsock
+                if lsock is None:
+                    break
                 try:
-                    csock, _addr = self._lsock.accept()
+                    csock, _addr = lsock.accept()
                 except OSError:
                     # transient errors (e.g. a client resetting mid-connect)
                     # must not kill the accept loop; a persistent failure

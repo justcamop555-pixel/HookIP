@@ -1275,6 +1275,7 @@ class App:
         dash = ttk.Frame(nb, style="Card.TFrame", padding=14)
         nb.add(dash, text=" Dashboard ")
         self.dash_vars = {}
+        self._dash_colors = {}   # dashboard key -> (lit, normal) colors
         row = tk.Frame(dash, bg=PANEL)
         row.pack(fill="x")
         self._stat_card(row, "connections", "Total connections", 0)
@@ -1743,7 +1744,10 @@ class App:
         val.pack()
         tk.Label(card, text=label, bg="#1b2130", fg=MUTED,
                  font=("Segoe UI", 9)).pack()
-        val._lit, val._normal = lit, normal
+        # keep the colors OFF the widget object: a Label subclass would be
+        # one more widget class to carry around, and monkey-patching Tk
+        # widget attributes confuses static analysis for no benefit
+        self._dash_colors[key] = (lit, normal)
         self.dash_vars[key] = val
 
     # ------------------------------------------------------------------
@@ -2545,12 +2549,11 @@ class App:
             if self.port_badge.cget("text") != port_txt:
                 self.port_badge.configure(text=port_txt)
             self.dash_vars["connections"].configure(text=str(total))
-            av = self.dash_vars["active"]
-            av.configure(text=str(active), fg=av._lit if active else av._normal)
-            fv = self.dash_vars["failed"]
-            fv.configure(text=str(failed), fg=fv._lit if failed else fv._normal)
-            bv = self.dash_vars["blocked"]
-            bv.configure(text=str(blocked), fg=bv._lit if blocked else bv._normal)
+            for key, count in (("active", active), ("failed", failed),
+                               ("blocked", blocked)):
+                lit, normal = self._dash_colors[key]
+                self.dash_vars[key].configure(text=str(count),
+                                              fg=lit if count else normal)
             self.dash_vars["down"].configure(text=self._fmt_bytes(down))
             self.dash_vars["up"].configure(text=self._fmt_bytes(up))
             # crash protection must never silently vanish: the watchdog is a
@@ -3256,11 +3259,11 @@ def run():
         root = tk.Tk()
         root.withdraw()
         if winproxy.notify_running_instance():
-            tk.messagebox.showinfo(
+            messagebox.showinfo(
                 APP_NAME,
                 f"{APP_NAME} is already running —\nit was brought to the front instead.")
         else:
-            tk.messagebox.showwarning(
+            messagebox.showwarning(
                 APP_NAME,
                 f"{APP_NAME} is already running.\n"
                 f"Close the other instance before starting a new one.")
