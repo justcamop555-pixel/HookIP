@@ -429,8 +429,13 @@ class ProxyServer:
         persisted history can be aged out by the retention window."""
         with self._state_lock:
             if len(self._strat_pref) >= self._strat_cap and host not in self._strat_pref:
-                self._strat_pref.pop(next(iter(self._strat_pref)), None)
-                self._strat_ts.pop(next(iter(self._strat_ts)), None)
+                # evict the SAME victim from both maps: popping each map's
+                # own first key independently could evict host A's pref and
+                # host B's ts — B's pref entry would then survive without a
+                # timestamp and persist with t=now (never aged out)
+                victim = next(iter(self._strat_pref))
+                self._strat_pref.pop(victim, None)
+                self._strat_ts.pop(victim, None)
             self._strat_pref[host] = strategy
             self._strat_ts[host] = time.time()
             if len(self._strat_ts) > self._strat_cap:

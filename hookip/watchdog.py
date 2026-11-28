@@ -108,7 +108,7 @@ def _do_restore(backup_path, mem_backup, mem_vals=None):
     return False
 
 
-def _log_marker(backup_path, reason, mem_vals=None):
+def _log_marker(backup_path, reason):
     """Write the crash record where the user can actually find it:
     (1) a marker file the NEXT app session turns into a visible log
     entry (a fresh session used to start with no hint of why the
@@ -208,7 +208,7 @@ def _restore_and_notify(backup_path, mem_backup, parent_pid=0, reason=None,
                 "settings.", timeout_s=30)
     except Exception:
         pass                        # a dead notifier must not kill the restore
-    _log_marker(backup_path, reason, mem_vals=mem_vals)
+    _log_marker(backup_path, reason)
     if h_done:
         try:
             _k32.SetEvent(h_done)

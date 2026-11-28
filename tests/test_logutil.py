@@ -6,7 +6,6 @@ any OS. Only the section that uses real DPAPI is skipped on non-Windows.
 import os
 import sys
 import tempfile
-import threading
 import time
 import unittest.mock as mock
 

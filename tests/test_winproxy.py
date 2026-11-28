@@ -10,7 +10,6 @@ import json
 import os
 import sys
 import tempfile
-import threading
 import types
 import unittest.mock as mock
 
@@ -190,8 +189,6 @@ def fake_set_event(handle):
     set_calls.append(handle)
     return True
 
-
-import time as _time
 
 
 def fake_wait(t):

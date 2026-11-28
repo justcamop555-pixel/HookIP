@@ -11,6 +11,51 @@ import subprocess
 import sys
 import time
 
+
+def _real_proxy_snapshot():
+    """The machine's ACTUAL proxy settings, taken before any suite runs.
+
+    Global canary: if ANY suite leaks a write into the user's real
+    Internet Settings (this genuinely happened once — an unpatched
+    restore_from_file test set ProxyServer to a fixture value and took
+    the user's internet down), run_all detects it, RESTORES the original
+    values and fails the run."""
+    if os.name != "nt":
+        return None
+    import winreg
+    key_path = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path) as k:
+        vals = {}
+        for name in ("ProxyEnable", "ProxyServer", "ProxyOverride",
+                     "AutoConfigURL"):
+            try:
+                v, _t = winreg.QueryValueEx(k, name)
+            except FileNotFoundError:
+                v = None
+            vals[name] = v
+    return (key_path, vals)
+
+
+def _restore_real_proxy(snap):
+    import winreg
+    key_path, vals = snap
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0,
+                            winreg.KEY_SET_VALUE) as k:
+            for name, v in vals.items():
+                if v is None:
+                    try:
+                        winreg.DeleteValue(k, name)
+                    except FileNotFoundError:
+                        pass
+                else:
+                    winreg.SetValueEx(
+                        k, name, 0,
+                        winreg.REG_DWORD if name == "ProxyEnable"
+                        else winreg.REG_SZ, v)
+    except OSError:
+        pass
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 
@@ -41,6 +86,7 @@ def main():
     if not picked:
         picked = SUITES
 
+    snap = _real_proxy_snapshot()
     results = []
     failed = False
     for suite in picked:
@@ -77,6 +123,19 @@ def main():
     totals = [_nums(s) for _, s, _, _ in results]
     total_pass = sum(a for a, _ in totals)
     total_all = sum(b for _, b in totals)
+
+    # global canary AFTER every suite: the real proxy settings must be
+    # identical to the baseline — any leak restores the user's values and
+    # fails the whole run
+    if snap is not None:
+        key_path, before = snap
+        if _real_proxy_snapshot()[1] != before:
+            _restore_real_proxy(snap)
+            failed = True
+            print()
+            print("!!! a test LEAKED into the user's real Internet Settings "
+                  f"({key_path}) — original values restored, run FAILED. "
+                  "Find the unpatched write in the suites above.")
     print()
     print(f"TOTAL: {total_pass}/{total_all} checks in {len(results)} suites — "
           f"{'ALL GREEN' if not failed and results else 'FAILURES PRESENT'}")
