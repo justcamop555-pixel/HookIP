@@ -79,6 +79,19 @@ class Config:
         if not isinstance(clean.get("excluded"), list) or \
                 not all(isinstance(x, str) for x in clean["excluded"]):
             clean["excluded"] = list(DEFAULTS["excluded"])
+        else:
+            # normalize what the UI parser would produce anyway: trimmed,
+            # lowercased (domains are case-insensitive), trailing dots and
+            # blanks gone, deduped — a hand-edited settings.json used to
+            # inject junk entries the PAC then carried verbatim
+            seen = set()
+            norm = []
+            for x in clean["excluded"]:
+                t = x.strip().lower().rstrip(".").strip()
+                if t and t not in seen:
+                    seen.add(t)
+                    norm.append(t)
+            clean["excluded"] = norm
         if not isinstance(clean.get("pac_token"), str):
             clean["pac_token"] = DEFAULTS["pac_token"]
         if not isinstance(clean.get("upstream_proxy"), str):

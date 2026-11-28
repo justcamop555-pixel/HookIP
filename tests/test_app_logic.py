@@ -524,6 +524,49 @@ check("pasted URL + :port stripped to the bare domain",
 check("deduped and lowercased",
       parsed == ["bank.example.com", "example.com", "vpn.corp.example",
                  "::1", "bücher.de"], str(parsed))
+
+# ---- exclusion VISIBILITY at Start (the silent-PAC-skip fix) -----------
+import types as _t
+
+_replines = []
+
+class _RecordingLog:
+    def __init__(self):
+        pass
+
+    def _w(self, lvl):
+        def f(msg, *a, **k):
+            _replines.append((lvl, str(msg)))
+        return f
+
+    debug = property(lambda self: self._w("debug"))
+    info = property(lambda self: self._w("info"))
+    ok = property(lambda self: self._w("ok"))
+    warn = property(lambda self: self._w("warn"))
+    error = property(lambda self: self._w("error"))
+
+_replog = _RecordingLog()
+fakeapp2 = make_app()
+fakeapp2.log = _replog
+fakeapp2._unusable_in_pac = appmod.App._unusable_in_pac
+appmod.App._report_exclusions(fakeapp2, ["example.com", "vpn.corp.example"])
+check("Start reports the active exclusion count and names",
+      any("2 domain exclusion(s)" in m and "example.com" in m
+          for (lvl, m) in _replines if lvl == "info"),
+      str(_replines[:2]))
+_replines.clear()
+appmod.App._report_exclusions(fakeapp2, ["it's.bad.test", "*", "ok.com"])
+warns = [m for (lvl, m) in _replines if lvl == "warn"]
+check("quote-bearing exclusion warned as PAC-ignored",
+      any("'it" + chr(39) + "s.bad.test' is IGNORED" in m for m in warns),
+      str(warns))
+check("bare '*' warned as excludes-everything",
+      any("matches EVERY domain" in m for m in warns), str(warns))
+_replines.clear()
+appmod.App._report_exclusions(fakeapp2, [])
+check("empty exclusion list reported (not silent)",
+      any("No domain exclusions" in m for (lvl, m) in _replines),
+      str(_replines))
 check("trailing dot stripped, comment dropped",
       "vpn.corp.example" in parsed and
       not any(x.startswith("#") for x in parsed))

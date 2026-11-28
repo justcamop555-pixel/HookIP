@@ -533,6 +533,38 @@ class App:
             return
         self.log.error("No free port found in 9000–9899 — type one manually.")
 
+    @staticmethod
+    def _unusable_in_pac(p):
+        """Patterns the served PAC must skip (they would corrupt its JS):
+        control characters, quotes, backslashes. Mirrors the guard in
+        ProxyServer._serve_pac — keep both in sync."""
+        return (any(ord(c) < 0x20 or ord(c) == 0x7f for c in p)
+                or '"' in p or "'" in p or "\\" in p)
+
+    def _report_exclusions(self, pats):
+        """Make exclusions VISIBLE at Start. The PAC silently skips
+        patterns that would corrupt its script (quote/backslash), and a
+        bare '*' excludes EVERY domain (HookIP would pass all sites
+        through unfragmented and 'do nothing') — both used to be
+        invisible until something broke."""
+        if not pats:
+            self.log.info("No domain exclusions configured.")
+            return
+        shown = ", ".join(pats[:5]) + (
+            f" … (+{len(pats) - 5} more)" if len(pats) > 5 else "")
+        self.log.info(f"{len(pats)} domain exclusion(s) active: {shown}")
+        for p in pats:
+            if self._unusable_in_pac(p):
+                self.log.warn(
+                    f"Exclusion '{p}' is IGNORED by the served PAC (it "
+                    "would corrupt the script) — remove or fix it in "
+                    "Settings → Excluded domains.")
+            elif p.strip().rstrip(".") in ("*", "**"):
+                self.log.warn(
+                    "Exclusion '*' matches EVERY domain — all sites go "
+                    "DIRECT (unfragmented) and HookIP will appear to do "
+                    "nothing. Remove it unless you really mean that.")
+
     def _parse_excluded(self):
         """Read the excluded-domains box: trimmed, lowercased, deduped,
         tolerant of pasted URLs (https://sub.example.com/ → sub.example.com)
@@ -1989,6 +2021,7 @@ class App:
             cfg.minimize_to_tray = self.tray_var.get()
             cfg.excluded = self._parse_excluded()
             self.log.verbose = cfg.verbose
+            self._report_exclusions(cfg.excluded)
         prev_port = getattr(self, "_live_port", None)
         self.log.info(f"Starting proxy on 127.0.0.1:{cfg.port} …")
         if prev_port and prev_port != cfg.port:
@@ -2899,7 +2932,15 @@ class App:
         except (ValueError, tk.TclError):
             self._diag_result("Fragment size", "FAIL", "not a number (1–255)", "fail")
         pats = self._parse_excluded()
-        self._diag_result("Excluded domains", "OK", f"{len(pats)} valid pattern(s)", "ok")
+        _bad = [p for p in pats if self._unusable_in_pac(p)]
+        if _bad:
+            self._diag_result(
+                "Excluded domains", "WARN",
+                f"{len(pats) - len(_bad)}/{len(pats)} usable — the PAC "
+                f"ignores: {', '.join(_bad[:3])}", "warn")
+        else:
+            self._diag_result("Excluded domains", "OK",
+                              f"{len(pats)} valid pattern(s)", "ok")
         try:
             from . import dataguard as _dg
             # READ-ONLY check — this used to call Config.save() from the

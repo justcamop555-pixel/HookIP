@@ -843,6 +843,17 @@ try:
           cb.fragment_size == _Cfg().fragment_size and
           cb.log_retention_days == _Cfg().log_retention_days,
           str((cb.port, cb.fragment_size, cb.log_retention_days)))
+    # excluded list: normalized the way the UI parser would (the UI
+    # dedupes; a hand-edited settings.json used to inject junk the PAC
+    # carried verbatim)
+    ce = _Cfg({"excluded": ["  Example.COM.  ", "example.com", "",
+                            "  ", "VPN.Corp.Example", "a*b.com"]})
+    check("config: excluded normalized (trim/lower/dedupe/dots)",
+          ce.excluded == ["example.com", "vpn.corp.example", "a*b.com"],
+          str(ce.excluded))
+    c_empty = _Cfg({"excluded": ["", "   "]})
+    check("config: exclusions emptied by hand stay empty (user choice)",
+          c_empty.excluded == [], str(c_empty.excluded))
 finally:
     shutil.rmtree(cfgc, ignore_errors=True)
 
