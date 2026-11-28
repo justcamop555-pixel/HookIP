@@ -252,8 +252,10 @@ class _DoHConn:
                 # accumulate the body — overwriting with `buf` would paste
                 # the HTTP HEADERS back into the DNS message (this caused
                 # 'truncated name' parse failures on multi-record
-                # responses, e.g. Google DoH)
-                body += chunk
+                # responses, e.g. Google DoH). body is always bytes here
+                # (this branch only runs after the header block set it);
+                # `or b""` keeps that provable for type checkers.
+                body = (body or b"") + chunk
         # connection ended — anything short of the promised length is
         # incomplete; raising triggers a fresh-session retry upstream
         if body and clen is not None and len(body) < clen:
@@ -676,7 +678,7 @@ class Resolver:
         if source and source != "doh" and self.cfg.doh_enabled and ips:
             self._plain_fallback_warn(host, source)
 
-        ttl = min(300, max(10, int(ttl)))
+        ttl = min(300, max(10, int(ttl or 120)))   # None -> sensible default
         with self._lock:
             cap = profile().cache_cap
             neg_cap = profile().neg_cache_cap
@@ -767,8 +769,13 @@ class Resolver:
             state["hedge_deadline"] = time.time() + 0.4
         while result is None and verified is None and (inflight or state["next"] < n):
             # keep up to 2 attempts in flight (2nd hedges 0.4 s behind the 1st)
+            # (the deadline is None only before the first launch, when the
+            # inflight check already short-circuits — made explicit here so
+            # that is provable, not just true)
+            deadline = state["hedge_deadline"]
             if (len(inflight) < 2 and state["next"] < n
-                    and (len(inflight) == 0 or time.time() >= state["hedge_deadline"])):
+                    and (len(inflight) == 0
+                         or (deadline is not None and time.time() >= deadline))):
                 _launch(state["next"])
                 state["next"] += 1
                 state["hedge_deadline"] = time.time() + 0.4
