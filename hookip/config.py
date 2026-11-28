@@ -31,6 +31,13 @@ class Config:
 
     def __init__(self, data=None):
         self._data = dict(DEFAULTS)
+        # dict(DEFAULTS) SHARES nested mutables with the class default —
+        # an in-place cfg.excluded.append(...) or strat_memory update would
+        # corrupt DEFAULTS for every future Config() in this process.
+        # Copy them so mutation stays instance-local (all call sites rebind
+        # today; this makes the hazard impossible rather than avoided).
+        self._data["excluded"] = list(self._data["excluded"])
+        self._data["strat_memory"] = dict(self._data["strat_memory"])
         if data:
             clean = {k: v for k, v in data.items() if k in DEFAULTS}
             self._data.update(self._sanitize(clean))

@@ -90,13 +90,17 @@ class App:
                 pass
         except Exception:
             pass
+        self._log_file = os.path.join(self._log_dir, time.strftime("hookip_%Y%m%d_%H%M%S.hlog"))
+        self.log.attach_file(self._log_file)
+        # start the guard AFTER _log_file exists: the retention purge uses
+        # it as the never-delete name — a race here would make keep="" for
+        # a moment (harmless today: a fresh session log always has a fresh
+        # mtime, but the dependency should not be implicit)
         try:
             import threading as _th
             _th.Thread(target=self._startup_dataguard, daemon=True).start()
         except Exception:
             pass
-        self._log_file = os.path.join(self._log_dir, time.strftime("hookip_%Y%m%d_%H%M%S.hlog"))
-        self.log.attach_file(self._log_file)
         if getattr(self.log, "file_error", None):
             self.log.warn("Session log file could NOT be created — this "
                           "session is memory-only. Check disk space and "

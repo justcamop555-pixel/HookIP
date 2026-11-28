@@ -435,8 +435,13 @@ try:
           "settings.json.123.tmp" in removed and not os.path.isfile(stale_tmp),
           str(removed))
     check("sweep keeps settings.json", os.path.isfile(keep))
-    check("sweep is idempotent (no errors, empty result)",
-          dg.sweep_plaintext(d_sweep) == [], str(removed))
+    # idempotent for the APP-DIR leftovers (the %TEMP% toast sweep is
+    # global — another process could drop a new file between calls, so
+    # an empty second result would be a flaky assertion)
+    again = dg.sweep_plaintext(d_sweep)
+    check("sweep is idempotent (app-dir leftovers gone)",
+          "winhttp_backup.txt" not in again and
+          "settings.json.123.tmp" not in again, str(again))
 finally:
     shutil.rmtree(d_sweep, ignore_errors=True)
 

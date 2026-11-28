@@ -328,6 +328,10 @@ class Resolver:
         # how long past its expiry a cached DoH answer may be served as
         # stale when every resolver path fails (RFC 8767-style)
         self._STALE_MAX = 600
+        # host -> ts of the FIRST stale serve: the per-serve ttl-30 re-cache
+        # would otherwise extend the staleness window on every lookup, so
+        # total staleness is measured from the first serve and hard-capped
+        self._stale_since = {}
         self._pool_lock = threading.Lock()
         self._pool_max = profile().doh_pool_per_resolver  # hardware-scaled
         self._pending = {}                    # resolver -> conns being created
@@ -521,6 +525,7 @@ class Resolver:
         Called at most once per host at a time (in-flight coalescing)."""
         ips = []
         ttl = 120
+        stale_served = False     # the answer below came from the stale cache
         verified_neg = None    # trusted negative verdict string (NXDOMAIN / NODATA)
         doh_note = None        # detailed last DoH verdict (helps messaging)
         source = None          # where the winning answer came from (logging)
@@ -649,8 +654,20 @@ class Resolver:
                         if entry and now < entry[0] + self._STALE_MAX:
                             stale = entry
                 if stale:
+                    with self._lock:
+                        since = self._stale_since.get(host)
+                        if since is not None and now - since > self._STALE_MAX:
+                            # total-staleness cap: each serve re-caches with
+                            # ttl 30, which would stretch the window forever
+                            # — after STALE_MAX since the FIRST serve, stop
+                            self._stale_since.pop(host, None)
+                            stale = None
+                        elif since is None:
+                            self._stale_since[host] = now
+                if stale:
                     ips = list(stale[1])
                     ttl = 30      # brief — the resolver retries DoH soon
+                    stale_served = True
                     with self._lock:
                         self._neg_cache.pop(host, None)
                         self._cache[host] = (now + ttl, ips)
@@ -709,6 +726,12 @@ class Resolver:
         with self._lock:
             cap = profile().cache_cap
             neg_cap = profile().neg_cache_cap
+            if ips and not stale_served:
+                # a FRESH answer retires the stale-serving bookkeeping —
+                # the stale serve's own ttl-30 re-cache must NOT (it used
+                # to flow into this pop and erase the stamp in the same
+                # call, leaving the window unbounded again)
+                self._stale_since.pop(host, None)
             if len(self._cache) > cap:
                 # marathon sessions: drop expired entries first, then the
                 # oldest — the cache must never grow without bound
@@ -737,12 +760,15 @@ class Resolver:
     _CB_COOLDOWN = 300.0   # seconds
 
     def _cb_note(self, name, ok):
+        msg = None
+        lvl = None
         with self._lock:
             prev = self._cb_fail.get(name, 0)
             if ok:
                 if prev >= self._CB_FAILS:
-                    self.log.ok(f"DoH {name}: working again after "
-                                f"{prev} consecutive failures — back in rotation")
+                    msg = (f"DoH {name}: working again after {prev} "
+                           "consecutive failures — back in rotation")
+                    lvl = "ok"
                 self._cb_fail[name] = 0
                 self._cb_open.pop(name, None)
             else:
@@ -750,10 +776,15 @@ class Resolver:
                 self._cb_fail[name] = fails
                 if fails >= self._CB_FAILS and name not in self._cb_open:
                     self._cb_open[name] = time.time() + self._CB_COOLDOWN
-                    self.log.warn(
-                        f"DoH {name}: failed {fails}× in a row — paused "
-                        f"for {self._CB_COOLDOWN // 60} min (auto-retries; "
-                        "other resolvers keep serving)")
+                    msg = (f"DoH {name}: failed {fails}× in a row — paused "
+                           f"for {self._CB_COOLDOWN // 60} min (auto-retries; "
+                           "other resolvers keep serving)")
+                    lvl = "warn"
+        # LOG OUTSIDE the lock: the log sink writes to disk (fsync'd) —
+        # logging while holding the resolver's global lock stalls every
+        # concurrent lookup for the duration of the write
+        if msg:
+            self.log.warn(msg) if lvl == "warn" else self.log.ok(msg)
 
     def _cb_skip(self, name):
         """True when this resolver is in cooldown AND at least one other

@@ -811,8 +811,37 @@ def test_serve_stale_on_doh_outage():
     except ResolveError:
         check("doh disabled -> no serve-stale", True)
 
+    # total-staleness cap: repeated stale serves keep re-caching with ttl
+    # 30 — a per-lookup window would stretch forever. _stale_since is set
+    # on the first serve and hard-stops after _STALE_MAX since THEN.
+    r.cfg.doh_enabled = True
+    future_ts = now + 700          # > _STALE_MAX after the first serve
+    r._cache.clear(); r._neg_cache.clear(); r.log.lines.clear()
+    r._cache["cap.host.name"] = (now - 60, ["8.8.8.8"])
+    ips = r.resolve("cap.host.name")
+    check("stale serve #1 works and stamps _stale_since",
+          ips == ["8.8.8.8"] and "cap.host.name" in r._stale_since,
+          f"ips={ips} since={r._stale_since}")
+    # simulate a lookup far in the future: the re-cached (ttl 30) entry has
+    # long expired again, and > STALE_MAX has passed since the FIRST serve
+    r._cache["cap.host.name"] = (future_ts - 40, ["8.8.8.8"])
+    with mock.patch.object(dohmod.time, "time", lambda: future_ts):
+        try:
+            r.resolve("cap.host.name")
+            check("total staleness cap stops endless re-serving", False,
+                  "served past the cap")
+        except ResolveError:
+            check("total staleness cap stops endless re-serving", True)
+    check("cap bookkeeping cleared on refusal",
+          "cap.host.name" not in r._stale_since, str(r._stale_since))
+
 
 def test_circuit_breaker():
+    """3 consecutive transport failures cool a resolver down for 5 min
+    (demoted to the BACK of the hedge order, never skipped when everyone
+    is cooling); the first success resets it and logs the recovery."""
+    fail = OSError("blocked (simulated)")
+    scripts = {n: [fail] for n, _, _ in dohmod.RESOLVERS}
     """3 consecutive transport failures cool a resolver down for 5 min
     (demoted to the BACK of the hedge order, never skipped when everyone
     is cooling); the first success resets it and logs the recovery."""
