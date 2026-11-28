@@ -3,7 +3,7 @@
 # Release version — the number that is PUBLISHED on GitHub. Bump it only
 # when the release is actually uploaded; the updater compares this against
 # the latest GitHub tag.
-__version__ = "1.1.1"
+__version__ = "1.2.0"
 # Local build ID — identifies a build that may NOT be on GitHub yet
 # (dev/test builds). Leave "" for published builds; set something like
 # "20261127.1" for a local build so the updater can tell 'ahead of
