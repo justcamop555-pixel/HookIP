@@ -22,6 +22,7 @@ DEFAULTS = {
     "pac_token": "",              # stable PAC URL token (generated once)
     "upstream_proxy": "",         # network's own mandatory proxy (restricted Wi-Fi), "" = none
     "strat_memory": {},           # host -> ClientHello strategy that last worked (persisted)
+    "log_retention_days": 14,     # session logs older than this are purged; 0 = keep forever
 }
 
 
@@ -73,6 +74,9 @@ class Config:
         # the end, so the tail is the live set)
         if len(clean["strat_memory"]) > 256:
             clean["strat_memory"] = dict(list(clean["strat_memory"].items())[-256:])
+        lrd = clean.get("log_retention_days")
+        if not isinstance(lrd, int) or not (0 <= lrd <= 3650):
+            clean["log_retention_days"] = DEFAULTS["log_retention_days"]
         return clean
 
     # -- dict-style access ------------------------------------------------

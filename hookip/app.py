@@ -107,15 +107,23 @@ class App:
             marker = os.path.join(APP_DIR, "last_crash.txt")
             if os.path.isfile(marker):
                 with open(marker, encoding="utf-8") as fh:
-                    reason, ts = (fh.read().strip().split("\t", 1) + [""])[0:2]
+                    raw = fh.read()
+                # current format: encrypted (HKCFG1); a legacy plaintext
+                # marker (pre-hardening) is honored once
+                if raw.startswith("HKCFG1:"):
+                    from . import dataguard
+                    plain = dataguard.decrypt_bytes(raw)
+                    raw = plain.decode("utf-8") if plain is not None else ""
+                reason, ts = (raw.strip().split("\t", 1) + [""])[0:2]
                 try:
                     os.remove(marker)
                 except OSError:
                     pass
-                self.log.warn(f"Last session ended unexpectedly "
-                              f"({reason or 'crash'}) at {ts} — crash "
-                              "protection restored your internet. This "
-                              "session is a fresh start.")
+                if reason or ts:
+                    self.log.warn(f"Last session ended unexpectedly "
+                                  f"({reason or 'crash'}) at {ts} — crash "
+                                  "protection restored your internet. This "
+                                  "session is a fresh start.")
         except OSError:
             pass
         self._hook_exception_logging()
@@ -220,6 +228,22 @@ class App:
             else:
                 self.log.debug("Data guard: folder ACL hardened (current user + "
                                "SYSTEM only).")
+            # plaintext-hygiene sweep: delete known legacy leftovers the
+            # current code never reads (winhttp_backup.txt from the old
+            # version, stale settings tmp files, old toast scripts)
+            swept = dataguard.sweep_plaintext(APP_DIR)
+            if swept:
+                self.log.ok("Data guard: removed " + ", ".join(swept))
+            # retention: old session logs are a years-deep browsing history
+            # — keep the default window only (config: log_retention_days)
+            days = int(getattr(self.cfg, "log_retention_days", 14) or 0)
+            if days:
+                gone = logutil.purge_old_logs(
+                    os.path.join(APP_DIR, "logs"), days,
+                    keep=os.path.basename(getattr(self, "_log_file", "") or ""))
+                if gone:
+                    self.log.ok(f"Log retention: removed {len(gone)} session "
+                                f"log(s) older than {days} days")
         except Exception as exc:  # noqa: BLE001 — the guard must never block startup
             self.log.debug(f"Data guard bootstrap skipped: {type(exc).__name__}: {exc}")
 
@@ -1563,11 +1587,14 @@ class App:
         net_proxy = winproxy.detect_network_proxy(prev)
         cfg.upstream_proxy = net_proxy
         if net_proxy:
-            self.log.ok(f"This network requires its own proxy ({net_proxy}) — "
+            # credentials never reach logs/toasts: a detected corporate
+            # proxy can embed user:pass@ — mask before display
+            shown = winproxy.mask_proxy(net_proxy)
+            self.log.ok(f"This network requires its own proxy ({shown}) — "
                         "HookIP will tunnel through it automatically.")
             notify.notify("HookIP — restricted network detected",
                           f"Your Wi-Fi only allows traffic through its own "
-                          f"proxy ({net_proxy}). HookIP now chains through "
+                          f"proxy ({shown}). HookIP now chains through "
                           "it, so sites keep working.", timeout_s=12)
         try:
             self.proxy = ProxyServer(cfg, self.log, self.stats, self.pac_token)

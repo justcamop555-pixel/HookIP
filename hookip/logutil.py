@@ -11,6 +11,43 @@ from .perf import profile
 LEVEL_RANK = {"debug": 0, "info": 1, "ok": 1, "warn": 2, "error": 3}
 
 
+def purge_old_logs(log_dir, days, keep=""):
+    """Delete session log files older than `days` (mtime-based).
+
+    Old .hlog files are encrypted, but encryption limits WHO can read a
+    stolen file — not how LONG a years-deep browsing-history trove sits
+    around waiting to be stolen. Retention is the privacy control that
+    bounds the blast radius.
+
+    `keep` is the CURRENT session's basename — never removed even if its
+    mtime somehow reads old. Legacy .log/.migrating leftovers age out with
+    the same clock. Returns the basenames removed. Never raises.
+    """
+    import glob as _glob
+    import time as _time
+    removed = []
+    if not days or not log_dir or not os.path.isdir(log_dir):
+        return removed
+    cutoff = _time.time() - days * 86400
+    patterns = (os.path.join(log_dir, "hookip_*.hlog"),
+                os.path.join(log_dir, "hookip_*.log"),
+                os.path.join(log_dir, "hookip_*.log.migrating"))
+    seen = set()
+    for pat in patterns:
+        for p in _glob.glob(pat):
+            b = os.path.basename(p)
+            if b in seen or b == keep or b == f"{keep}.migrating":
+                continue
+            seen.add(b)
+            try:
+                if os.path.getmtime(p) < cutoff:
+                    os.remove(p)
+                    removed.append(b)
+            except OSError:
+                pass
+    return removed
+
+
 class Log:
     def __init__(self, maxlen=None):
         # default buffer scales with the hardware tier (perf.py): a 2-core

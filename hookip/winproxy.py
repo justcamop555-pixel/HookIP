@@ -120,12 +120,38 @@ def notify_shell():
     threading.Thread(target=_send, daemon=True).start()
 
 
+_CRED_RE = None  # compiled lazily in mask_proxy (import-time cost)
+
+
+def mask_proxy(proxy):
+    """Mask embedded credentials in a proxy string before it reaches any
+    log, toast or diagnostics line. Handles scheme URLs
+    ('http://user:pass@corp:8080'), per-scheme entries ('socks=user:pass@h:p')
+    and the IE ProxyServer list format ('u:p@h:8080;socks=proxy:1080') —
+    per-segment and @-anchored, so a plain 'host:port' never matches."""
+    import re
+    global _CRED_RE
+    if _CRED_RE is None:
+        _CRED_RE = re.compile(r"([^/:@]+):([^@]+)@")
+
+    def _seg(seg):
+        # strip a 'scheme://' or 'scheme=' prefix first so the scheme colon
+        # is never mistaken for the user:pass separator
+        m = re.match(r"^(\w+://|\w+=)(.*)$", seg, re.S)
+        prefix, rest = (m.group(1), m.group(2)) if m else ("", seg)
+        if "@" in rest:
+            rest = _CRED_RE.sub(r"\1:***@", rest, count=1)
+        return prefix + rest
+
+    return ";".join(_seg(seg) for seg in str(proxy or "").split(";"))
+
+
 def describe(vals):
     if not vals or not vals.get("ProxyEnable") and not vals.get("AutoConfigURL"):
         return "direct connection (no proxy)"
     parts = []
     if vals.get("ProxyEnable"):
-        parts.append(f"manual proxy {vals.get('ProxyServer')}")
+        parts.append(f"manual proxy {mask_proxy(vals.get('ProxyServer'))}")
     if vals.get("AutoConfigURL"):
         parts.append(f"PAC {vals['AutoConfigURL']}")
     if vals.get("ProxyOverride"):
@@ -142,8 +168,15 @@ def backup():
     if has_backup() and _is_ours(cur):
         return
     os.makedirs(_app_dir(), exist_ok=True)
+    # ENCRYPTED at rest (HKCFG1): the backup holds the user's ORIGINAL
+    # system-proxy config — corporate ProxyServer strings can embed
+    # credentials (user:pass@proxy:8080) and ProxyOverride lists internal
+    # hostnames. In plaintext this file was the single most profile-able
+    # object HookIP wrote.
+    from . import dataguard
+    blob = dataguard.encrypt_bytes(json.dumps(cur).encode("utf-8"))
     with open(BACKUP_PATH, "w", encoding="utf-8") as fh:
-        json.dump(cur, fh)
+        fh.write(blob)
     _write_restore_cmd(cur)
 
 
@@ -154,8 +187,27 @@ def has_backup():
 def restore_from_file(path=BACKUP_PATH):
     try:
         with open(path, "r", encoding="utf-8") as fh:
-            vals = json.load(fh)
-    except (OSError, ValueError):
+            raw = fh.read()
+    except OSError:
+        return False
+    # current format: encrypted (HKCFG1). A legacy plaintext backup is
+    # honored once (restore is best-effort and the file is removed
+    # afterwards either way) — fail-closed on unreadable ours-format blobs
+    vals = None
+    if raw.startswith("HKCFG1:"):
+        from . import dataguard
+        plain = dataguard.decrypt_bytes(raw)
+        if plain is not None:
+            try:
+                vals = json.loads(plain.decode("utf-8"))
+            except ValueError:
+                vals = None
+    else:
+        try:
+            vals = json.loads(raw)   # legacy plaintext backup
+        except ValueError:
+            vals = None
+    if not isinstance(vals, dict):
         return False
     _write(vals)
     try:
@@ -330,10 +382,15 @@ def _is_ours(vals):
 
 
 def _write_restore_cmd(vals):
+    # NOTE: ProxyServer values that embed credentials are MASKED here — the
+    # cmd is a plaintext recovery artifact by nature (reg.exe must read it)
+    # and used to copy user:pass@proxy strings to disk. The address
+    # survives a crash-restore; auth re-prompts. The complete unmasked
+    # values live only in the ENCRYPTED proxy backup.
     lines = ["@echo off"]
     lines.append(f'reg add "HKCU\\{KEY_PATH}" /v ProxyEnable /t REG_DWORD /d {1 if vals.get("ProxyEnable") else 0} /f')
     if vals.get("ProxyServer"):
-        lines.append(f'reg add "HKCU\\{KEY_PATH}" /v ProxyServer /t REG_SZ /d "{vals["ProxyServer"]}" /f')
+        lines.append(f'reg add "HKCU\\{KEY_PATH}" /v ProxyServer /t REG_SZ /d "{mask_proxy(vals["ProxyServer"])}" /f')
     else:
         lines.append(f'reg delete "HKCU\\{KEY_PATH}" /v ProxyServer /f >nul 2>&1')
     if vals.get("ProxyOverride"):

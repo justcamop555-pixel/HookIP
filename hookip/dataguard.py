@@ -31,6 +31,12 @@ Guard, in layers (all stdlib/ctypes, still no admin):
    an existing .hlog is never overwritten.
 5. ENTROPY UPGRADE: one-time re-encryption of log lines and settings
    that were still written with the legacy static entropy.
+6. PLAINTEXT HYGIENE: a startup sweep deletes plaintext leftovers the
+   current code never reads (older versions' winhttp dumps, stale temp
+   scripts); the crash marker, the system-proxy backup and restore.cmd
+   credentials are encrypted/masked at the source; session logs age out
+   after a retention window (default 14 days) instead of hoarding a
+   years-deep browsing history forever.
 
 Why the per-install key: the original entropy was a constant in the
 public source AND inside the exe, so any generic DPAPI decryptor — or
@@ -711,3 +717,58 @@ def _has_marker(lines, src_sha):
         if is_marker(v) and _MARKER_RE.match(v.strip()).group(1) == src_sha:
             return True
     return False
+
+
+# ------------------------------------------------- plaintext hygiene sweep
+_SWEEP_FILES = ("winhttp_backup.txt",)   # legacy SNIper-era leftovers
+
+
+def sweep_plaintext(app_dir):
+    """Delete known plaintext leftovers the current code never reads.
+
+    Threat model: an infostealer bulk-copies folders and greps them. Every
+    plaintext byte HookIP ever wrote still lying around is a free find even
+    after everything else is encrypted. Best-effort, never raises; returns
+    the basenames it removed (for the session log).
+
+    Currently swept:
+    - winhttp_backup.txt        (older version's plaintext winhttp dump)
+    - settings.json.*.tmp       (stale atomic-save temp files; encrypted
+                                 content, but hygiene)
+    - %TEMP% hookip_toast_*.ps1 (toast scripts older than 24 h; new ones
+                                 self-delete after running)
+    """
+    import glob as _glob
+    import time as _time
+    removed = []
+    for name in _SWEEP_FILES:
+        p = os.path.join(app_dir, name)
+        try:
+            if os.path.isfile(p):
+                os.remove(p)
+                removed.append(name)
+        except OSError:
+            pass
+    try:
+        for p in _glob.glob(os.path.join(app_dir, "settings.json.*.tmp")):
+            try:
+                os.remove(p)
+                removed.append(os.path.basename(p))
+            except OSError:
+                pass
+    except OSError:
+        pass
+    try:
+        tmpdir = os.environ.get("TEMP") or os.path.join(
+            os.path.expanduser("~"), "AppData", "Local", "Temp")
+        day_ago = _time.time() - 86400
+        for p in _glob.glob(os.path.join(tmpdir, "hookip_toast_*.ps1")):
+            try:
+                if os.path.getmtime(p) < day_ago:
+                    os.remove(p)
+                    removed.append(os.path.basename(p))
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return removed

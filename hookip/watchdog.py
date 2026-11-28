@@ -81,11 +81,17 @@ def _log_marker(backup_path, reason):
     Never raises."""
     appdir = os.path.dirname(backup_path)
     try:
+        # ENCRYPTED at rest (HKCFG1): the reason is an exception string and
+        # can carry hostnames from the failing operation — in plaintext the
+        # marker was a small but greppable leak sitting in the app dir.
+        from . import dataguard as _dg
+        blob = _dg.encrypt_bytes(
+            f"{reason or 'stopped unexpectedly'}\t"
+            f"{time.strftime('%Y-%m-%d %H:%M:%S')}\n".encode("utf-8"))
         with open(os.path.join(appdir, "last_crash.txt"), "w",
                   encoding="utf-8") as fh:
-            fh.write(f"{reason or 'stopped unexpectedly'}\t"
-                     f"{time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-    except OSError:
+            fh.write(blob)
+    except Exception:
         pass
     try:
         import glob as _glob

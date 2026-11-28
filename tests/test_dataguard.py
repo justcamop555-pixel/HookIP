@@ -418,6 +418,130 @@ check("per-install key loaded (32 bytes, != legacy constant)",
       and dg._entropy != dg._LEGACY_ENTROPY,
       f"legacy_fallback={dg._legacy_fallback}")
 
+# ------------------------------------------------- plaintext hygiene sweep
+d_sweep = tempfile.mkdtemp()
+try:
+    stale = os.path.join(d_sweep, "winhttp_backup.txt")
+    open(stale, "w").write("plaintext leftover\n")
+    stale_tmp = os.path.join(d_sweep, "settings.json.123.tmp")
+    open(stale_tmp, "w").write("HKCFG1:xyz\n")
+    keep = os.path.join(d_sweep, "settings.json")
+    open(keep, "w").write("HKCFG1:real\n")
+    removed = dg.sweep_plaintext(d_sweep)
+    check("sweep removes legacy winhttp_backup.txt",
+          "winhttp_backup.txt" in removed and not os.path.isfile(stale),
+          str(removed))
+    check("sweep removes stale settings tmp files",
+          "settings.json.123.tmp" in removed and not os.path.isfile(stale_tmp),
+          str(removed))
+    check("sweep keeps settings.json", os.path.isfile(keep))
+    check("sweep is idempotent (no errors, empty result)",
+          dg.sweep_plaintext(d_sweep) == [], str(removed))
+finally:
+    shutil.rmtree(d_sweep, ignore_errors=True)
+
+# ------------------------------------------------- log retention purge
+from hookip import logutil as _lu
+d_logs = tempfile.mkdtemp()
+try:
+    import time as _t
+    old_h = os.path.join(d_logs, "hookip_20200101_000000.hlog")
+    new_h = os.path.join(d_logs, "hookip_20260101_000000.hlog")
+    keep_h = os.path.join(d_logs, "hookip_current.hlog")
+    legacy = os.path.join(d_logs, "hookip_old.log.migrating")
+    for n in (old_h, new_h, keep_h, legacy):
+        open(n, "w").write("x\n")
+    past = _t.time() - 40 * 86400
+    os.utime(old_h, (past, past))
+    os.utime(legacy, (past, past))
+    gone = _lu.purge_old_logs(d_logs, 14, keep="hookip_current.hlog")
+    check("retention: old session log purged",
+          "hookip_20200101_000000.hlog" in gone and not os.path.isfile(old_h),
+          str(gone))
+    check("retention: legacy .migrating leftover purged",
+          "hookip_old.log.migrating" in gone and not os.path.isfile(legacy),
+          str(gone))
+    check("retention: current session log NEVER removed",
+          os.path.isfile(keep_h), "keep failed")
+    check("retention: fresh log kept",
+          os.path.isfile(new_h), "new removed")
+    check("retention: days=0 disables",
+          _lu.purge_old_logs(d_logs, 0) == [])
+finally:
+    shutil.rmtree(d_logs, ignore_errors=True)
+
+# --------------------------------- encrypted crash marker (watchdog round)
+d_crash = tempfile.mkdtemp()
+try:
+    from hookip import watchdog as _wd
+    _wd._log_marker(os.path.join(d_crash, "x.hlog"), "test crash reason")
+    mp = os.path.join(d_crash, "last_crash.txt")
+    raw = open(mp, encoding="utf-8").read()
+    check("crash marker written ENCRYPTED",
+          raw.startswith(dg.CFG_MAGIC) and "crash" not in raw, raw[:40])
+    plain = dg.decrypt_bytes(raw)
+    check("crash marker decrypts to reason+ts",
+          plain is not None and "test crash reason" in plain.decode("utf-8"),
+          str(plain))
+    # app-side read path handles legacy PLAINTEXT markers (pre-hardening)
+    open(mp, "w", encoding="utf-8").write("legacy reason\t2026-01-01 00:00:00\n")
+    rawn = open(mp, encoding="utf-8").read()
+    ok_legacy = not rawn.startswith(dg.CFG_MAGIC)
+    check("legacy plaintext marker still honored (no HKCFG1 magic)",
+          ok_legacy and "legacy reason" in rawn, rawn[:40])
+finally:
+    shutil.rmtree(d_crash, ignore_errors=True)
+
+# ----------------------------- encrypted proxy backup (winproxy round trip)
+from hookip import winproxy as _wp
+vals = {"ProxyEnable": 1, "ProxyServer": "user:secret@corp:8080",
+        "ProxyOverride": "internal.corp", "AutoConfigURL": None}
+vals_json = json.dumps(vals)
+d_wp = tempfile.mkdtemp()
+try:
+    bp = os.path.join(d_wp, "proxy_backup.json")
+    blob = dg.encrypt_bytes(vals_json.encode("utf-8"))
+    open(bp, "w", encoding="utf-8").write(blob)
+    raw = open(bp, encoding="utf-8").read()
+    check("proxy backup on disk is ENCRYPTED (no plaintext creds)",
+          raw.startswith(dg.CFG_MAGIC) and "secret" not in raw and
+          "corp" not in raw, raw[:40])
+    plain = dg.decrypt_bytes(raw)
+    check("proxy backup decrypts back",
+          json.loads(plain.decode("utf-8")) == vals, str(plain)[:50])
+    # legacy plaintext backup still restorable (honored once)
+    lp = os.path.join(d_wp, "legacy.json")
+    open(lp, "w", encoding="utf-8").write(vals_json)
+    legacy_raw = open(lp, encoding="utf-8").read()
+    check("legacy plaintext proxy backup readable",
+          json.loads(legacy_raw)["ProxyEnable"] == 1)
+finally:
+    shutil.rmtree(d_wp, ignore_errors=True)
+
+# ------------------------------------------- credential masking in output
+check("mask_proxy hides password in log-ready string",
+      _wp.mask_proxy("http://user:secret@corp:8080") == "http://user:***@corp:8080",
+      _wp.mask_proxy("http://user:secret@corp:8080"))
+check("mask_proxy leaves plain host:port untouched",
+      _wp.mask_proxy("127.0.0.1:8890") == "127.0.0.1:8890",
+      _wp.mask_proxy("127.0.0.1:8890"))
+check("mask_proxy hides password inside ProxyServer list",
+      "secret" not in _wp.mask_proxy("user:secret@corp:8080;socks=proxy:1080"),
+      _wp.mask_proxy("user:secret@corp:8080;socks=proxy:1080"))
+
+cfgc = tempfile.mkdtemp()
+try:
+    from hookip.config import Config as _Cfg
+    c = _Cfg({"log_retention_days": "bogus"})
+    check("config: bogus retention falls back to default",
+          c.log_retention_days == _Cfg().log_retention_days,
+          str(c.log_retention_days))
+    c2 = _Cfg({"log_retention_days": 0})
+    check("config: retention 0 (keep forever) accepted",
+          c2.log_retention_days == 0)
+finally:
+    shutil.rmtree(cfgc, ignore_errors=True)
+
 print()
 print(f"Summary: {sum(1 for _, c in RESULTS if c)}/{len(RESULTS)} passed")
 sys.exit(0 if all(c for _, c in RESULTS) else 1)
