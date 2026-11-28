@@ -241,9 +241,14 @@ def _unprotect_once(blob, ent_blob):
 def _crypt(data, decrypt):
     if decrypt:
         _load_key()
+        ent = _ENTROPY_BLOB
+        if ent is None:
+            # same guard as the encrypt path: _load_key() always assigns
+            # this; failing loudly beats a None deref inside ctypes
+            raise OSError("dataguard: per-install key unavailable")
         # current key first (one call in the common case); pre-upgrade
         # blobs fall back to the legacy static entropy
-        out = _unprotect_once(data, _ENTROPY_BLOB)
+        out = _unprotect_once(data, ent)
         if out is None and not _legacy_fallback and _entropy != _LEGACY_ENTROPY:
             out = _unprotect_once(data, _LEGACY_BLOB)
         if out is None:
@@ -251,10 +256,15 @@ def _crypt(data, decrypt):
                           "decryptable with the per-install or legacy key")
         return out
     _load_key()
+    ent = _ENTROPY_BLOB
+    if ent is None:
+        # unprovable-by-inference: _load_key() always assigns this — but
+        # if it somehow did not, failing loudly beats a None deref in C
+        raise OSError("dataguard: per-install key unavailable")
     pin, keep_in = _blob(data)
     pout = _DATA_BLOB()
     ok = _crypt32.CryptProtectData(ctypes.byref(pin), None,
-                                   ctypes.byref(_ENTROPY_BLOB),
+                                   ctypes.byref(ent),
                                    None, None,
                                    _CRYPTPROTECT_UI_FORBIDDEN,
                                    ctypes.byref(pout))
@@ -649,8 +659,10 @@ def migrate_plaintext_logs(log_dir):
                 # claim first: locked source -> rename fails -> skip,
                 # write nothing (a crash after this point leaves a
                 # finishable .migrating file, handled on the next run
-                # as a leftover entry)
-                os.replace(src, migrating)
+                # as a leftover entry). A fresh local (not the branch-
+                # shared `src`, which is None on the leftover path) keeps
+                # the rename provably str-typed.
+                os.replace(os.path.join(log_dir, name), migrating)
             with open(migrating, "rb") as fh:
                 raw = fh.read()
             src_sha = hashlib.sha256(raw).hexdigest()   # over the RAW bytes
@@ -714,7 +726,11 @@ def _has_marker(lines, src_sha):
     idempotency marker carrying the same source-file sha256."""
     for ex in lines:
         v = decrypt_line(ex)
-        if is_marker(v) and _MARKER_RE.match(v.strip()).group(1) == src_sha:
+        # is_marker(v) implies v is a plain str (UNREADABLE/None are
+        # falsy/non-str) — but proving that to a checker needs the str
+        # test spelled out here too
+        if isinstance(v, str) and is_marker(v) and \
+                _MARKER_RE.match(v.strip()).group(1) == src_sha:
             return True
     return False
 
