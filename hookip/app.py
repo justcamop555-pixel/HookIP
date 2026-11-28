@@ -518,6 +518,9 @@ class App:
         latest, url, offline, asset, sha_asset, prerelease = (None, None, False,
                                                               None, None, False)
         body = None
+        http_error = None          # HTTP status / 0 for a bad body — never
+                                   # an 'offline' verdict (the network was
+                                   # reachable enough to answer)
 
         def fetch(req, timeout=10):
             # The system proxy may point at HookIP itself; if the request
@@ -566,6 +569,7 @@ class App:
                         sha_asset = a.get("browser_download_url")
         except urllib.error.HTTPError as exc:
             offline = exc.code in (403, 429, 500, 502, 503)
+            http_error = exc.code   # NOT 'offline': the network answered
             # 404: private repo — try the redirect form (works once public)
             if latest is None:
                 tag = redirect_fallback()
@@ -592,8 +596,9 @@ class App:
             # malformed API response must not kill the worker (it used to
             # leave the update check permanently stuck on 'already running')
             offline = True
+            http_error = 0          # bad response, not offline
         self._ui_queue.put(("update", (latest, url, offline, asset,
-                                       sha_asset, prerelease, body)))
+                                       sha_asset, prerelease, body, http_error)))
 
     @staticmethod
     def _ver_tuple(s):
@@ -612,21 +617,35 @@ class App:
             return (0,)
 
     def _update_result(self, latest, url, offline=False, asset=None,
-                       sha_asset=None, prerelease=False, body=None):
+                       sha_asset=None, prerelease=False, body=None,
+                       http_error=None):
         self._update_running = False
         try:
             if not latest:
                 stamp = time.strftime(" · checked %H:%M")
-                if offline:
+                if offline and http_error is not None:
+                    # FALSE-POSITIVE FIX: an HTTP answer means the network
+                    # is UP — 403/429/5xx and malformed bodies are not
+                    # 'offline'. Say what actually happened.
+                    why = (f"HTTP {http_error}" if http_error
+                           else "bad response")
+                    self.update_label.configure(
+                        text=f"update check failed ({why}) — will retry" + stamp,
+                        fg=MUTED)
+                    self.log.debug(f"Update check failed ({why}); "
+                                   "will re-check in 30 min.")
+                elif offline:
                     self.update_label.configure(
                         text="offline — will re-check later" + stamp, fg=MUTED)
+                    self.log.debug("Update check: no reachable release info "
+                                   "(offline).")
                 else:
                     self.update_label.configure(
                         text="private repo — works once public" + stamp, fg=MUTED)
+                    self.log.debug("Update check: no reachable release info "
+                                   "(private repo).")
                 self.update_pill.configure(text="", fg=MUTED)
                 self._dl_btn.pack_forget()
-                self.log.debug("Update check: no reachable release info "
-                               + ("(offline)." if offline else "(private repo)."))
                 # offline is usually transient (or our own tunnel mid-restart)
                 # — re-check in 30 min instead of waiting 12 h (cancels any
                 # pending timer first; this path used to stack timers)
@@ -1520,11 +1539,31 @@ class App:
             self.log.error(f"Cannot read proxy settings: {exc}")
             return
         try:
-            if winproxy.has_backup() and winproxy.restore_from_file():
-                self.log.ok("Internet restored: system proxy set back to your "
-                            "previous settings.")
-                notify.notify("HookIP — internet restored",
-                              "Windows points at your original connection again.")
+            if winproxy.has_backup():
+                if winproxy._is_ours(cur, self.cfg.port, self.pac_token):
+                    # the system still points at HookIP: the backup is the
+                    # real fix
+                    if winproxy.restore_from_file():
+                        self.log.ok("Internet restored: system proxy set back "
+                                    "to your previous settings.")
+                        notify.notify("HookIP — internet restored",
+                                      "Windows points at your original "
+                                      "connection again.")
+                    else:
+                        self.log.error("Restore failed — the backup could not "
+                                       "be applied (see log).")
+                else:
+                    # FALSE-POSITIVE GUARD: a backup exists but the system
+                    # proxy no longer points at HookIP — the user (or
+                    # another tool) already fixed it manually. Restoring
+                    # the stale backup would CLOBBER their config. Drop
+                    # the backup, touch nothing else.
+                    winproxy.discard_backup()
+                    winproxy.clear_runonce()
+                    self.log.ok("Stale proxy backup discarded — the system "
+                                "proxy no longer points at HookIP, so there "
+                                "is nothing to restore. Your current "
+                                "settings were left untouched.")
             elif winproxy._is_ours(cur, self.cfg.port, self.pac_token):
                 winproxy.remove_proxy()
                 self.log.ok("Internet restored: HookIP proxy settings cleared "
@@ -1637,8 +1676,14 @@ class App:
                 winproxy.apply_pac(cfg.port, self.pac_token)
             else:
                 winproxy.apply_both(cfg.port, self.pac_token, bypass=bypass)
-            self.watchdog.start(cfg.port)
+            # RunOnce FIRST: from the moment the registry points at HookIP,
+            # a crash needs a recovery path — the watchdog covers the
+            # running window, RunOnce covers the sign-in after a power
+            # loss, but between apply_* and watchdog.start there was NO
+            # recovery at all (a crash in those milliseconds left the
+            # system proxy pointing at a dead port with nothing to fix it).
             winproxy.set_runonce()
+            self.watchdog.start(cfg.port)
             self.log.ok("System proxy configured.")
             # the watchdog can die at birth (AV heuristic, broken cwd) and
             # respawns once internally — 'crash protection active' used to
@@ -2058,6 +2103,27 @@ class App:
                 else:
                     self._wd_restarts = 0
                     self._wd_cap_warned = False   # healthy again — re-arm
+                # DESYNC WATCH (crash-safety mirror): while HookIP is
+                # running, the system proxy MUST point at its port. A
+                # watchdog-forced restore, another tool changing the
+                # setting, or a group-policy refresh silently takes
+                # HookIP OUT of the path — the UI keeps saying 'running'
+                # while traffic flows direct. Poll the registry every dash
+                # tick (a registry read is ~µs) and warn throttled.
+                try:
+                    cur = winproxy.read_current()
+                except OSError:
+                    cur = None
+                if cur is not None and not winproxy._is_ours(
+                        cur, self.cfg.port, self.pac_token):
+                    now_ts = time.time()
+                    if now_ts - getattr(self, "_desync_warn_at", 0) > 300:
+                        self._desync_warn_at = now_ts
+                        self.log.warn(
+                            "System proxy no longer points at HookIP "
+                            "(changed externally or restored by crash "
+                            "protection) — traffic is bypassing HookIP. "
+                            "Press ⏹ Stop, then ▶ Start to re-arm.")
             if self.root.state() == "normal":
                 self._draw_spark()
             if self.root.state() != "normal":

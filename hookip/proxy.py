@@ -677,11 +677,14 @@ class ProxyServer:
             if alt not in strategies:
                 strategies.append(alt)
         if excl:
-            strategies = [strategies[0]]   # excluded hosts: single attempt, no retry noise
+            # excluded hosts: single attempt, no retry noise (strategies is
+            # never empty — cfg.strategy is validated — but slicing keeps
+            # the IndexError impossible rather than incidental)
+            strategies = strategies[:1]
         elif self._recent_fail(host):
             # this host failed everything moments ago — one attempt instead of
             # re-burning 3 full strategy cycles on every new connection
-            strategies = [strategies[0]]
+            strategies = strategies[:1]
 
         last_err = None
         attempt_errors = []

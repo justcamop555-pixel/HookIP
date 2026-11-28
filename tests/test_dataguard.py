@@ -655,6 +655,63 @@ try:
               str(os.listdir(d_bp)))
     finally:
         shutil.rmtree(d_bp, ignore_errors=True)
+
+    # 9. false-positive guards (crash-safety round)
+    # backup() atomic write produces a DECRYPTABLE backup (no truncation)
+    d_bp2 = _tf.mkdtemp()
+    try:
+        with _mock.patch.object(_wpx, "BACKUP_PATH",
+                                os.path.join(d_bp2, "proxy_backup.json")), \
+             _mock.patch.object(_wpx, "_write_restore_cmd", lambda vals: None):
+            _wpx.backup()
+            raw = open(os.path.join(d_bp2, "proxy_backup.json"),
+                       encoding="utf-8").read()
+            check("atomic backup() decrypts back (no truncation)",
+                  raw.startswith(dg.CFG_MAGIC)
+                  and dg.decrypt_bytes(raw) is not None, raw[:30])
+            # discard_backup deletes WITHOUT applying (inside the
+            # BACKUP_PATH patch — touching the real backup would be a bug)
+            check("discard_backup removes the file",
+                  _wpx.discard_backup()
+                  and not os.path.isfile(
+                      os.path.join(d_bp2, "proxy_backup.json")))
+            check("discard_backup tolerates a missing file",
+                  _wpx.discard_backup() is False)
+    finally:
+        shutil.rmtree(d_bp2, ignore_errors=True)
+
+    # 10. update-check verdict wording: an HTTP answer is NOT 'offline'
+    from hookip import app as _app
+    class _FakeLbl:
+        def __init__(self): self.text = ""
+        def configure(self, **kw): self.text = kw.get("text", self.text)
+    class _FakeBtn:
+        def pack_forget(self): pass
+    fake_app = types.SimpleNamespace(
+        _update_running=True, update_label=_FakeLbl(),
+        update_pill=_FakeLbl(), _dl_btn=_FakeBtn(),
+        log=types.SimpleNamespace(
+            debug=lambda *a, **k: None, ok=lambda *a, **k: None,
+            warn=lambda *a, **k: None, error=lambda *a, **k: None),
+        _update_manual=False,
+        _schedule_update_recheck=lambda ms: None,
+        _update_url=None, _update_asset=None, _update_sha=None,
+        _update_body=None, _update_prerelease=False,
+        _dl_btn_packed=False)
+    _app.App._update_result(fake_app, None, None, offline=True,
+                            http_error=429)
+    check("HTTP 429 is NOT reported as offline",
+          "429" in fake_app.update_label.text
+          and "offline" not in fake_app.update_label.text,
+          fake_app.update_label.text)
+    _app.App._update_result(fake_app, None, None, offline=True,
+                            http_error=0)
+    check("malformed body reported as bad response, not offline",
+          "bad response" in fake_app.update_label.text,
+          fake_app.update_label.text)
+    _app.App._update_result(fake_app, None, None, offline=True)
+    check("true offline still says offline",
+          "offline" in fake_app.update_label.text, fake_app.update_label.text)
     check("config: bogus retention falls back to default",
           c.log_retention_days == _Cfg().log_retention_days,
           str(c.log_retention_days))

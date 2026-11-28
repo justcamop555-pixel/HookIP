@@ -221,6 +221,27 @@ def has_backup():
     return os.path.isfile(BACKUP_PATH)
 
 
+def discard_backup(path=None):
+    """Delete a stale proxy backup WITHOUT applying it.
+
+    False-positive guard: a backup exists whenever a session did not end
+    cleanly — but the user (or another tool) may have already fixed the
+    system proxy manually. Restoring the stale backup over their manual
+    config would silently CLOBBER it. When the registry no longer points
+    at HookIP, the right move is to drop the backup."""
+    # default bound at CALL time: a def-time default would freeze the
+    # module constant forever (tests redirect BACKUP_PATH; the same
+    # frozen-default pattern in restore_from_file is kept for API
+    # stability — there it is equivalent in production)
+    if path is None:
+        path = BACKUP_PATH
+    try:
+        os.remove(path)
+        return True
+    except OSError:
+        return False
+
+
 def restore_from_file(path=BACKUP_PATH):
     try:
         with open(path, "r", encoding="utf-8") as fh:
