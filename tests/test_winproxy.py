@@ -297,6 +297,73 @@ finally:
     import shutil as _sh5
     _sh5.rmtree(d, ignore_errors=True)
 
+
+# 7. looks_like_ours: self-identifying PAC URL, last resort only
+check("our PAC URL recognized",
+      wpx.looks_like_ours({"AutoConfigURL": "http://127.0.0.1:8931/hookip-tk.pac"}))
+check("foreign PAC not matched",
+      wpx.looks_like_ours({"AutoConfigURL": "http://127.0.0.1:8080/other.pac"}) is False)
+check("non-pac not matched",
+      wpx.looks_like_ours({"AutoConfigURL": "http://host/hookip-x"}) is False)
+check("empty vals not matched", wpx.looks_like_ours(None) is False)
+check("plain manual proxy not matched",
+      wpx.looks_like_ours({"ProxyServer": "127.0.0.1:8931"}) is False)
+
+# 8. restore_from_cmd: parses the recovery script _write_restore_cmd wrote
+d = tempfile.mkdtemp()
+try:
+    rc = os.path.join(d, "restore.cmd")
+    vals_in = {"ProxyEnable": 1, "ProxyServer": "user:pw@proxy.corp:8080",
+               "ProxyOverride": "foo.com;bar.com",
+               "AutoConfigURL": "http://pac/corp.pac"}
+    writes = []
+    with mock.patch.object(wpx, "RESTORE_CMD", rc),          mock.patch.object(wpx, "_write", lambda v: writes.append(dict(v))):
+        wpx._write_restore_cmd(vals_in)
+        check("restore_from_cmd applies the script's values",
+              wpx.restore_from_cmd() is True and len(writes) == 1,
+              str(writes))
+        got = writes[0]
+        check("ProxyEnable parsed as int", got["ProxyEnable"] == 1, str(got))
+        check("credentials were stripped by the script writer",
+              got["ProxyServer"] == "proxy.corp:8080", str(got.get("ProxyServer")))
+        check("ProxyOverride survived quoting", got["ProxyOverride"] == "foo.com;bar.com",
+              str(got.get("ProxyOverride")))
+        check("AutoConfigURL parsed", got["AutoConfigURL"] == "http://pac/corp.pac")
+    # a DIRECT original: only deletes in the script (lines built from the
+    # real KEY_PATH so no backslash-escaping guesswork is involved)
+    kp = wpx.KEY_PATH
+    _add = lambda name, typ, val: (
+        'reg add "HKCU\\' + kp + '" /v ' + name + ' /t REG_' + typ
+        + ' /d "' + val + '" /f')
+    _del = lambda name: (
+        'reg delete "HKCU\\' + kp + '" /v ' + name + ' /f')
+    open(rc, "w").write("\r\n".join([
+        _add("ProxyEnable", "DWORD", "0"),
+        _del("ProxyServer"),
+    ]))
+    writes.clear()
+    with mock.patch.object(wpx, "RESTORE_CMD", rc),          mock.patch.object(wpx, "_write", lambda v: writes.append(dict(v))):
+        check("direct original: script parses to all-clear",
+              wpx.restore_from_cmd() is True and
+              writes[0]["ProxyEnable"] == 0 and writes[0]["ProxyServer"] is None,
+              str(writes))
+    # garbage / missing file never raises
+    open(rc, "w").write("this is not a restore script")
+    with mock.patch.object(wpx, "RESTORE_CMD", rc),          mock.patch.object(wpx, "_write", lambda v: None):
+        check("garbage script -> False", wpx.restore_from_cmd() is False)
+    with mock.patch.object(wpx, "RESTORE_CMD", os.path.join(d, "nope.cmd")),          mock.patch.object(wpx, "_write", lambda v: None):
+        check("missing script -> False", wpx.restore_from_cmd() is False)
+    # unrelated key path in the script must be IGNORED, not written
+    writes.clear()
+    open(rc, "w").write(
+        'reg add "HKCU\\Software\\Other" /v ProxyServer /t REG_SZ /d "x" /f\r\n')
+    with mock.patch.object(wpx, "RESTORE_CMD", rc),          mock.patch.object(wpx, "_write", lambda v: writes.append(dict(v))):
+        check("other-key reg adds ignored", wpx.restore_from_cmd() is False
+              and writes == [], str(writes))
+finally:
+    import shutil as _sh6
+    _sh6.rmtree(d, ignore_errors=True)
+
 # FINAL CANARY: the machine's real proxy settings must be byte-identical
 # to the baseline taken at import. If any test (present or FUTURE) leaks a
 # write through an unpatched _write/_write_raw/apply_*, this fails loudly

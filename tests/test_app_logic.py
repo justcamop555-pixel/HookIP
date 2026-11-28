@@ -366,5 +366,116 @@ check("degraded/quarantine flags copied onto the defaults object",
       str((app7.cfg.degraded, app7.cfg.quarantined, app7.cfg.quarantine_path)))
 
 print()
+
+# ---- 4. restore-internet flow: cmd fallback, PAC heuristic, honest UI ----
+
+# 4a. _recover_stale_proxy: encrypted backup unreadable -> restore.cmd fallback
+app_rc = make_app()
+app_rc.cfg = types.SimpleNamespace(port=9440)
+app_rc.running = False
+cmd_calls = []
+with mock.patch.object(appmod.winproxy, "read_current", lambda: dict(stale_vals)), \
+     mock.patch.object(appmod.winproxy, "is_stale_hookip",
+                       lambda vals, port, token: True), \
+     mock.patch.object(appmod.winproxy, "has_backup", lambda: True), \
+     mock.patch.object(appmod.winproxy, "restore_from_file", lambda: False), \
+     mock.patch.object(appmod.winproxy, "restore_from_cmd",
+                       lambda: cmd_calls.append(1) or True), \
+     mock.patch.object(appmod.winproxy, "clear_runonce", lambda: None), \
+     mock.patch.object(appmod.notify, "notify", lambda *a, **k: None):
+    appmod.App._recover_stale_proxy(app_rc)
+check("recovery falls back to the plaintext recovery script",
+      cmd_calls == [1] and
+      any("recovery script" in m for (lvl, m) in app_rc.log.lines),
+      str(app_rc.log.lines))
+
+# 4b. _manual_restore: same fallback + clear_runonce after success
+app_mr = make_app()
+app_mr.cfg = types.SimpleNamespace(port=9440)
+app_mr.running = False
+app_mr._dl_btn = FakeBtn()
+cmd_calls.clear()
+cleared = []
+with mock.patch.object(appmod.winproxy, "read_current", lambda: dict(stale_vals)), \
+     mock.patch.object(appmod.winproxy, "is_stale_hookip",
+                       lambda vals, port, token: True), \
+     mock.patch.object(appmod.winproxy, "has_backup", lambda: True), \
+     mock.patch.object(appmod.winproxy, "restore_from_file", lambda: False), \
+     mock.patch.object(appmod.winproxy, "restore_from_cmd",
+                       lambda: cmd_calls.append(1) or True), \
+     mock.patch.object(appmod.winproxy, "clear_runonce",
+                       lambda: cleared.append(1)), \
+     mock.patch.object(appmod.notify, "notify", lambda *a, **k: None):
+    appmod.App._manual_restore(app_mr)
+check("manual restore: cmd fallback runs and RunOnce is cleared",
+      cmd_calls == [1] and cleared == [1], f"{cmd_calls} {cleared}")
+check("manual restore: user is told about the fallback honestly",
+      any("recovery script" in m and "password" in m
+          for (lvl, m) in app_mr.log.lines), str(app_mr.log.lines))
+
+# 4c. _manual_restore: self-identifying stale PAC URL (no backup, old port)
+app_pac = make_app()
+app_pac.cfg = types.SimpleNamespace(port=9440)     # session's port differs
+app_pac.running = False
+removed = []
+pac_vals = {"ProxyEnable": 0, "ProxyServer": None, "ProxyOverride": None,
+            "AutoConfigURL": "http://127.0.0.1:8931/hookip-oldtok.pac"}
+with mock.patch.object(appmod.winproxy, "read_current", lambda: dict(pac_vals)), \
+     mock.patch.object(appmod.winproxy, "has_backup", lambda: False), \
+     mock.patch.object(appmod.winproxy, "remove_proxy",
+                       lambda: removed.append(1)), \
+     mock.patch.object(appmod.winproxy, "clear_runonce", lambda: None), \
+     mock.patch.object(appmod.notify, "notify", lambda *a, **k: None):
+    appmod.App._manual_restore(app_pac)
+check("stale PAC from an OLD session is recognized and cleared",
+      removed == [1] and
+      any("direct connection" in m for (lvl, m) in app_pac.log.lines),
+      str(app_pac.log.lines))
+
+# a FOREIGN pac must NOT be cleared by the heuristic
+foreign = dict(pac_vals, AutoConfigURL="http://127.0.0.1:8080/other.pac")
+removed.clear()
+with mock.patch.object(appmod.winproxy, "read_current", lambda: dict(foreign)), \
+     mock.patch.object(appmod.winproxy, "has_backup", lambda: False), \
+     mock.patch.object(appmod.winproxy, "remove_proxy",
+                       lambda: removed.append(1)), \
+     mock.patch.object(appmod.notify, "notify", lambda *a, **k: None):
+    appmod.App._manual_restore(app_pac)
+check("foreign PAC left untouched (heuristic is last resort)",
+      removed == [] and
+      any("Nothing to restore" in m for (lvl, m) in app_pac.log.lines),
+      str(app_pac.log.lines))
+
+# 4d. stop_proxy: honest toast when the restore fell back to direct
+app_sp = make_app()
+app_sp.cfg = types.SimpleNamespace(port=8931)
+app_sp.running = True
+app_sp.proxy = FakeProxy()
+app_sp.watchdog = types.SimpleNamespace(stop=lambda: None)
+app_sp._set_running_ui = lambda running: None
+app_sp.stats = types.SimpleNamespace()
+app_sp._live_port = 8931
+toasts = []
+with mock.patch.object(appmod.winproxy, "restore_from_file", lambda: False), \
+     mock.patch.object(appmod.winproxy, "has_backup", lambda: False), \
+     mock.patch.object(appmod.winproxy, "read_current",
+                       lambda: {"ProxyEnable": 1,
+                                "ProxyServer": "127.0.0.1:8931",
+                                "ProxyOverride": None,
+                                "AutoConfigURL": None}), \
+     mock.patch.object(appmod.winproxy, "_is_ours", lambda *a, **k: True), \
+     mock.patch.object(appmod.winproxy, "looks_like_ours", lambda v: False), \
+     mock.patch.object(appmod.winproxy, "remove_proxy", lambda: None), \
+     mock.patch.object(appmod.winproxy, "clear_runonce", lambda: None), \
+     mock.patch.object(appmod.notify, "notify",
+                       lambda *a, **k: toasts.append((a, k))):
+    appmod.App.stop_proxy(app_sp)
+check("stop falls back to direct when no backup and cur is ours",
+      app_sp.proxy is None and
+      any("direct connection" in m for (lvl, m) in app_sp.log.lines),
+      str(app_sp.log.lines))
+check("stop toast is HONEST about the direct fallback",
+      any("direct connection" in a[1] for (a, k) in toasts),
+      str(toasts))
 print(f"Summary: {sum(1 for _, c in RESULTS if c)}/{len(RESULTS)} passed")
 sys.exit(0 if all(c for _, c in RESULTS) else 1)

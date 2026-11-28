@@ -40,9 +40,40 @@ def _esc(s):
              .replace("'", "&apos;"))
 
 
-def notify(title, message, timeout_s=8):
+# dedupe: the same (title, message) toast within the cooldown window is
+# suppressed — a flapping network used to fire 'internet restored'/'failed'
+# toasts in rapid bursts (each a separate PowerShell spawn)
+_COOLDOWN_S = 30.0
+_last_fired = {}            # (title, message) -> monotonic time
+_cooldown_lock = threading.Lock()
+
+
+def reset_cooldown():
+    """Forget the dedupe history (tests / 'notify me again anyway')."""
+    with _cooldown_lock:
+        _last_fired.clear()
+
+
+def notify(title, message, timeout_s=8, cooldown_s=_COOLDOWN_S, force=False):
     """Fire a Windows toast. Fire-and-forget; failures are silent (it is a
-    nicety, never a reason to disturb the user)."""
+    nicety, never a reason to disturb the user).
+
+    Dedupe: an identical (title, message) toast within `cooldown_s` of the
+    last one is suppressed (returns False) unless force=True — repeated
+    network flap used to stack identical notifications instead of one."""
+    if cooldown_s and not force:
+        now = time.monotonic()
+        key = (title, message)
+        with _cooldown_lock:
+            last = _last_fired.get(key)
+            if last is not None and now - last < cooldown_s:
+                return False
+            _last_fired[key] = now
+            # keep the map bounded: drop entries older than 10x the window
+            if len(_last_fired) > 64:
+                cutoff = now - cooldown_s * 10
+                for k in [k for k, t in _last_fired.items() if t < cutoff]:
+                    _last_fired.pop(k, None)
     try:
         ps = f"""
 [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null

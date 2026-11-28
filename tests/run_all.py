@@ -69,6 +69,7 @@ SUITES = [
     "test_winproxy.py",
     "test_app_logic.py",
     "test_update.py",
+    "test_vpn.py",
     "test_doh.py",
     "test_proxy.py",       # real sockets (~25 s)
     "test_watchdog.py",    # real child processes (~14 s)

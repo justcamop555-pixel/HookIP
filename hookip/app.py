@@ -20,9 +20,10 @@ from .config import Config, SETTINGS_PATH, DEFAULTS
 from .logutil import Log
 from .perf import profile
 from .proxy import ProxyServer, Stats
-from .tooltips import Tooltip
+from .tooltips import Tooltip, NotebookTips
 from . import winproxy
 from . import notify
+from . import vpn as vpndetect
 from .tray import TrayIcon
 from .doh import RESOLVERS, _DoHConn
 
@@ -337,6 +338,13 @@ class App:
                     self._set_running_ui(False)
                 elif kind == "reapply":
                     self._reapply_system_proxy()
+                elif kind == "vpn":
+                    self._apply_vpn_state(args[0] if args else None)
+                elif kind == "upstream_ui":
+                    try:
+                        self.upstream_var.set(str(args[0]) if args else "")
+                    except (tk.TclError, RuntimeError, AttributeError):
+                        pass
                 elif kind == "dl_progress":
                     mb, note = (args + ("",))[:2]
                     try:
@@ -1222,6 +1230,14 @@ class App:
         Tooltip(self.update_pill,
                 "Update banner: '⬆ vX' means a newer HookIP is out (click to "
                 "open the release page). '✓ vX' means you are up to date.")
+        # VPN pill: hidden until a VPN is detected (best-effort, cached in
+        # hookip.vpn). Honest WHY: with a full-tunnel VPN up, HookIP's
+        # fragmentation/DoH are redundant — the user should know that.
+        self.vpn_pill = tk.Label(head, text="", font=("Segoe UI", 10),
+                                 bg="#202634", fg=MUTED, padx=8, pady=3)
+        self.vpn_tip = None
+        self._vpn_refresh_scheduled = False
+        self.root.after(1500, self._refresh_vpn_pill)   # after the window paints
         # flat-button hover feedback (header buttons)
         for btn, hot, cold in ((self.restore_btn, "#2a3244", "#202634"),):
             btn.bind("<Enter>", lambda e, b=btn, c=hot: b.configure(bg=c), add="+")
@@ -1230,6 +1246,21 @@ class App:
         nb = ttk.Notebook(self.root)
         nb.pack(fill="both", expand=True, padx=16, pady=(0, 12))
         self.nb = nb
+        # Notebook tab headers: plain Tooltips can't target a tab — this
+        # helper shows a description when the cursor hovers a tab
+        try:
+            NotebookTips(nb, [
+                "Dashboard — connection totals, live throughput graph and "
+                "the list of sites HookIP resolved today.",
+                "Log — everything HookIP did, color-coded. 'Save log…' "
+                "exports the complete decrypted file for bug reports.",
+                "Settings — port, fragmentation strategy, system proxy mode, "
+                "secure DNS, upstream proxy, excluded domains.",
+                "Diagnostics — one-click checks: DNS resolvers, real tunnel "
+                "test, system/antivirus state, plus a copyable report.",
+            ])
+        except Exception:
+            pass
 
         # dashboard --------------------------------------------------------
         dash = ttk.Frame(nb, style="Card.TFrame", padding=14)
@@ -1454,10 +1485,29 @@ class App:
                 "both = set both at once — the widest app coverage,\n"
                 "since both point at the same HookIP listener.")
 
+        # Upstream proxy: chain HookIP through another proxy. Empty =
+        # direct. Fills the gap for WARP-in-proxy-mode (127.0.0.1:40000),
+        # corporate upstreams and local chains — the config key existed
+        # (network detection wrote it) but users had no manual control.
+        up_row = tk.Frame(grid, bg=PANEL)
+        self.upstream_var = tk.StringVar(value=str(getattr(self.cfg, "upstream_proxy", "") or ""))
+        up_e = ttk.Entry(up_row, textvariable=self.upstream_var, width=28)
+        up_e.pack(side="left")
+        self.upstream_e = up_e
+        add_row("Upstream proxy", up_row, 4)   # row 4; later rows shift down
+        Tooltip(up_e,
+                "Chain HookIP through another proxy before the internet "
+                "(empty = direct). Accepts host:port or "
+                "http://user:pass@host:port.\n"
+                "Typical use: a VPN running in PROXY mode — e.g. Cloudflare "
+                "WARP proxy mode listens on 127.0.0.1:40000 — or the "
+                "network's own mandatory proxy on restricted Wi-Fi.\n"
+                "With a full-tunnel VPN (normal WARP mode) leave this EMPTY: "
+                "HookIP's traffic already rides through the tunnel.")
         self.doh_var = tk.BooleanVar(value=self.cfg.doh_enabled)
         doh_c = ttk.Checkbutton(grid, text="Use DNS-over-HTTPS (recommended)",
                                 variable=self.doh_var)
-        add_row("Secure DNS", doh_c, 4)
+        add_row("Secure DNS", doh_c, 5)
         Tooltip(doh_c,
                 "DNS-over-HTTPS: resolves names over an encrypted, fragmented\n"
                 "connection so DNS itself can't be blocked or tampered with.\n"
@@ -1467,7 +1517,7 @@ class App:
         verb_c = ttk.Checkbutton(grid, text="Verbose log", variable=self.verbose_var,
                                  command=lambda: setattr(self.log, "verbose",
                                                          self.verbose_var.get()))
-        add_row("Logging", verb_c, 5)
+        add_row("Logging", verb_c, 6)
         Tooltip(verb_c,
                 "Shows per-connection detail on screen (DNS timings, ports,\n"
                 "fragment counts). The log FILE always keeps this detail\n"
@@ -1476,7 +1526,7 @@ class App:
         self.remember_var = tk.BooleanVar(value=self.cfg.remember)
         rem_c = ttk.Checkbutton(grid, text="Remember settings for next launch",
                                 variable=self.remember_var)
-        add_row("Persistence", rem_c, 6)
+        add_row("Persistence", rem_c, 7)
         Tooltip(rem_c,
                 "Save port, fragment size, strategy, mode and the excluded\n"
                 "list to %LOCALAPPDATA%\\HookIP\\settings.json.\n"
@@ -1485,7 +1535,7 @@ class App:
         self.tray_var = tk.BooleanVar(value=self.cfg.minimize_to_tray)
         tray_c = ttk.Checkbutton(grid, text="Hide to tray when the window is closed (X)",
                                  variable=self.tray_var)
-        add_row("Window", tray_c, 7)
+        add_row("Window", tray_c, 8)
         Tooltip(tray_c,
                 "On: the X button hides HookIP to the system tray and the "
                 "proxy keeps running — the tray icon restores it.\n"
@@ -1513,11 +1563,16 @@ class App:
                                  cursor="hand2")
         Tooltip(self._dl_btn,
                 "Downloads the new HookIP.exe straight from the release "
-                "(checksum-verified) into your Downloads folder, then "
-                "turns into 'Install now': HookIP closes, your internet "
-                "settings are restored, and the new version starts. "
-                "Settings are kept.")
-        add_row("Updates", upd, 8)
+                "(checksum-verified), then HookIP closes, your internet "
+                "settings are restored, and the new version starts "
+                "automatically under the same name. Settings are kept.\n"
+                "The button is grey until an update is actually found.",
+                disabled_text=
+                    "No update is available right now (or a check is still "
+                    "running) — the button lights up as soon as a newer "
+                    "release is detected. It also runs automatically ~15 s "
+                    "after launch and every 12 h.")
+        add_row("Updates", upd, 9)
 
         row = tk.Frame(setf, bg=PANEL)
         tk.Label(row, text="Excluded domains (one per line, wildcards allowed).\n"
@@ -1703,7 +1758,16 @@ class App:
         if winproxy.has_backup():
             # backup exists only when the last activation never stopped
             # cleanly (clean stop deletes it) — restore the original settings
-            if winproxy.restore_from_file():
+            restored = winproxy.restore_from_file()
+            if not restored and winproxy.has_backup():
+                # encrypted backup unreadable this session (degraded key):
+                # the plaintext recovery script is the second chance
+                restored = winproxy.restore_from_cmd()
+                if restored:
+                    self.log.ok("Recovered from a crash via the recovery "
+                                "script (the encrypted backup could not be "
+                                "decrypted this session).")
+            if restored:
                 winproxy.clear_runonce()   # stale crash-cleanup entry
                 self.log.ok("Recovered from a crash: system proxy restored to "
                             "your previous settings — internet should work again.")
@@ -1712,11 +1776,15 @@ class App:
                               "pointed at it. Your original connection is back.",
                               timeout_s=12)
                 return
-        # no backup, but the registry still points at our own port
+        # no (usable) backup, but the registry still points at our own port —
+        # exact match for this session, or the SELF-IDENTIFYING PAC URL of a
+        # crashed older session (different port/token, no backup left)
         port_s = f"127.0.0.1:{self.cfg.port}"
         if port_s in str(cur.get("ProxyServer") or "") or \
-                port_s in str(cur.get("AutoConfigURL") or ""):
+                port_s in str(cur.get("AutoConfigURL") or "") or \
+                winproxy.looks_like_ours(cur):
             winproxy.remove_proxy()
+            winproxy.clear_runonce()
             self.log.ok("Recovered from a crash: stale HookIP proxy settings "
                         "cleared — internet set to direct connection.")
 
@@ -1725,7 +1793,10 @@ class App:
         dead HookIP port (crash, watchdog failure, power loss)."""
         if self.running:
             self.stop_proxy()   # stopping already restores from backup (+ toast)
-            self.log.ok("Proxy stopped — internet restored to your previous settings.")
+            # stop_proxy logs the SPECIFIC outcome (backup restore vs
+            # direct-fallback) — a generic 'internet restored' here would
+            # be a false success when it actually fell back to direct
+            self.log.ok("Proxy stopped.")
             return
         try:
             cur = winproxy.read_current()
@@ -1740,15 +1811,35 @@ class App:
                     # entries used to be missed here, and the stale backup
                     # — the only one — was then discarded below): the
                     # backup is the real fix
-                    if winproxy.restore_from_file():
+                    restored = winproxy.restore_from_file()
+                    if not restored and winproxy.has_backup():
+                        # unreadable ENCRYPTED backup (degraded key
+                        # session): the plaintext recovery script written
+                        # next to it holds the same original values
+                        restored = winproxy.restore_from_cmd()
+                        if restored:
+                            self.log.ok("Restored from the recovery script — "
+                                        "the encrypted backup could not be "
+                                        "decrypted this session. If your "
+                                        "upstream proxy needed a password, "
+                                        "enter it again.")
+                    if restored:
+                        # also drop the crash-cleanup RunOnce entry: after
+                        # a manual restore it used to survive and re-apply
+                        # the crash-era settings at the NEXT REBOOT
+                        winproxy.clear_runonce()
                         self.log.ok("Internet restored: system proxy set back "
                                     "to your previous settings.")
                         notify.notify("HookIP — internet restored",
                                       "Windows points at your original "
                                       "connection again.")
                     else:
-                        self.log.error("Restore failed — the backup could not "
-                                       "be applied (see log).")
+                        self.log.error(
+                            "Restore failed — neither the encrypted backup "
+                            "nor the recovery script could be applied "
+                            f"({winproxy.RESTORE_CMD}). "
+                            "A restart of HookIP usually fixes the key "
+                            "problem; try again after restarting.")
                 else:
                     # FALSE-POSITIVE GUARD: a backup exists but the system
                     # proxy no longer points at HookIP — the user (or
@@ -1761,10 +1852,12 @@ class App:
                                 "proxy no longer points at HookIP, so there "
                                 "is nothing to restore. Your current "
                                 "settings were left untouched.")
-            elif winproxy._is_ours(cur, self.cfg.port, self.pac_token):
+            elif winproxy._is_ours(cur, self.cfg.port, self.pac_token) or \
+                    winproxy.looks_like_ours(cur):
                 winproxy.remove_proxy()
                 self.log.ok("Internet restored: HookIP proxy settings cleared "
                             "(direct connection).")
+                winproxy.clear_runonce()
                 notify.notify("HookIP — internet restored",
                               "Stale HookIP proxy settings cleared — direct "
                               "connection is back.")
@@ -1796,6 +1889,10 @@ class App:
             cfg.strategy = self.strategy_var.get()
             if cfg.strategy not in ("smart", "chunk", "random"):
                 cfg.strategy = "smart"
+            # upstream proxy: empty = direct; strip spaces and a possible
+            # scheme-less 'http://' is allowed by proxy._via_upstream —
+            # store the user's string verbatim minus surrounding blanks
+            cfg.upstream_proxy = self.upstream_var.get().strip()
             cfg.proxy_mode = self.mode_var.get()
             cfg.doh_enabled = self.doh_var.get()
             cfg.verbose = self.verbose_var.get()
@@ -1921,10 +2018,24 @@ class App:
                 pass
         self.running = True
         self._set_running_ui(True)
-        notify.notify("HookIP is protecting you",
-                      f"Proxy running on 127.0.0.1:{cfg.port}.\n"
-                      "Close (X) hides to the tray; Stop restores your "
-                      "internet.")
+        # VPN awareness: say HONESTLY what HookIP does and does not add
+        # while a full-tunnel VPN (e.g. Cloudflare WARP) is up — the user
+        # asked 'do they conflict?' too often for this to stay invisible.
+        try:
+            vpn_state = vpndetect.detect()
+        except Exception:
+            vpn_state = None
+        protect_msg = (f"Proxy running on 127.0.0.1:{cfg.port}.\n"
+                       "Close (X) hides to the tray; Stop restores your "
+                       "internet.")
+        if vpn_state:
+            self.log.info(
+                f"VPN detected: {vpn_state.get('kind')} ({vpn_state.get('detail')}) — "
+                + vpndetect.why_text(vpn_state))
+            self._ui_queue.put(("vpn", (vpn_state,)))
+            protect_msg += ("\nVPN active: "
+                            + vpndetect.why_text(vpn_state).split(". ")[0] + ".")
+        notify.notify("HookIP is protecting you", protect_msg)
         # restricted-network probe (captive portals, proxy-only Wi-Fi):
         # direct, unproxied NCSI test — this is exactly the path app
         # installers and Windows services use, so its failure predicts
@@ -2027,6 +2138,58 @@ class App:
         # UI refresh happens on the main thread via _pump_ui ("emergency_done")
         # — this hook runs on the accept thread and must not touch Tk directly
 
+    def _refresh_vpn_pill(self):
+        """Best-effort VPN detection for the header pill. Runs on a worker
+        thread (tasklist + optional warp-cli are subprocesses); the UI is
+        updated via the pump queue. Re-arms itself every 5 minutes."""
+        if self._closing.is_set():
+            return
+        try:
+            state = vpndetect.detect()
+        except Exception:
+            state = None
+        self._ui_queue.put(("vpn", (state,)))
+        if not self._vpn_refresh_scheduled:
+            self._vpn_refresh_scheduled = True
+            try:
+                self.root.after(5 * 60 * 1000, self._vpn_refresh_loop)
+            except (RuntimeError, tk.TclError):
+                self._vpn_refresh_scheduled = False
+
+    def _vpn_refresh_loop(self):
+        # periodic re-check: WARP can connect/disconnect while HookIP runs
+        try:
+            self.root.after(5 * 60 * 1000, self._vpn_refresh_loop)
+        except (RuntimeError, tk.TclError):
+            return
+        threading.Thread(target=self._refresh_vpn_pill, daemon=True).start()
+
+    def _apply_vpn_state(self, state):
+        """Main-thread: show/hide the VPN pill with the honest WHY."""
+        try:
+            if state:
+                self.vpn_pill.configure(
+                    text=f"⛓ VPN ({state.get('detail', 'active')})",
+                    fg=MUTED)
+                if not self.vpn_pill.winfo_manager():
+                    self.vpn_pill.pack(side="left", padx=(0, 8))
+                if self.vpn_tip:
+                    self.vpn_tip.set_text(
+                        f"VPN detected: {state.get('kind')} — "
+                        + vpndetect.why_text(state))
+                else:
+                    self.vpn_tip = Tooltip(
+                        self.vpn_pill,
+                        f"VPN detected: {state.get('kind')} — "
+                        + vpndetect.why_text(state))
+            else:
+                try:
+                    self.vpn_pill.pack_forget()
+                except tk.TclError:
+                    pass
+        except (tk.TclError, RuntimeError):
+            pass
+
     def _apply_proxy_settings(self, cfg, bypass=None):
         """Write the system proxy per the configured mode. May raise
         winproxy.BackupError (nothing was written then) or OSError."""
@@ -2099,6 +2262,9 @@ class App:
                       f"Your Wi-Fi only allows traffic through its own "
                       f"proxy ({shown}). HookIP now chains through "
                       "it, so sites keep working.", timeout_s=12)
+        # reflect the detected upstream in the Settings field (worker
+        # thread must not touch Tk — route through the pump)
+        self._ui_queue.put(("upstream_ui", (net_proxy,)))
 
     def stop_proxy(self, tell_user=True):
         if not self.running:
@@ -2113,20 +2279,41 @@ class App:
             # can then log 'port switched: a → b' for the diagnostics
             self.watchdog.stop()
             winproxy.clear_runonce()
-            if winproxy.restore_from_file():
+            restored = winproxy.restore_from_file()
+            if not restored and winproxy.has_backup():
+                # the backup EXISTS but could not be applied (degraded key
+                # session): the plaintext recovery script written next to
+                # it holds the same original values (credentials stripped)
+                restored = winproxy.restore_from_cmd()
+                if restored:
+                    self.log.ok("System proxy restored from the recovery "
+                                "script — the encrypted backup could not be "
+                                "decrypted this session. If your upstream "
+                                "proxy needed a password, enter it again.")
+            if restored:
                 self.log.ok("System proxy restored to previous settings.")
             else:
-                # no backup (e.g. wiped while running) — clear our own entries
-                # by EXACT match: the old '127.0.0.1 in …' heuristic wiped a
-                # local Clash/Fiddler/V2Ray config that was never HookIP's
+                # no (usable) backup (e.g. wiped while running) — clear our
+                # own entries by EXACT match (or the self-identifying stale
+                # PAC URL): the old '127.0.0.1 in …' heuristic wiped a local
+                # Clash/Fiddler/V2Ray config that was never HookIP's
                 cur = winproxy.read_current()
-                if winproxy._is_ours(cur, self.cfg.port, self.pac_token):
+                if winproxy._is_ours(cur, self.cfg.port, self.pac_token) or \
+                        winproxy.looks_like_ours(cur):
                     winproxy.remove_proxy()
                     self.log.ok("Proxy backup missing — cleared HookIP proxy settings (direct connection).")
+                elif winproxy.has_backup():
+                    self.log.error(
+                        "Restore failed: the encrypted backup could not be "
+                        "decrypted and the recovery script did not apply — "
+                        "Windows may still point at HookIP. Restart HookIP "
+                        "(usually fixes the key problem) and use 'Restore "
+                        "internet', or run " + winproxy.RESTORE_CMD + " manually.")
                 else:
                     self.log.warn("No proxy backup found and current proxy is not HookIP's; left untouched.")
         except OSError as exc:
             self.log.error(f"Restore failed: {exc}")
+            restored = False
         # the app (not proxy.stop()) persists strategy memory AFTER the
         # system proxy is back — stop() itself must not do disk I/O
         try:
@@ -2136,8 +2323,15 @@ class App:
             pass
         self._set_running_ui(False)
         if tell_user:
+            # HONEST toast: say what actually happened (backup restore vs
+            # direct fallback) instead of always claiming 'your normal
+            # connection is back'
             notify.notify("HookIP — internet restored",
-                          "Proxy stopped. Your normal connection is back.")
+                          "Proxy stopped. Your normal connection is back."
+                          if restored else
+                          "Proxy stopped — Windows is set to a direct "
+                          "connection (your previous proxy settings could "
+                          "not be restored this session).")
 
     def _set_running_ui(self, running):
         self.start_btn.configure(
@@ -2642,6 +2836,22 @@ class App:
 
     def _diag_system(self):
         self._diag_section("System")
+        # VPN awareness in the report: the WHY belongs in diagnostics too
+        try:
+            vstate = vpndetect.detect()
+        except Exception:
+            vstate = None
+        if vstate:
+            self._diag_result(
+                "VPN", "info",
+                f"{vstate.get('kind')} ({vstate.get('detail')}) — "
+                + vpndetect.why_text(vstate))
+        else:
+            self._diag_result(
+                "VPN", "info",
+                "no VPN detected — HookIP's SNI fragmentation and DoH are "
+                "doing real work right now (with a VPN up they would be "
+                "redundant, not broken)")
         import platform
         self._diag_result("Environment", "info",
                           f"HookIP {__version__}"

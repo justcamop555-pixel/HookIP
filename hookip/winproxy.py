@@ -9,6 +9,7 @@ import ctypes
 import ctypes.wintypes as wt
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -294,6 +295,19 @@ def is_stale_hookip(vals, port, token):
     return _is_ours(vals, port, token) or _is_ours(vals, *backup_meta())
 
 
+def looks_like_ours(vals):
+    """Last-resort HookIP identification WITHOUT session context.
+
+    Our PAC URLs are self-identifying:
+    http://127.0.0.1:<port>/hookip-<token>.pac — the '/hookip-' marker is
+    part of the URL no other tool is expected to produce. Used ONLY after
+    the exact session match fails: a crashed session's stale PAC entry
+    (different port/token, backup already gone) used to fall through to
+    'nothing to restore' while the internet was still broken."""
+    ac = str((vals or {}).get("AutoConfigURL") or "")
+    return "/hookip-" in ac and ac.endswith(".pac")
+
+
 def has_backup():
     return os.path.isfile(BACKUP_PATH)
 
@@ -317,6 +331,66 @@ def discard_backup(path=None):
         return True
     except OSError:
         return False
+
+
+# restore.cmd line grammar (see _write_restore_cmd):
+#   reg add "HKCU\<KEY_PATH>" /v <Name> /t REG_<TYPE> /d "<value>" /f
+#   reg delete "HKCU\<KEY_PATH>" /v <Name> /f
+_ADD_RE = re.compile(
+    r'reg\s+add\s+"HKCU\\(?P<key>[^"]+)"\s+/v\s+(?P<name>\w+)\s+'
+    r'/t\s+REG_(?P<typ>[A-Z]+)\s+/d\s+(?:"(?P<val>[^"]*)"|(?P<val2>\S+))\s+/f',
+    re.IGNORECASE)
+_DEL_RE = re.compile(
+    r'reg\s+delete\s+"HKCU\\(?P<key>[^"]+)"\s+/v\s+(?P<name>\w+)\s+/f',
+    re.IGNORECASE)
+
+
+def restore_from_cmd(path=None):
+    """Recover the original proxy settings from the PLAINTEXT restore.cmd
+    script that backup() writes alongside every encrypted backup.
+
+    Fallback for the case the ENCRYPTED backup cannot be decrypted (a
+    degraded DPAPI session used to make 'Restore internet' fail with no
+    second chance). The script's values have credentials STRIPPED (it is
+    plaintext on disk by nature) — a user with an authenticated upstream
+    must re-enter the password afterwards; that is stated in the log.
+    Returns True when the registry was written; never raises."""
+    if path is None:
+        path = RESTORE_CMD
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+    except OSError:
+        return False
+    vals = {"ProxyEnable": 0, "ProxyServer": None,
+            "ProxyOverride": None, "AutoConfigURL": None}
+    parsed = False
+    for m in _ADD_RE.finditer(text):
+        if m.group("key").lower() != KEY_PATH.lower():
+            continue
+        name = m.group("name")
+        if name not in vals:
+            continue
+        raw = m.group("val") if m.group("val") is not None else m.group("val2")
+        if name == "ProxyEnable":
+            vals[name] = 1 if raw.strip() in ("1", "0x1") else 0
+        else:
+            vals[name] = raw or None
+        parsed = True
+    for m in _DEL_RE.finditer(text):
+        if m.group("key").lower() != KEY_PATH.lower():
+            continue
+        name = m.group("name")
+        if name in vals:
+            vals[name] = None
+            parsed = True
+    if not parsed:
+        return False
+    try:
+        _write(vals)
+    except OSError:
+        return False
+    return True
 
 
 def restore_from_file(path=None):
