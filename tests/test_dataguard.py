@@ -14,6 +14,7 @@ import sys
 import tempfile
 import time
 import types
+from typing import Any, cast
 import unittest.mock as mock
 
 if os.name != "nt":
@@ -28,9 +29,16 @@ from hookip import dataguard as dg  # noqa: E402
 RESULTS = []
 
 
-def check(name, cond, extra=""):
+def check(name, cond, extra: object = ""):
     RESULTS.append((name, cond))
     print(("PASS" if cond else "FAIL"), name, extra, flush=True)
+def dec(x):
+    """decrypt_line() narrowed to plain str: '' for None/UNREADABLE.
+    Every flagged `in`/endswith/startswith/split use keeps the same
+    outcome (falsy branches compare identically against '')."""
+    return x if isinstance(x, str) else ""
+
+
 
 
 def hlog_lines(path):
@@ -98,7 +106,7 @@ check("migrate converts", conv == 1 and total == 1, f"{conv}/{total}")
 h1 = os.path.join(d, "hookip_a.hlog")
 check("migrate removes source", not os.path.exists(src1) and os.path.exists(h1))
 check("no leftover .migrating", not [n for n in os.listdir(d) if n.endswith(".migrating")])
-vals = [dg.decrypt_line(x) for x in hlog_lines(h1)]
+vals = [dec(dg.decrypt_line(x)) for x in hlog_lines(h1)]
 marker_ok = vals and isinstance(vals[-1], str) and vals[-1].startswith("# migrated ")
 check("migrate: CRLF normalized, form-feed NOT a line break",
       len(vals) == 3 and vals[0].endswith(":443") and "\x0c" in vals[1], str(vals))
@@ -123,7 +131,7 @@ d_cp = tempfile.mkdtemp()
 with open(os.path.join(d_cp, "hookip_q.log"), "wb") as fh:
     fh.write(b"[INFO] \x93quoted\x94 \x97 dash\n")
 dg.migrate_plaintext_logs(d_cp)
-vq = [dg.decrypt_line(x) for x in hlog_lines(os.path.join(d_cp, "hookip_q.hlog"))]
+vq = [dec(dg.decrypt_line(x)) for x in hlog_lines(os.path.join(d_cp, "hookip_q.hlog"))]
 qline = next((v for v in vq if v and "quoted" in v), "")
 check("cp1252 smart quotes/dashes decoded",
       "\u201cquoted\u201d" in qline and "\u2014" in qline, repr(qline))
@@ -137,7 +145,7 @@ with open(src2, "w", encoding="utf-8") as fh:
 with open(dst2, "w", encoding="utf-8") as fh:
     fh.write(dg.encrypt_line("[2026-01-01] [INFO] pre-existing encrypted line") + "\n")
 conv2, total2 = dg.migrate_plaintext_logs(d)
-vals2 = [dg.decrypt_line(x) for x in hlog_lines(dst2)]
+vals2 = [dec(dg.decrypt_line(x)) for x in hlog_lines(dst2)]
 check("merge: existing line preserved",
       any("pre-existing encrypted line" in (v or "") for v in vals2))
 check("merge: new line appended",
@@ -164,14 +172,14 @@ with mock.patch("builtins.open", locked_open):
     convu, totu = dg.migrate_plaintext_logs(d_u)
 check("dst unreadable -> abort (not converted)", convu == 0, f"conv={convu} tot={totu}")
 check("dst unreadable -> .hlog untouched",
-      [dg.decrypt_line(x) for x in hlog_lines(hu)][0].endswith("precious existing line"))
+      dec([dg.decrypt_line(x) for x in hlog_lines(hu)][0]).endswith("precious existing line"))
 check("dst unreadable -> .migrating claim remains",
       any(n.endswith(".log.migrating") for n in os.listdir(d_u)))
 check("dst unreadable -> no .mig temp left",
       not [n for n in os.listdir(d_u) if n.endswith(".mig")])
 # next run retries and completes
 convu2, _ = dg.migrate_plaintext_logs(d_u)
-valsu = [dg.decrypt_line(x) for x in hlog_lines(hu)]
+valsu = [dec(dg.decrypt_line(x)) for x in hlog_lines(hu)]
 check("retry after lock clears completes",
       convu2 == 1 and any("wikipedia.org:443" in (v or "") for v in valsu))
 shutil.rmtree(d_u, ignore_errors=True)
@@ -183,7 +191,7 @@ with open(os.path.join(d_o, "hookip_o.log.migrating"), "wb") as fh:
 with open(os.path.join(d_o, "hookip_o.log"), "w", encoding="utf-8") as fh:
     fh.write("[2026-01-07] [INFO] tunnel fresh.org:443\n")
 convo, toto = dg.migrate_plaintext_logs(d_o)
-vo = [dg.decrypt_line(x) for x in hlog_lines(os.path.join(d_o, "hookip_o.hlog"))]
+vo = [dec(dg.decrypt_line(x)) for x in hlog_lines(os.path.join(d_o, "hookip_o.hlog"))]
 check("orphan + .log both processed in ONE run",
       convo == 2 and any("orphan.org:443" in (v or "") for v in vo)
       and any("fresh.org:443" in (v or "") for v in vo), f"{convo}/{toto}")
@@ -201,7 +209,7 @@ with mock.patch.object(dg.os, "remove", side_effect=OSError("AV lock")):
 check("remove-fail run keeps leftover .migrating",
       conv3 == 0 and any(n.endswith(".log.migrating") for n in os.listdir(d3)))
 conv3b, _ = dg.migrate_plaintext_logs(d3)          # rerun, no mock
-vals3 = [dg.decrypt_line(x) for x in hlog_lines(os.path.join(d3, "hookip_c.hlog"))]
+vals3 = [dec(dg.decrypt_line(x)) for x in hlog_lines(os.path.join(d3, "hookip_c.hlog"))]
 check("rerun finishes leftover via marker", conv3b == 1 and
       any("gnu.org:443" in (v or "") for v in vals3), str(vals3))
 check("rerun did NOT duplicate lines (marker-based)",
@@ -217,7 +225,7 @@ orphan = os.path.join(d4, "hookip_d.log.migrating")
 with open(orphan, "wb") as fh:
     fh.write("[2026-01-04] [INFO] tunnel pypi.org:443\n".encode())
 conv4, _ = dg.migrate_plaintext_logs(d4)
-vals4 = [dg.decrypt_line(x) for x in hlog_lines(os.path.join(d4, "hookip_d.hlog"))]
+vals4 = [dec(dg.decrypt_line(x)) for x in hlog_lines(os.path.join(d4, "hookip_d.hlog"))]
 check("orphan .log.migrating finished", conv4 == 1 and
       any("pypi.org:443" in (v or "") for v in vals4))
 check("orphan consumed", not os.path.exists(orphan))
@@ -228,8 +236,9 @@ check("harden_dir by SID succeeds", dg.harden_dir(d5) is True)
 check("acl_is_hardened true after", dg.acl_is_hardened(d5) is True)
 out = subprocess.run(["icacls", d5], capture_output=True, text=True).stdout
 check("no ':(I)' anywhere in real output", ":(I)" not in out)
+_sid = dg._current_user_sid()
 check("current-user SID resolvable",
-      bool(dg._current_user_sid()) and dg._current_user_sid().startswith("S-1-"))
+      bool(_sid) and _sid.startswith("S-1-"))
 shutil.rmtree(d5, ignore_errors=True)
 
 with mock.patch.object(dg, "_current_user_sid", lambda: None):
@@ -314,7 +323,7 @@ d_base = tempfile.mkdtemp()
 with open(os.path.join(d_base, "hookip_n.log"), "wb") as fh:
     fh.write(b"[INFO] tunnel example.org:443\n")
 dg.migrate_plaintext_logs(d_base)
-vbase = [dg.decrypt_line(x) for x in hlog_lines(os.path.join(d_base, "hookip_n.hlog"))]
+vbase = [dec(dg.decrypt_line(x)) for x in hlog_lines(os.path.join(d_base, "hookip_n.hlog"))]
 mline = next((v for v in vbase if v and v.startswith("# migrated ")), "")
 check("marker carries the basename, no path separators",
       "hookip_n.log" in mline and os.sep not in mline and ":" not in mline.split(" ")[2],
@@ -616,7 +625,8 @@ try:
           "corp" not in raw, raw[:40])
     plain = dg.decrypt_bytes(raw)
     check("proxy backup decrypts back",
-          json.loads(plain.decode("utf-8")) == vals, str(plain)[:50])
+          plain is not None and json.loads(plain.decode("utf-8")) == vals,
+          str(plain)[:50])
     # legacy plaintext backup still restorable (honored once)
     lp = os.path.join(d_wp, "legacy.json")
     open(lp, "w", encoding="utf-8").write(vals_json)
@@ -649,9 +659,9 @@ try:
     #    not raise out of encrypt_line (it used to escape _emit into the
     #    proxy's handler)
     enc = dg.encrypt_line("bad path: \udcff")
-    dec = dg.decrypt_line(enc)
+    _dec = dg.decrypt_line(enc)
     check("lone surrogate encrypts without raising (round-trippable)",
-          isinstance(dec, str) and "bad path:" in dec, repr(dec))
+          isinstance(_dec, str) and "bad path:" in _dec, repr(_dec))
 
     # 2. a failing file sink must never lose the entry nor raise
     class _BoomFile:
@@ -794,7 +804,7 @@ try:
         def configure(self, **kw): self.text = kw.get("text", self.text)
     class _FakeBtn:
         def pack_forget(self): pass
-    fake_app = types.SimpleNamespace(
+    fake_app = cast(Any, types.SimpleNamespace(   # duck-typed App stub
         _update_running=True, update_label=_FakeLbl(),
         update_pill=_FakeLbl(), _dl_btn=_FakeBtn(),
         log=types.SimpleNamespace(
@@ -804,7 +814,7 @@ try:
         _schedule_update_recheck=lambda ms: None,
         _update_url=None, _update_asset=None, _update_sha=None,
         _update_body=None, _update_prerelease=False,
-        _dl_btn_packed=False)
+        _dl_btn_packed=False))
     _app.App._update_result(fake_app, None, None, offline=True,
                             http_error=429)
     check("HTTP 429 is NOT reported as offline",

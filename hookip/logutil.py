@@ -4,6 +4,7 @@ import time
 import os
 import glob
 from collections import deque
+from typing import Any
 
 from . import dataguard
 from .perf import profile
@@ -59,7 +60,8 @@ class Log:
         self._lock = threading.Lock()
         self._buf = deque(maxlen=maxlen)
         self._subs = []
-        self._file = None
+        # real .hlog handle, or a duck-typed fake in tests — hence Any
+        self._file: Any = None
         self.file_error = None     # last file-sink failure, surfaced once
         self.verbose = False
         self._last_flush = 0.0     # monotonic — time-based flush for info/ok

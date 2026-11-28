@@ -6,6 +6,7 @@ import threading
 import time
 import types
 import unittest.mock as mock
+from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -40,10 +41,12 @@ class FakeLog:
 
 class FakeCfg:
     doh_enabled = True
+    excluded: list = []
 
 
 class FakeConn:
     """Stands in for _DoHConn — no sockets."""
+    default: Any = b""       # bytes, or a scripted request-result dict
     created = 0
     created_per_name = {}
 
@@ -347,7 +350,7 @@ def test_sni_less_and_fallback():
             self.alive = True
             self.keepalive = keepalive
             self._reqlock = threading.Lock()
-            self.healthy = lambda: True
+            self.healthy = lambda max_idle=25.0: True
 
     r = make_resolver()
     real_conn = dohmod._DoHConn
@@ -371,7 +374,7 @@ def test_sni_less_and_fallback():
                 self.alive = True
                 self.keepalive = k.get("keepalive", False)
                 self._reqlock = threading.Lock()
-                self.healthy = lambda: True
+                self.healthy = lambda max_idle=25.0: True
 
         captured.clear()
         dohmod._DoHConn = CertFailConn
@@ -492,7 +495,7 @@ class StubDns:
                 if t in (StubDns.TYPE_A, StubDns.TYPE_AAAA)]
 
 
-def script_resolver(scripts, pool_max=4):
+def script_resolver(scripts: dict[str, list[Any]], pool_max=4):
     """scripts: resolver name -> list of request-result dicts."""
     r = make_resolver(pool_max=pool_max)
     r.chunk = 2
@@ -750,7 +753,7 @@ def test_hedging():
 class FakeUDP:
     """Stands in for socket.socket(AF_INET, SOCK_DGRAM)."""
     instances = []
-    reply = None             # datagram bytes returned by recv
+    reply: Any = None        # datagram bytes returned by recv
     connect_calls = []
 
     def __init__(self, *a, **k):
@@ -775,9 +778,11 @@ class FakeUDP:
 
 
 def test_udp_verification():
-    q = b"\xab\xcd" + b"query"
+    _qbytes = b"\xab\xcd" + b"query"
     real_encode = StubDns.encode_query
-    StubDns.encode_query = staticmethod(lambda h, qt: q)
+    real_parse = StubDns.parse_response      # pre-bound: the finally must
+    real_extract = StubDns.extract_ips       # never see these unbound
+    StubDns.encode_query = staticmethod(lambda h, q: _qbytes)
     try:
         r = Resolver(FakeCfg(), FakeLog(), chunk=2)
         # wrong transaction ID -> ignored
@@ -786,18 +791,16 @@ def test_udp_verification():
              mock.patch.object(dohmod, "dnsmsg", StubDns):
             ips, ttl = r._via_udp_dns("udp.test", 1)
         check("UDP wrong transaction ID ignored", ips == [] and FakeUDP.instances
-              and FakeUDP.instances[0].sent == q)
+              and FakeUDP.instances[0].sent == _qbytes)
         check("UDP connect((ip,53)) used for source filtering",
               FakeUDP.connect_calls and FakeUDP.connect_calls[0] == ("1.1.1.1", 53))
         # correct transaction ID -> accepted
         FakeUDP.instances.clear()
         FakeUDP.reply = b"\xab\xcd" + b"resp"
-        real_parse = StubDns.parse_response
-        real_extract = StubDns.extract_ips
         StubDns.parse_response = staticmethod(
             lambda resp, qname=None: (0, [(("n"), 1, 60, "6.6.6.6")]))
         StubDns.extract_ips = staticmethod(
-            lambda answers, qt: [v for (_n, t, _ttl, v) in answers])
+            lambda answers, q: [v for (_n, t, _ttl, v) in answers])
         with mock.patch.object(dohmod.socket, "socket", FakeUDP), \
              mock.patch.object(dohmod, "dnsmsg", StubDns):
             ips, ttl = r._via_udp_dns("udp2.test", 1)
@@ -820,7 +823,7 @@ def test_serve_stale_on_doh_outage():
     entries and doh-off sessions still fail normally."""
     r = make_resolver(pool_max=2)
     now = time.time()
-    r._via_doh = lambda h, q: ([], 120, "error: all failed")
+    r._via_doh = lambda host, qtype: ([], 120, "error: all failed")
     r._via_tcp_dns = lambda *a, **k: ([], 0)
     r._via_udp_dns = lambda *a, **k: ([], 0)
     r._via_system = lambda *a, **k: ([], 0)
@@ -886,12 +889,7 @@ def test_circuit_breaker():
     (demoted to the BACK of the hedge order, never skipped when everyone
     is cooling); the first success resets it and logs the recovery."""
     fail = OSError("blocked (simulated)")
-    scripts = {n: [fail] for n, _, _ in dohmod.RESOLVERS}
-    """3 consecutive transport failures cool a resolver down for 5 min
-    (demoted to the BACK of the hedge order, never skipped when everyone
-    is cooling); the first success resets it and logs the recovery."""
-    fail = OSError("blocked (simulated)")
-    scripts = {n: [fail] for n, _, _ in dohmod.RESOLVERS}
+    scripts: dict[str, list[Any]] = {n: [fail] for n, _, _ in dohmod.RESOLVERS}
     r = script_resolver(scripts, pool_max=2)
     r._via_tcp_dns = lambda *a, **k: ([], 0)
     r._via_udp_dns = lambda *a, **k: ([], 0)

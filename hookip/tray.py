@@ -10,6 +10,7 @@ import queue
 import sys
 import threading
 from ctypes import wintypes
+from typing import Any
 
 _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 _user32 = ctypes.WinDLL("user32", use_last_error=True)
@@ -151,7 +152,7 @@ class TrayIcon:
         self._title = title[:127]
         self._hicon = _load_app_icon()
         self._hwnd = None
-        self._thread = None
+        self._thread: Any = None   # Thread (or a duck-typed fake in tests)
         self._ready = threading.Event()
         self._visible = False
         self._failed = False

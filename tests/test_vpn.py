@@ -65,7 +65,7 @@ for img in vpndetect._WARP_IMAGES:
         st = vpndetect.detect(force=True)
         check(f"WARP CONNECTED detected via {img}", st is not None and
               st["kind"] == "cloudflare-warp", str(st))
-        check(f"full-tunnel mode parsed ({img})", st.get("mode") == "full")
+        check(f"full-tunnel mode parsed ({img})", (st or {}).get("mode") == "full")
         break
 
 # service running but VPN switched OFF must NOT claim anything is up
@@ -104,7 +104,7 @@ with mock.patch.object(
         fake_run(images=("warp-svc.exe",), warp_status=CONNECTED,
                  settings_out="Mode: WarpProxy")):
     st = vpndetect.detect(force=True)
-    check("WARP proxy mode parsed", st.get("mode") == "proxy", str(st))
+    check("WARP proxy mode parsed", (st or {}).get("mode") == "proxy", str(st))
     check("proxy-mode why admits SOCKS5, does NOT advertise chaining",
           "SOCKS5" in vpndetect.why_text(st) and
           "Upstream proxy" not in vpndetect.why_text(st),
@@ -116,7 +116,7 @@ with mock.patch.object(
         fake_run(images=("warp-svc.exe",), warp_status=CONNECTED,
                  settings_out="totally different format")):
     st = vpndetect.detect(force=True)
-    check("unknown mode kept distinct", st.get("mode") is None, str(st))
+    check("unknown mode kept distinct", (st or {}).get("mode") is None, str(st))
     w = vpndetect.why_text(st)
     check("unknown mode gets NEUTRAL text (not the full-tunnel claim)",
           "mode could not be determined" in w and
@@ -129,7 +129,7 @@ with mock.patch.object(
                  settings_out=SETTINGS_FULL)):
     check("older CLI 'Status: Connected' recognized",
           vpndetect.detect(force=True) is not None and
-          vpndetect.detect().get("mode") == "full")
+          (vpndetect.detect() or {}).get("mode") == "full")
 
 # subprocess crash paths: TimeoutExpired (SubprocessError) and OSError
 # must BOTH yield None — the old code let TimeoutExpired escape
@@ -180,6 +180,7 @@ with mock.patch.object(vpndetect, "subprocess", types.SimpleNamespace(
         run=fake_run(images=("warp-svc.exe",), warp_status=CONNECTED,
                      settings_out=SETTINGS_FULL))):
     with vpndetect._cache_lock:
+        assert vpndetect._cache is not None   # detect() above populated it
         state, at, _ttl = vpndetect._cache
         vpndetect._cache = (state, at - 25.0, _ttl)   # expire the failure
     st = vpndetect.detect()
@@ -255,6 +256,7 @@ with mock.patch.object(notify.subprocess, "Popen",
 # ---- 5. tooltip policy: DISABLED widgets still get their tip ------------
 try:
     import tkinter as tk
+    assert tk is not None
     from hookip.tooltips import Tooltip
     root = tk.Tk()
     root.withdraw()
@@ -267,6 +269,7 @@ try:
         tip._hide()
         tip2 = Tooltip(btn, "normal", disabled_text="why disabled")
         tip2._show()
+        assert tip2._tip is not None           # _show() created it
         lbl2 = tip2._tip.children[list(tip2._tip.children)[0]]
         check("disabled_text override used",
               "why disabled" in lbl2.cget("text"), lbl2.cget("text"))
@@ -277,7 +280,7 @@ try:
     check("enabled widget unchanged", tip3._tip is not None)
     tip3._hide()
     root.destroy()
-except tk.TclError as exc:      # headless CI: skip, never fail
+except Exception as exc:        # headless CI (ImportError or TclError): skip, never fail
     print("SKIP tkinter tooltip checks:", exc)
 
 print()

@@ -7,6 +7,7 @@ import ssl
 import struct
 import threading
 import time
+from typing import Any
 
 from . import dnsmsg
 from .perf import profile
@@ -108,7 +109,7 @@ class _DoHConn:
         self.ip = ip
         self.host = host
         self.validate_by_ip = validate_by_ip   # True = SNI-LESS (IP-SAN)
-        self.sock = socket.create_connection((ip, 443), timeout=timeout)
+        self.sock: Any = socket.create_connection((ip, 443), timeout=timeout)
         self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self.sock.settimeout(timeout)
         ctx = _ssl_context()
@@ -856,7 +857,7 @@ class Resolver:
             else:
                 self._lat[name] = min(10.0, prev * 1.2 + 0.1)
 
-    def _via_doh(self, host, qtype):
+    def _via_doh(self, host, qtype):   # noqa: qtype matches _via_system
         n = len(RESOLVERS)
         with self._lock:
             order = [RESOLVERS[(self._start_idx + i) % n] for i in range(n)]
@@ -1190,7 +1191,7 @@ class Resolver:
                 self.log.debug(f"UDP DNS {ip}: unparseable response ({exc})")
         return [], 120
 
-    def _via_system(self, host, qtype):
+    def _via_system(self, host, qtype) -> tuple[list, int]:  # noqa: tests stub this
         try:
             family = socket.AF_INET6 if qtype == dnsmsg.TYPE_AAAA else socket.AF_INET
             infos = socket.getaddrinfo(host, None, family, socket.SOCK_STREAM)

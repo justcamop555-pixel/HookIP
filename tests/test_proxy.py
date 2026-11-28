@@ -482,7 +482,8 @@ def test_dpi_flag_and_raw_last_resort():
           entry is not None and entry[2] is False, str(entry))
     client.close(); client_peer.close()
     try:
-        s.close()
+        if s:
+            s.close()
     except OSError:
         pass
 
@@ -532,8 +533,8 @@ def test_always_resets_falls_through_raw():
     th2.join(10)
     with ps._fails_lock:
         entry2 = ps._fails.get("hard.test")
-    check("always-reset: capped after second full cycle", entry2[2] is True,
-          str(entry2))
+    check("always-reset: capped after second full cycle",
+          entry2 is not None and entry2[2] is True, str(entry2))
     client.close(); client_peer.close()
 
 
@@ -961,7 +962,8 @@ def test_flap_retry_recovers_known_good():
           calls == ["smart", "smart"], str(calls))
     client.close(); client_peer.close()
     try:
-        s.close()
+        if s:
+            s.close()
     except OSError:
         pass
 
@@ -1025,7 +1027,7 @@ def test_flap_retry_time_budget():
         th.join(10)
         client.close(); client_peer.close()
     finally:
-        proxymod.time = real_time.__self__ if hasattr(real_time, "__self__") else time
+        proxymod.time = getattr(real_time, "__self__", time)
     check("time budget: no flap-retry after >= 6 s of attempts",
           isinstance(result.get("err"), OSError)
           and calls == ["smart"], f"calls={calls} err={result.get('err')}")

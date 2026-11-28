@@ -69,7 +69,7 @@ with p1, p2:
               str(c2.quarantine_path))
         check("both quarantined files exist",
               os.path.isfile(SETTINGS + ".bad") and
-              os.path.isfile(c2.quarantine_path),
+              bool(c2.quarantine_path) and os.path.isfile(c2.quarantine_path),
               str(os.listdir(d)))
     else:
         print("SKIP quarantine-of-encrypted checks (non-Windows)")
@@ -135,9 +135,10 @@ if HAVE_DPAPI:
         ok = c.save()
         check("save success returns True", ok is True)
         raw = open(SETTINGS, encoding="utf-8").read()
+        _plain = dg.decrypt_bytes(raw)
         check("save wrote an encrypted file that decrypts",
-              raw.startswith("HKCFG1:") and
-              json.loads(dg.decrypt_bytes(raw).decode())["port"] == 9012,
+              raw.startswith("HKCFG1:") and _plain is not None and
+              json.loads(_plain.decode("utf-8"))["port"] == 9012,
               raw[:24])
         # failure path: os.replace raises
         c2 = Config({"port": 9013})

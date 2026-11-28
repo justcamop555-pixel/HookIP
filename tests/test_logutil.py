@@ -12,7 +12,7 @@ import unittest.mock as mock
 RESULTS = []
 
 
-def check(name, cond, detail=""):
+def check(name, cond, detail: object = ""):
     RESULTS.append((name, bool(cond)))
     print(("PASS" if cond else "FAIL") + " " + name +
           (" " + str(detail) if (detail and not cond) else ""))

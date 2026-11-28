@@ -11,7 +11,7 @@ import hookip.dnsmsg as dm  # noqa: E402
 RESULTS = []
 
 
-def check(name, cond, extra=""):
+def check(name, cond, extra: object = ""):
     RESULTS.append((name, cond))
     print(("PASS" if cond else "FAIL"), name, extra, flush=True)
 

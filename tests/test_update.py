@@ -10,7 +10,7 @@ from hookip import app as appmod  # noqa: E402
 RESULTS = []
 
 
-def check(name, cond, extra=""):
+def check(name, cond, extra: object = ""):
     RESULTS.append((name, cond))
     print(("PASS" if cond else "FAIL"), name, extra, flush=True)
 
@@ -41,6 +41,7 @@ check("real update still detected",
 
 # ---- update-flow: download ownership, same-name auto-install ----------
 import types
+from typing import Any
 from unittest import mock as _mock
 
 
@@ -69,7 +70,7 @@ class _Queue(list):
         self.append(item)
 
 
-def make_fake_app(frozen=False):
+def make_fake_app(frozen=False) -> Any:
     q = _Queue()
     return types.SimpleNamespace(
         root=types.SimpleNamespace(after=lambda *a, **k: None),

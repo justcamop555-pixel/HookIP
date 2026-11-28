@@ -153,7 +153,7 @@ check("hello_needed oversized -> 0",
 for strat in ("smart", "chunk", "random"):
     for bad in (None, "2"):
         try:
-            parts = tf.fragment(rec, strat, bad)
+            parts = tf.fragment(rec, strat, bad)  # pyright: ignore[reportArgumentType]  # deliberate non-int
             check(f"chunk_size {bad!r} ({strat})",
                   b"".join(parts) == rec and all(parts))
         except Exception as e:

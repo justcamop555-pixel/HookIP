@@ -12,6 +12,7 @@ import os
 import re
 import subprocess
 import sys
+from typing import Any
 import threading
 import time
 import winreg
@@ -709,12 +710,12 @@ class Watchdog:
     def __init__(self):
         self._event = None
         self._beat = []      # one auto-reset beat event per child
-        self._beat_stop = None
+        self._beat_stop: Any = None   # Event (or a duck-typed fake in tests)
         self._beat_thread = None
         self._procs = []
         self._proc = None
         self.event_name = None
-        self.beat_name = None
+        self.beat_name: Any = None    # str once children spawn; None before
 
     def _spawn(self, args, flags, env):
         try:

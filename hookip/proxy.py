@@ -6,7 +6,7 @@ import socket
 import threading
 import time
 from collections import deque
-from typing import Callable
+from typing import Any, Callable
 
 from . import tlsfrag
 from .perf import profile
@@ -246,7 +246,7 @@ class ProxyServer:
         # annotated so assigning the app's callable type-checks)
         self.on_accept_death: Callable[[], None] | None = None
         self._blocked_seen = {}               # host -> last 'blocked/dead' log ts
-        self._lsock = None
+        self._lsock: Any = None   # listener socket (a stub in tests)
         self._accept_thread = None
         self._ticker = None
         self._conns = set()
@@ -1202,7 +1202,9 @@ class ProxyServer:
                 pass
             raise
 
-    def _tunnel_once(self, csock, host, port, strategy, first, exclude_frag=False,
+    # NOTE: the parameter is named `excl` (matching every caller, including
+    # the test fakes); it is passed positionally in-tree
+    def _tunnel_once(self, csock, host, port, strategy, first, excl=False,
                      force_no_frag=False, count_first=True, frag_size=None):
         t0 = time.time()
         upstream_set = bool(str(getattr(self.cfg, "upstream_proxy", "") or "").strip())
@@ -1243,7 +1245,7 @@ class ProxyServer:
         server.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
         try:
-            frag = (first[:1] == b"\x16") and not exclude_frag and not force_no_frag
+            frag = (first[:1] == b"\x16") and not excl and not force_no_frag
             if frag:
                 # frag_size=None keeps the user's configured size; the
                 # ADAPTIVE path passes a SMALLER (stealthier) size after

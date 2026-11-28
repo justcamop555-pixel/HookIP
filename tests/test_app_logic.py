@@ -10,12 +10,13 @@ import urllib.request as _urlreq
 import sys
 import tempfile
 import types
+from typing import Any
 import unittest.mock as mock
 
 RESULTS = []
 
 
-def check(name, cond, detail=""):
+def check(name, cond, detail: object = ""):
     RESULTS.append((name, bool(cond)))
     print(("PASS" if cond else "FAIL") + " " + name +
           (" " + str(detail) if (detail and not cond) else ""))
@@ -82,7 +83,7 @@ class FakeProxy:
         return True
 
 
-def make_app(**extra):
+def make_app(**extra) -> Any:   # test fake, deliberately not a real App
     a = types.SimpleNamespace(
         running=False, proxy=None, cfg=None, log=FakeLog(),
         _ui_queue=_Queue(), _dl_btn=FakeBtn(), _downloading=False,
@@ -135,7 +136,7 @@ try:
             return self
 
         def __exit__(self, *a):
-            return False
+            return None            # falsy either way; base class returns None
 
     payload = b"NEW-EXE-BYTES" * 100
 
