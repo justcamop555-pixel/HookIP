@@ -45,6 +45,9 @@ def test_per_tier_limits():
     check("DoH pool scales", low.doh_pool_per_resolver < high.doh_pool_per_resolver,
           f"{low.doh_pool_per_resolver}/{high.doh_pool_per_resolver}")
     check("cache caps scale", low.cache_cap < high.cache_cap)
+    check("accept backlog scales low < high",
+          low.accept_backlog < high.accept_backlog,
+          f"{low.accept_backlog}/{high.accept_backlog}")
     check("dashboard redraws slower on low tier",
           low.dash_interval_ms > high.dash_interval_ms,
           f"{low.dash_interval_ms}/{high.dash_interval_ms} ms")
@@ -61,20 +64,37 @@ def test_per_tier_limits():
           all(t.log_screen_lines < t.log_buffer for t in (low, mid, high)))
     check("describe() mentions tier and limits",
           all(s in high.describe() for s in ("high", "connections", "DoH conns")))
+    check("describe() is honest about SMT (logical cores)",
+          "logical cores" in high.describe(), high.describe())
+
+
+def test_profile_threadsafe():
+    """profile() initializes once under concurrent first calls — the
+    double-checked lock must not build two different Profile objects."""
+    import threading as _th
+    with mock.patch.object(perf, "_PROFILE", None):
+        seen = []
+        barrier = _th.Barrier(8)
+        def worker():
+            barrier.wait()
+            seen.append(perf.profile())
+        ths = [_th.Thread(target=worker) for _ in range(8)]
+        for t in ths:
+            t.start()
+        for t in ths:
+            t.join(5)
+        check("concurrent profile() callers share ONE instance",
+              len(seen) == 8 and all(s is seen[0] for s in seen))
+    # restore a clean singleton for other tests
+    with mock.patch.object(perf, "_PROFILE", None):
+        perf.profile()
 
 
 def test_log_uses_profile():
-    fake = Profile.__new__(Profile)
-    fake.tier = "low"
-    fake.cores = 2
-    fake.ram_gb = 8.0
-    fake.max_connections = 96
-    fake.doh_pool_per_resolver = 1
-    fake.cache_cap = 1024
-    fake.neg_cache_cap = 512
-    fake.domain_cap = 200
-    fake.dash_interval_ms = 1000
-    fake.idle_dash_interval_ms = 3000
+    # built from a REAL low-tier profile (copy + override) so adding a new
+    # profile field never leaves this fake with a missing attribute
+    import copy
+    fake = copy.copy(tier_for(2, 8.0))
     fake.log_buffer = 1234
     fake.log_screen_lines = 1000
     with mock.patch.object(perf, "_PROFILE", fake):
@@ -86,7 +106,8 @@ def test_log_uses_profile():
         check("explicit maxlen still wins", lg2._buf.maxlen == 77)
 
 
-for fn in (test_tiers, test_per_tier_limits, test_log_uses_profile):
+for fn in (test_tiers, test_per_tier_limits, test_profile_threadsafe,
+           test_log_uses_profile):
     fn()
 
 print()

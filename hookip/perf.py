@@ -7,6 +7,7 @@ Everything stays within stdlib — no third-party hardware libraries.
 """
 import ctypes
 import os
+import threading
 
 
 def _cpu_count():
@@ -61,6 +62,7 @@ class Profile:
             self.idle_dash_interval_ms = 3000
             self.log_buffer = 1200           # in-memory history entries
             self.log_screen_lines = 1000     # max lines in the on-screen log
+            self.accept_backlog = 64         # pending accepts before refusal
         elif self.tier == "high":
             self.max_connections = 512
             self.doh_pool_per_resolver = 4
@@ -71,6 +73,7 @@ class Profile:
             self.idle_dash_interval_ms = 2000
             self.log_buffer = 3000
             self.log_screen_lines = 2500
+            self.accept_backlog = 256
         else:  # mid
             self.max_connections = 256
             self.doh_pool_per_resolver = 2
@@ -81,20 +84,29 @@ class Profile:
             self.idle_dash_interval_ms = 2500
             self.log_buffer = 2500
             self.log_screen_lines = 2000
+            self.accept_backlog = 128
 
     def describe(self):
+        # 'logical cores' — os.cpu_count() counts SMT threads; a 4C/8T
+        # laptop reports 8 and the honest label prevents the reader from
+        # assuming physical cores
         ram = f"{self.ram_gb:.0f} GB RAM" if self.ram_gb else "RAM n/a"
-        return (f"{self.tier} ({self.cores} cores, {ram}) — up to "
+        return (f"{self.tier} ({self.cores} logical cores, {ram}) — up to "
                 f"{self.max_connections} connections, "
                 f"{self.doh_pool_per_resolver} DoH conns/resolver")
 
 
 _PROFILE = None
+_profile_lock = threading.Lock()
 
 
 def profile():
-    """Process-wide profile (detected once)."""
+    """Process-wide profile (detected once). Thread-safe: Resolver init
+    and the proxy import both call this from different threads."""
     global _PROFILE
     if _PROFILE is None:
-        _PROFILE = Profile()
+        with _profile_lock:
+            if _PROFILE is None:      # double-checked: a second thread
+                                      # may have built it while we waited
+                _PROFILE = Profile()
     return _PROFILE

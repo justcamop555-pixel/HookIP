@@ -247,7 +247,7 @@ class ProxyServer:
             raise OSError(
                 f"port {self.cfg.port} is already in use by another program "
                 f"({exc}) — change the port in Settings or close the other app") from exc
-        sock.listen(128)
+        sock.listen(profile().accept_backlog)   # hardware-scaled backlog
         self._lsock = sock
         self.running = True
         self._accept_thread = threading.Thread(target=self._accept_loop, name="hookip-accept", daemon=True)
