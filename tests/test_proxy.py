@@ -427,7 +427,7 @@ def test_dpi_flag_and_raw_last_resort():
     calls = []
 
     def fake_tunnel_once(csock, host, port, strategy, first, excl=False,
-                         force_no_frag=False, count_first=True):
+                         force_no_frag=False, count_first=True, frag_size=None):
         calls.append((strategy, force_no_frag))
         if strategy == "raw" and force_no_frag:
             s1, s2 = socketpair()
@@ -466,7 +466,7 @@ def test_always_resets_falls_through_raw():
     calls = []
 
     def fake_tunnel_once(csock, host, port, strategy, first, excl=False,
-                         force_no_frag=False, count_first=True):
+                         force_no_frag=False, count_first=True, frag_size=None):
         calls.append((strategy, force_no_frag))
         raise DpiReset(f"{host}:{port} connection reset during ClientHello "
                        f"(possible DPI reset)")
@@ -484,8 +484,14 @@ def test_always_resets_falls_through_raw():
         else:
             msg = str(err)
             check("always-reset raises final OSError", "failed" in msg, msg[:80])
+            # smart/chunk/random + raw last resort + ADAPTIVE SECOND ROUND
+            # (smart again with 2-byte fragments — a different weapon
+            # after everything default died)
             check("always-reset: unfragmented attempt was made",
-                  ("raw", True) in calls and len(calls) == 4, str(calls))
+                  ("raw", True) in calls and len(calls) == 5, str(calls))
+            check("always-reset: adaptive second round re-tried smart",
+                  calls[-1] == ("smart", False) and calls[0] == ("smart", False),
+                  str(calls))
             check("always-reset: attempt errors listed",
                   "smart" in msg and "unfragmented" in msg, msg[-80:])
     finally:
@@ -510,7 +516,7 @@ def test_no_string_matching():
     ps = make_server()
 
     def fake_tunnel_once(csock, host, port, strategy, first, excl=False,
-                         force_no_frag=False, count_first=True):
+                         force_no_frag=False, count_first=True, frag_size=None):
         calls.append(strategy)
         raise OSError(f"{host}:{port} could not connect (timeout)")
 
@@ -909,7 +915,7 @@ def test_flap_retry_recovers_known_good():
     calls = []
 
     def fake_tunnel_once(csock, host, port, strategy, first, excl=False,
-                         force_no_frag=False, count_first=True):
+                         force_no_frag=False, count_first=True, frag_size=None):
         calls.append(strategy)
         if len(calls) >= 2:
             s1, _s2 = socketpair()               # the alive window opens on
@@ -941,7 +947,7 @@ def test_flap_retry_skips_never_worked():
     calls = []
 
     def fake_tunnel_once(csock, host, port, strategy, first, excl=False,
-                         force_no_frag=False, count_first=True):
+                         force_no_frag=False, count_first=True, frag_size=None):
         calls.append(strategy)
         raise proxymod.ConnectDead(
             f"{host}:{port} could not connect (1 address(es) tried, timed out)")
@@ -966,7 +972,7 @@ def test_flap_retry_time_budget():
     calls = []
 
     def fake_tunnel_once(csock, host, port, strategy, first, excl=False,
-                         force_no_frag=False, count_first=True):
+                         force_no_frag=False, count_first=True, frag_size=None):
         calls.append(strategy)
         time.sleep(0.05)                     # simulated cost per attempt
         offset[0] += 7.0                     # each attempt 'costs' 7 s of
@@ -1122,7 +1128,7 @@ def test_connect_dead_fail_fast():
     calls = []
 
     def fake_tunnel_once(csock, host, port, strategy, first, excl=False,
-                         force_no_frag=False, count_first=True):
+                         force_no_frag=False, count_first=True, frag_size=None):
         calls.append(strategy)
         raise proxymod.ConnectDead(
             f"{host}:{port} could not connect (1 address(es) tried, timed out)")
@@ -1321,7 +1327,7 @@ def test_upstream_connect_failure_is_connectdead():
     calls = []
 
     def fake_once(csock, host, port, strategy, first, excl=False,
-                  force_no_frag=False, count_first=True):
+                  force_no_frag=False, count_first=True, frag_size=None):
         calls.append(strategy)
         raise ConnectDead("network proxy refused")
 
@@ -1433,7 +1439,7 @@ def test_retry_stats_count_first_once():
     calls = []
 
     def fake_once(csock, host, port, strategy, first, excl=False,
-                  force_no_frag=False, count_first=True):
+                  force_no_frag=False, count_first=True, frag_size=None):
         calls.append((strategy, count_first))
         if len(calls) == 1:
             # pretend the relay ran and counted the first flight
@@ -1479,6 +1485,261 @@ def test_retry_stats_count_first_once():
     c1.close(); c2.close(); s1.close()
 
 
+# ---- adaptive DPI retry -------------------------------------------------
+def test_adaptive_escalates_frag_after_kill():
+    """After the FIRST DPI kill in a connection, later attempts use the
+    stealthiest fragment size (2), not the configured default."""
+    ps = make_server(fragment_size=8)
+    calls = []
+
+    def fake(csock, host, port, strategy, first, excl=False,
+             force_no_frag=False, count_first=True, frag_size=None):
+        calls.append((strategy, frag_size))
+        raise DpiReset(f"{host}:{port} reset during ClientHello")
+
+    ps._tunnel_once = fake
+    client, peer = socketpair()
+    res = {}
+    th = run_tunnel_async(ps, client, peer, "escal.test", 443, res)
+    th.join(10)
+    check("adaptive: attempt 1 uses the configured size",
+          calls[0] == ("smart", None), str(calls))
+    # every FRAGMENTED attempt after the first kill escalates to 2;
+    # the raw last resort never fragments (frag_size None is correct)
+    check("adaptive: fragmented attempts 2+ escalate to 2-byte fragments",
+          all(fs == 2 for (s, fs) in calls[1:] if s != "raw"), str(calls))
+    check("adaptive: raw last resort passes no override",
+          ("raw", None) in calls, str(calls))
+    check("adaptive: per-host memory recorded the kills",
+          ps._recent_dpi("escal.test") >= 3, str(ps._dpi_hist.get("escal.test")))
+    client.close(); peer.close()
+
+
+def test_adaptive_hot_start():
+    """A host with >= 2 recent DPI kills starts its NEXT connection on
+    2-byte fragments immediately."""
+    ps = make_server(fragment_size=8)
+    calls = []
+
+    def fake(csock, host, port, strategy, first, excl=False,
+             force_no_frag=False, count_first=True, frag_size=None):
+        calls.append((strategy, frag_size))
+        if len(calls) >= 2:
+            s1, _s2 = socketpair()
+            return s1
+        raise DpiReset(f"{host}:{port} reset during ClientHello")
+
+    ps._tunnel_once = fake
+    for _ in range(3):
+        ps._note_dpi("hot.test")           # the filter killed it 3x before
+    client, peer = socketpair()
+    res = {}
+    th = run_tunnel_async(ps, client, peer, "hot.test", 443, res)
+    th.join(10)
+    check("adaptive: hot host starts on 2-byte fragments",
+          res.get("ok") and calls[0] == ("smart", 2), str(calls))
+    client.close(); peer.close()
+
+
+def test_adaptive_backoff_sleeps():
+    """Between DPI-killed attempts the adaptive layer sleeps an escalating
+    pause (patched _SLEEP records it); plain ConnectDead sleeps nothing."""
+    ps = make_server()
+    slept = []
+    real_sleep = proxymod._SLEEP
+    proxymod._SLEEP = lambda s: slept.append(s)
+    try:
+        calls = []
+
+        def fake(csock, host, port, strategy, first, excl=False,
+                 force_no_frag=False, count_first=True, frag_size=None):
+            calls.append(strategy)
+            raise DpiReset(f"{host}:{port} reset during ClientHello")
+
+        ps._tunnel_once = fake
+        client, peer = socketpair()
+        res = {}
+        th = run_tunnel_async(ps, client, peer, "backoff.test", 443, res)
+        th.join(10)
+        # sleeps BEFORE attempts 2..n: escalating 0.05/0.1 (capped 0.25)
+        check("adaptive: escalating backoff between killed attempts",
+              len(slept) >= 2 and slept[0] <= slept[-1] and
+              all(0 < s <= 0.25 for s in slept), str(slept))
+        # sleeps happen only BEFORE an in-loop attempt that follows a
+        # kill: smart-kill -> 0.05 before chunk, chunk-kill -> 0.1 before
+        # random; the random kill ends the LOOP (raw/second round are
+        # outside it and get no extra pause)
+        check("adaptive: backoff between in-loop attempts only",
+              slept == [0.05, 0.1], f"{slept} vs {calls}")
+        client.close(); peer.close()
+
+        # plain (non-DPI) failures must NOT sleep
+        slept.clear()
+        calls.clear()
+
+        def fake_dead(csock, host, port, strategy, first, excl=False,
+                      force_no_frag=False, count_first=True, frag_size=None):
+            calls.append(strategy)
+            raise proxymod.ConnectDead(f"{host}:{port} timed out")
+
+        ps._tunnel_once = fake_dead
+        client2, peer2 = socketpair()
+        res2 = {}
+        th2 = run_tunnel_async(ps, client2, peer2, "backoff2.test", 443, res2)
+        th2.join(10)
+        check("adaptive: no backoff for plain connect-dead",
+              slept == [], str(slept))
+        client2.close(); peer2.close()
+    finally:
+        proxymod._SLEEP = real_sleep
+
+
+def test_adaptive_second_round_dpi_host():
+    """A DPI-killed host (never succeeded) gets the adaptive second round
+    with 2-byte fragments; a never-seen host without DPI kills does not."""
+    ps = make_server()
+    calls = []
+
+    def fake(csock, host, port, strategy, first, excl=False,
+             force_no_frag=False, count_first=True, frag_size=None):
+        calls.append((strategy, frag_size))
+        # the adaptive SECOND ROUND is the only smart attempt with
+        # frag_size=2 (the in-loop first attempt is smart at the default
+        # size) — succeed exactly there
+        if strategy == "smart" and frag_size == 2:
+            s1, _s2 = socketpair()
+            return s1
+        raise DpiReset(f"{host}:{port} reset during ClientHello")
+
+    ps._tunnel_once = fake
+    client, peer = socketpair()
+    res = {}
+    th = run_tunnel_async(ps, client, peer, "second.test", 443, res)
+    th.join(10)
+    check("adaptive: second round runs for a DPI-killed host and wins",
+          res.get("ok") and calls[-1] == ("smart", 2) and len(calls) == 5,
+          str(calls))
+    check("adaptive: second round logged honestly",
+          any("adaptive second" in msg
+              for (_lvl, msg) in getattr(ps.log, "lines", [])),
+          str(getattr(ps.log, "lines", [])))
+    client.close(); peer.close()
+
+    # never-failed, non-DPI host: NO second round (existing contract)
+    ps2 = make_server()
+    calls2 = []
+
+    def fake2(csock, host, port, strategy, first, excl=False,
+              force_no_frag=False, count_first=True, frag_size=None):
+        calls2.append(strategy)
+        raise proxymod.ConnectDead(f"{host}:{port} timed out")
+
+    ps2._tunnel_once = fake2
+    client2, peer2 = socketpair()
+    res2 = {}
+    th2 = run_tunnel_async(ps2, client2, peer2, "plain.test", 443, res2)
+    th2.join(10)
+    check("adaptive: no second round without DPI kills or history",
+          isinstance(res2.get("err"), OSError) and len(calls2) == 1,
+          str(calls2))
+    client2.close(); peer2.close()
+
+
+def test_adaptive_respects_configured_min():
+    """Escalation must never go COARSER than the user's configured size:
+    a user already on 1-byte fragments is not 'escalated' to 2."""
+    ps = make_server(fragment_size=1)
+    calls = []
+
+    def fake(csock, host, port, strategy, first, excl=False,
+             force_no_frag=False, count_first=True, frag_size=None):
+        calls.append((strategy, frag_size))
+        raise DpiReset(f"{host}:{port} reset during ClientHello")
+
+    ps._tunnel_once = fake
+    client, peer = socketpair()
+    res = {}
+    th = run_tunnel_async(ps, client, peer, "tiny.test", 443, res)
+    th.join(10)
+    check("adaptive: escalation stays at the configured 1-byte minimum",
+          all(fs == 1 for (s, fs) in calls if s not in ("raw",) and fs is not None),
+          str(calls))
+    check("adaptive: nothing coarser than 1 was ever used",
+          all(fs in (None, 1) for (_s, fs) in calls), str(calls))
+    client.close(); peer.close()
+
+
+def test_adaptive_capped_host_no_second_round():
+    """A repeat-failure (capped) DPI host keeps the fast-fail contract:
+    single strategy + raw last resort, NO adaptive second round."""
+    ps = make_server()
+    calls = []
+
+    def fake(csock, host, port, strategy, first, excl=False,
+             force_no_frag=False, count_first=True, frag_size=None):
+        calls.append((strategy, frag_size))
+        raise DpiReset(f"{host}:{port} reset during ClientHello")
+
+    ps._tunnel_once = fake
+    # cap the host exactly like two previous full failures would
+    ps._note_fail("capped.test", dpi=True)
+    ps._note_fail("capped.test", dpi=True)
+    client, peer = socketpair()
+    res = {}
+    th = run_tunnel_async(ps, client, peer, "capped.test", 443, res)
+    th.join(10)
+    check("adaptive: capped host gets no second round",
+          isinstance(res.get("err"), OSError) and len(calls) == 2 and
+          calls[-1] == ("raw", None), str(calls))
+    client.close(); peer.close()
+
+
+def test_adaptive_raw_pref_escalates():
+    """A DPI kill on the remembered-raw first attempt feeds the SAME
+    adaptive machinery: memory recorded + backoff before the next loop
+    attempt."""
+    ps = make_server()
+    with ps._state_lock:
+        ps._strat_pref["rawpref.test"] = "raw"
+    calls = []
+    slept = []
+    real_sleep = proxymod._SLEEP
+    proxymod._SLEEP = lambda s: slept.append(s)
+    try:
+        def fake(csock, host, port, strategy, first, excl=False,
+                 force_no_frag=False, count_first=True, frag_size=None):
+            calls.append((strategy, frag_size, force_no_frag))
+            raise DpiReset(f"{host}:{port} reset during ClientHello")
+
+        ps._tunnel_once = fake
+        client, peer = socketpair()
+        res = {}
+        th = run_tunnel_async(ps, client, peer, "rawpref.test", 443, res)
+        th.join(10)
+        check("adaptive: raw-pref kill recorded in DPI memory",
+              ps._recent_dpi("rawpref.test") >= 1)
+        check("adaptive: backoff applies after the raw-pref kill too",
+              slept[:1] == [0.05], str(slept))
+        check("adaptive: raw-pref attempt was unfragmented",
+              calls[0] == ("raw", None, True), str(calls))
+        client.close(); peer.close()
+    finally:
+        proxymod._SLEEP = real_sleep
+
+
+def test_dpi_hist_bounded():
+    ps = make_server()
+    for i in range(300):
+        ps._note_dpi(f"h{i}.test")
+    check("adaptive memory stays bounded", len(ps._dpi_hist) <= 257,
+          str(len(ps._dpi_hist)))
+    ps._note_dpi("h0.test")
+    check("per-host kill list is trimmed to the newest 8",
+          len(ps._dpi_hist["h0.test"]) <= 8)
+    check("recent window counts only fresh kills",
+          ps._recent_dpi("h0.test") == 1)
+
+
 if __name__ == "__main__":
 
     test_parse_head_body()
@@ -1516,6 +1777,14 @@ if __name__ == "__main__":
     test_pac_wildcards_and_safety()
     test_connect_parallel_closes_late_winner()
     test_retry_stats_count_first_once()
+    test_adaptive_escalates_frag_after_kill()
+    test_adaptive_hot_start()
+    test_adaptive_backoff_sleeps()
+    test_adaptive_second_round_dpi_host()
+    test_adaptive_respects_configured_min()
+    test_adaptive_capped_host_no_second_round()
+    test_adaptive_raw_pref_escalates()
+    test_dpi_hist_bounded()
 
     print()
     print(f"Summary: {sum(1 for _, c in RESULTS if c)}/{len(RESULTS)} passed")

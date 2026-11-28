@@ -20,6 +20,10 @@ class ClientAbortError(OSError):
     proxy failure and must not be counted or alarmed as one."""
 
 
+# patchable for tests: adaptive backoff between DPI-killed attempts
+_SLEEP = time.sleep
+
+
 class DpiReset(OSError):
     """The upstream reset/killed the connection during the ClientHello
     exchange — the classic DPI fingerprint-kill signature. Fragmentation
@@ -236,6 +240,11 @@ class ProxyServer:
         self._detail_lock = threading.Lock()
         self._cut_seen = {}                   # host -> ts (mid-transfer cut dedupe)
         self._failnote_seen = {}              # host -> ts (repeat-failure note dedupe)
+        # ADAPTIVE DPI-RETRY memory: host -> [kill timestamps] (bounded).
+        # A host the filter keeps killing gets the stealthiest setup from
+        # the first attempt of the NEXT connection, instead of replaying
+        # the same losing handshake every time.
+        self._dpi_hist = {}                   # guarded by _fails_lock
         # one lock for the shared state dicts above (_strat_pref,
         # _blocked_seen, _cut_seen, _failnote_seen): they are mutated from
         # many threads and bare next(iter(...)) evictions can raise
@@ -481,6 +490,38 @@ class ProxyServer:
             if not note_recent:
                 self.log.debug(f"{host}: marked as repeat-failure — "
                                "next connections will try a single strategy")
+
+    def _note_dpi(self, host):
+        """Record a DPI reset for `host` — the adaptive-retry memory.
+
+        Kills inside ONE connection are handled by escalation there
+        (backoff + stealthier fragments); this makes the memory survive
+        across connections: a host the filter keeps killing starts its
+        NEXT connection with the stealthiest fragmentation instead of
+        replaying the same losing handshake. Bounded; guarded by
+        _fails_lock (shared with the small _fails map)."""
+        now = time.time()
+        with self._fails_lock:
+            hist = self._dpi_hist.get(host)
+            if hist is None:
+                if len(self._dpi_hist) > 256:
+                    # drop hosts whose newest kill is older than 10 min
+                    for h in [h for h, ts in self._dpi_hist.items()
+                              if not ts or ts[-1] < now - 600]:
+                        del self._dpi_hist[h]
+                    if len(self._dpi_hist) > 256:
+                        self._dpi_hist.clear()
+                hist = self._dpi_hist[host] = []
+            hist.append(now)
+            del hist[:-8]              # keep the newest 8 kills per host
+
+    def _recent_dpi(self, host, window=300.0):
+        """DPI kills for `host` within the last `window` seconds (0 when
+        none / memory empty)."""
+        now = time.time()
+        with self._fails_lock:
+            hist = self._dpi_hist.get(host)
+            return sum(1 for t in (hist or []) if now - t < window)
 
     def _recent_fail(self, host):
         with self._fails_lock:
@@ -785,6 +826,27 @@ class ProxyServer:
             # this host failed everything moments ago — one attempt instead of
             # re-burning 3 full strategy cycles on every new connection
             strategies = strategies[:1]
+        # was this host ALREADY repeat-failure-capped BEFORE this connection?
+        # (captured here: _note_fail below caps non-DPI failures immediately,
+        # so reading it after the loop would be always-true)
+        was_capped = self._recent_fail(host)
+        # ADAPTIVE per-connection state (initialized BEFORE the raw-pref
+        # attempt so a DPI kill THERE also escalates and backs off)
+        dpi_kills = 0
+        need_backoff = False
+        # ADAPTIVE START: a host the filter DPI-killed RECENTLY (memory
+        # across connections) begins with the stealthiest fragmentation —
+        # 2-byte pieces — instead of replaying the handshake that just
+        # died. NEVER coarser than the user's configured size (a user on
+        # 1-byte fragments must not be 'escalated' to 2). Excluded hosts
+        # keep their single plain attempt.
+        stealth = min(2, max(1, self.cfg.fragment_size))
+        hot_kills = 0 if excl else self._recent_dpi(host)
+        frag_now = stealth if hot_kills >= 2 else None
+        if hot_kills >= 2:
+            self.log.debug(
+                f"{host}: DPI killed {hot_kills} recent handshakes — "
+                f"starting with {stealth}-byte fragments (adaptive)")
 
         last_err = None
         attempt_errors = []
@@ -850,6 +912,9 @@ class ProxyServer:
                     count_first = False    # its first flight was counted
                 if isinstance(exc, DpiReset):
                     saw_dpi = True
+                    dpi_kills += 1
+                    self._note_dpi(host)
+                    need_backoff = True    # the strategies loop backs off
                 last_err = exc
                 attempt_errors.append(f"raw: {exc}")
                 self.log.debug(f"{host}: raw attempt failed: {exc}")
@@ -857,9 +922,17 @@ class ProxyServer:
                     raise OSError(f"{host}:{port} failed (raw): {exc}")
 
         for attempt, strategy in enumerate(strategies):
+            if need_backoff:
+                # DPI middleboxes commonly kill IMMEDIATE reconnects (the
+                # retry looks like the same flow). A short escalating
+                # pause defeats that cheaply: 0.05 → 0.1 → 0.2 s, capped
+                # at 0.25 s (the 6 s overall budget still governs).
+                _SLEEP(min(0.05 * (2 ** (dpi_kills - 1)), 0.25))
+                need_backoff = False
             try:
                 ssock = self._tunnel_once(csock, host, port, strategy, first,
-                                          excl, count_first=count_first)
+                                          excl, count_first=count_first,
+                                          frag_size=frag_now)
                 self._remember_strat(host, strategy)
                 return ssock
             except ResolveError as exc:
@@ -887,6 +960,18 @@ class ProxyServer:
                     count_first = False
                 if isinstance(exc, DpiReset):
                     saw_dpi = True
+                    dpi_kills += 1
+                    self._note_dpi(host)
+                    if frag_now != stealth:
+                        # ADAPTIVE ESCALATION: after the first kill in
+                        # this connection, every remaining fragmented
+                        # attempt uses the stealthiest split
+                        frag_now = stealth
+                        self.log.debug(
+                            f"{host}: DPI reset — escalating to "
+                            f"{stealth}-byte fragments for the remaining "
+                            "attempts")
+                    need_backoff = True
                 last_err = exc
                 attempt_errors.append(f"{strategy}: {exc}")
                 self.log.debug(f"{host}: attempt {attempt+1} ({strategy}) failed: {exc}")
@@ -922,21 +1007,39 @@ class ProxyServer:
             except (OSError, ResolveError) as exc2:
                 attempt_errors.append(f"unfragmented: {exc2}")
                 last_err = exc2
-        # FLAP RETRY: a host that tunneled successfully BEFORE and now
-        # fails every strategy within a few seconds is flapping, not dead
-        # (www.gnu.org's single A record does exactly this: some SYNs land
-        # and complete, the rest die mid-handshake). One more fresh round
-        # is cheap on the rare failure and catches the alive window;
-        # hosts that NEVER succeeded get nothing extra — their failures
-        # stay fast. Skipped for excluded hosts (single attempt by design).
-        if not excl and host in self._strat_pref and (time.time() - t_start) < 6.0:
+        # FLAP RETRY / ADAPTIVE SECOND ROUND: one more fresh attempt when
+        # the 6 s budget allows.
+        #   - a host that tunneled successfully BEFORE and now fails every
+        #     strategy is flapping, not dead (www.gnu.org's single A record:
+        #     some SYNs land, the rest die mid-handshake) — retry 'smart';
+        #   - a host the filter DPI-killed through every strategy AND the
+        #     unfragmented last resort gets a second round with the
+        #     STEALTHIEST split (2-byte fragments) — a different weapon,
+        #     not a repeat of the losing handshakes.
+        # Excluded hosts keep their single attempt by design.
+        # A host ALREADY repeat-failure-capped keeps its fast-fail contract
+        # for the DPI second round (the raw last resort above was its extra
+        # chance). Hosts with remembered history keep the flap-retry round
+        # they always had.
+        if not excl and (host in self._strat_pref or
+                         (saw_dpi and not was_capped)) and \
+                (time.time() - t_start) < 6.0:
             try:
                 ssock = self._tunnel_once(csock, host, port, "smart", first,
-                                          excl, count_first=count_first)
-                self.log.info(
-                    f"{host}:{port} recovered on a second round after all "
-                    "strategies failed — the host is flapping (intermittent "
-                    "upstream), not blocked.")
+                                          excl, count_first=count_first,
+                                          frag_size=stealth if saw_dpi else None)
+                if saw_dpi and host not in self._strat_pref:
+                    self.log.info(
+                        f"{host}:{port} recovered on the adaptive second "
+                        f"round with {stealth}-byte fragments after DPI "
+                        "kills — the stealthiest split got through where "
+                        "the default fragmentation and the plain handshake "
+                        "died.")
+                else:
+                    self.log.info(
+                        f"{host}:{port} recovered on a second round after all "
+                        "strategies failed — the host is flapping (intermittent "
+                        "upstream), not blocked.")
                 self._remember_strat(host, "smart")
                 return ssock
             except (OSError, ResolveError) as exc3:
@@ -1075,7 +1178,7 @@ class ProxyServer:
             raise
 
     def _tunnel_once(self, csock, host, port, strategy, first, exclude_frag=False,
-                     force_no_frag=False, count_first=True):
+                     force_no_frag=False, count_first=True, frag_size=None):
         t0 = time.time()
         upstream_set = bool(str(getattr(self.cfg, "upstream_proxy", "") or "").strip())
         if upstream_set:
@@ -1117,7 +1220,11 @@ class ProxyServer:
         try:
             frag = (first[:1] == b"\x16") and not exclude_frag and not force_no_frag
             if frag:
-                chunks = tlsfrag.fragment(first, strategy, self.cfg.fragment_size)
+                # frag_size=None keeps the user's configured size; the
+                # ADAPTIVE path passes a SMALLER (stealthier) size after
+                # DPI kills — 2 bytes is the hardest-to-fingerprint split
+                size = self.cfg.fragment_size if frag_size is None else frag_size
+                chunks = tlsfrag.fragment(first, strategy, size)
             elif first:
                 chunks = [first]
             else:
