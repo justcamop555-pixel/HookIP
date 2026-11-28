@@ -477,5 +477,28 @@ check("stop falls back to direct when no backup and cur is ours",
 check("stop toast is HONEST about the direct fallback",
       any("direct connection" in a[1] for (a, k) in toasts),
       str(toasts))
+# ---- 5. tray: native menu mapping, lifecycle, clean stop ----------------
+from hookip import tray as _traymod   # noqa: E402
+
+check("tray menu ids map to pump events",
+      _traymod._menu_event(_traymod.MENU_SHOW) == "show" and
+      _traymod._menu_event(_traymod.MENU_TOGGLE) == "toggle" and
+      _traymod._menu_event(_traymod.MENU_EXIT) == "exit" and
+      _traymod._menu_event(0) is None)          # dismissed by keyboard -> no event
+
+_t = _traymod.TrayIcon("HookIP test tray")
+_t.start()
+try:
+    check("tray icon thread comes up", _t.available and _t._hwnd is not None)
+    _t.set_menu_state(True)
+    check("menu state reflects running", _t._menu_running is True)
+    check("menu state plain bool (thread-safe by design)",
+          isinstance(_t._menu_running, bool))
+finally:
+    _t.stop()          # posts WM_APP_SHUTDOWN -> DestroyWindow -> WM_DESTROY
+    _t._thread.join(timeout=5)
+check("tray thread stops cleanly (no leaked message loop)",
+      not _t._thread.is_alive())
+
 print(f"Summary: {sum(1 for _, c in RESULTS if c)}/{len(RESULTS)} passed")
 sys.exit(0 if all(c for _, c in RESULTS) else 1)

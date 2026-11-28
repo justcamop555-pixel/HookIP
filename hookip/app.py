@@ -409,8 +409,13 @@ class App:
                 kind = ev[0]
                 if kind == "show":
                     self._show_self()
+                elif kind == "toggle":
+                    self.toggle()
                 elif kind == "menu":
-                    self._tray_menu(ev[1], ev[2])
+                    # legacy Win32-menu event from an older tray build —
+                    # kept so a hot-swapped tray module never strands an
+                    # unhandled event
+                    self._show_self()
                 elif kind == "exit":
                     self.on_close()
                     return
@@ -428,17 +433,6 @@ class App:
         except (tk.TclError, RuntimeError):
             return
 
-    def _tray_menu(self, x, y):
-        menu = tk.Menu(self.root, tearoff=0)
-        menu.add_command(label="Show HookIP", command=self._show_self)
-        menu.add_command(label=("⏹ Stop proxy" if self.running else "▶ Start proxy"),
-                         command=self.toggle)
-        menu.add_separator()
-        menu.add_command(label="Exit", command=self.on_close)
-        try:
-            menu.tk_popup(x, y)
-        finally:
-            menu.grab_release()
 
     # -- update check ----------------------------------------------------
     UPDATE_REPO = "justcamop555-pixel/HookIP"
@@ -2367,6 +2361,11 @@ class App:
         self.status_pill.configure(
             text="● Running" if running else "● Stopped",
             fg=OK if running else MUTED)
+        # the native tray menu rebuilds its Start/Stop label from this
+        try:
+            self.tray.set_menu_state(running)
+        except Exception:
+            pass
         if self.tray.available:
             self.tray.set_tip(f"{APP_NAME} — {'running' if running else 'stopped'}")
         try:

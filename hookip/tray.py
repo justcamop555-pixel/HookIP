@@ -20,10 +20,32 @@ NIM_ADD, NIM_MODIFY, NIM_DELETE = 0, 1, 2
 NIF_MESSAGE, NIF_ICON, NIF_TIP = 0x01, 0x02, 0x04
 
 WM_APP_TRAY = 0x8000 + 0x4B1          # our callback message id
+WM_APP_SHUTDOWN = 0x8000 + 0x4B2      # clean tray-window shutdown
 WM_LBUTTONDBLCLK = 0x0203
 WM_RBUTTONUP = 0x0205
 WM_LBUTTONUP = 0x0202
 WM_DESTROY = 0x0002
+WM_NULL = 0x0000
+
+# native popup menu (the dismissal fix lives in _show_menu)
+TPM_RIGHTBUTTON = 0x0002
+TPM_BOTTOMALIGN = 0x0020
+TPM_RETURNCMD = 0x0100
+MENU_SHOW, MENU_TOGGLE, MENU_EXIT = 1, 2, 3
+
+
+def _menu_event(cmd_id):
+    """TrackPopupMenuEx (TPM_RETURNCMD) id -> event name for the pump."""
+    return {MENU_SHOW: "show", MENU_TOGGLE: "toggle", MENU_EXIT: "exit"}.get(cmd_id)
+
+_user32.CreatePopupMenu.restype = wintypes.HMENU
+_user32.AppendMenuW.argtypes = [wintypes.HMENU, wintypes.UINT,
+                                ctypes.c_size_t, wintypes.LPCWSTR]
+_user32.TrackPopupMenuEx.argtypes = [wintypes.HMENU, wintypes.UINT,
+                                     wintypes.INT, wintypes.INT,
+                                     wintypes.HWND, wintypes.LPVOID]
+_user32.TrackPopupMenuEx.restype = wintypes.BOOL   # with TPM_RETURNCMD:
+                                                   # actually the cmd id
 
 
 class NOTIFYICONDATAW(ctypes.Structure):
@@ -110,7 +132,15 @@ def _load_app_icon():
 
 class TrayIcon:
     """Owns the tray icon. Events are delivered on self.events:
-       ("show",), ("menu", x, y), ("exit",)  — all raised from the Tk side."""
+       ("show",), ("toggle",), ("exit",)  — all raised from the Tk side.
+
+    The context menu is NATIVE (Win32 TrackPopupMenuEx on the tray's own
+    message window), NOT a Tk tk_popup: a popup shown while NO window of
+    our process owns the foreground is never told about outside clicks
+    and stays stuck on screen until the user clicks one of its items —
+    the classic tray-menu bug. SetForegroundWindow before tracking + a
+    posted WM_NULL after (Raymond Chen's fix) makes it dismiss on the
+    first outside click, every time."""
 
     def __init__(self, title):
         self.events = queue.Queue()
@@ -121,6 +151,7 @@ class TrayIcon:
         self._ready = threading.Event()
         self._visible = False
         self._failed = False
+        self._menu_running = False    # proxy running (menu label only)
 
     # -- public ------------------------------------------------------------
     def start(self):
@@ -133,9 +164,18 @@ class TrayIcon:
     def stop(self):
         try:
             if self._hwnd:
-                _user32.PostMessageW(self._hwnd, WM_DESTROY, 0, 0)
+                # a proper shutdown request: the wndproc calls
+                # DestroyWindow, which DELIVERS WM_DESTROY through the
+                # message loop (posting WM_DESTROY directly would skip
+                # the destroy bookkeeping and leak the window)
+                _user32.PostMessageW(self._hwnd, WM_APP_SHUTDOWN, 0, 0)
         except Exception:
             pass
+
+    def set_menu_state(self, running):
+        """Reflect the proxy state in the next popup's Start/Stop label.
+        Plain bool assignment — safe from any thread."""
+        self._menu_running = bool(running)
 
     def set_tip(self, tip):
         self._title = tip[:127]
@@ -151,19 +191,30 @@ class TrayIcon:
         """Tray thread: hidden window + message loop."""
         try:
             def wnd_proc(hwnd, msg, wparam, lparam):
+                # an exception escaping a ctypes WNDPROC callback kills
+                # the process — the tray must survive ANY surprise
+                try:
+                    return _wndproc_inner(hwnd, msg, wparam, lparam)
+                except Exception:
+                    return _user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+            def _wndproc_inner(hwnd, msg, wparam, lparam):
                 if msg == WM_APP_TRAY:
                     if lparam in (WM_LBUTTONUP, WM_LBUTTONDBLCLK):
                         self.events.put(("show",))
                     elif lparam == WM_RBUTTONUP:
-                        pt = POINT()
-                        _user32.GetCursorPos(ctypes.byref(pt))
-                        self.events.put(("menu", pt.x, pt.y))
+                        self._show_menu(hwnd)
+                    return 0
+                if msg == WM_APP_SHUTDOWN:
+                    _user32.DestroyWindow(hwnd)
                     return 0
                 if msg == WM_DESTROY:
                     self._remove()
                     _user32.PostQuitMessage(0)
                     return 0
                 return _user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+
 
             self._proc_ref = WNDPROC(wnd_proc)          # keep callback alive
             hinst = _kernel32.GetModuleHandleW(None)
@@ -191,6 +242,39 @@ class TrayIcon:
         except Exception:
             self._failed = True
             self._ready.set()
+
+    def _show_menu(self, hwnd):
+        """Native context menu at the cursor, on the tray's own thread.
+
+        The SetForegroundWindow + WM_NULL pair is REQUIRED: without it a
+        menu opened from the tray (no window of ours owns the foreground)
+        never receives the outside-click cancel and hangs on screen."""
+        menu = _user32.CreatePopupMenu()
+        if not menu:
+            return
+        try:
+            MF_STRING, MF_SEPARATOR = 0x0000, 0x0800
+            _user32.AppendMenuW(menu, MF_STRING, MENU_SHOW, "Show HookIP")
+            _user32.AppendMenuW(menu, MF_STRING, MENU_TOGGLE,
+                                "⏹ Stop proxy" if self._menu_running
+                                else "▶ Start proxy")
+            _user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
+            _user32.AppendMenuW(menu, MF_STRING, MENU_EXIT, "Exit")
+            pt = POINT()
+            _user32.GetCursorPos(ctypes.byref(pt))
+            _user32.SetForegroundWindow(hwnd)
+            cmd = _user32.TrackPopupMenuEx(
+                menu, TPM_RIGHTBUTTON | TPM_BOTTOMALIGN | TPM_RETURNCMD,
+                pt.x, pt.y, hwnd, None)
+            # let the menu finish tracking BEFORE the foreground dance
+            # completes — this posted WM_NULL is what makes Windows
+            # deliver the click-away cancellation to our menu
+            _user32.PostMessageW(hwnd, WM_NULL, 0, 0)
+            ev = _menu_event(cmd or 0)
+            if ev:
+                self.events.put((ev,))
+        finally:
+            _user32.DestroyMenu(menu)
 
     def _add(self):
         nid = NOTIFYICONDATAW()
