@@ -505,13 +505,17 @@ class Resolver:
             return [host]
 
         now = time.time()
+        # the cache keys are (host, QTYPE): the old host-only key served
+        # A records for an AAAA query (and let an AAAA negative poison the
+        # A lookups of the same name)
+        key = (host, qtype)
         with self._lock:
-            neg = self._neg_cache.get(host)
+            neg = self._neg_cache.get(key)
             if neg and neg[0] > now:
                 # reason stored with the entry (NXDOMAIN / NODATA / sinkhole) —
                 # the old code always said 'NXDOMAIN' even when it wasn't
                 raise ResolveError(f"{host}: {neg[1]} (cached)")
-            hit = self._cache.get(host)
+            hit = self._cache.get(key)
             if hit and hit[0] > now:
                 return list(hit[1])
 
@@ -528,10 +532,10 @@ class Resolver:
             ev.wait(6.0)
             now = time.time()
             with self._lock:
-                neg = self._neg_cache.get(host)
+                neg = self._neg_cache.get(key)
                 if neg and neg[0] > now:
                     raise ResolveError(f"{host}: {neg[1]} (cached)")
-                hit = self._cache.get(host)
+                hit = self._cache.get(key)
                 if hit and hit[0] > now:
                     return list(hit[1])
             # wait expired with no result — loop and take over if needed
@@ -633,7 +637,7 @@ class Resolver:
                 source = "system"
                 verified_neg = None
                 with self._lock:
-                    self._neg_cache.pop(host, None)
+                    self._neg_cache.pop((host, qtype), None)
                 self._force_ignore_doh(
                     host, "secure DNS said NXDOMAIN, the system resolver "
                     "answered")
@@ -654,7 +658,7 @@ class Resolver:
                 reason = "no addresses (DNS unreachable or dead domain)"
             neg_ttl = 60 if unconfirmed_nx else (300 if verified_neg else 120)
             with self._lock:
-                self._neg_cache[host] = (now + neg_ttl, reason)
+                self._neg_cache[(host, qtype)] = (now + neg_ttl, reason)
 
             # CROSS-TYPE last chance: a name can be AAAA-only
             # (brunhild.challenges.cloudflare.com: the A query is a verified
@@ -693,7 +697,7 @@ class Resolver:
                     # a cached negative while the positive cache below is
                     # written with real addresses
                     with self._lock:
-                        self._neg_cache.pop(host, None)
+                        self._neg_cache.pop((host, qtype), None)
                 elif other_note and not other_note.startswith("NXDOMAIN"):
                     # both types answered-empty: one honest merged verdict
                     other_kind = "AAAA" if qtype == dnsmsg.TYPE_A else "A"
@@ -715,7 +719,7 @@ class Resolver:
                                   f"empty: {other_note})")
                         neg_ttl = 60
                     with self._lock:
-                        self._neg_cache[host] = (now + neg_ttl, reason)
+                        self._neg_cache[(host, qtype)] = (now + neg_ttl, reason)
             if not ips:
                 if bypass_doh:
                     # the bypassed plaintext chain ALSO found nothing: the
@@ -731,7 +735,7 @@ class Resolver:
                 stale = None
                 if self.cfg.doh_enabled:
                     with self._lock:
-                        entry = self._cache.get(host)
+                        entry = self._cache.get((host, qtype))
                         if entry and now < entry[0] + self._STALE_MAX:
                             stale = entry
                 if stale:
@@ -750,8 +754,8 @@ class Resolver:
                     ttl = 30      # brief — the resolver retries DoH soon
                     stale_served = True
                     with self._lock:
-                        self._neg_cache.pop(host, None)
-                        self._cache[host] = (now + ttl, ips)
+                        self._neg_cache.pop((host, qtype), None)
+                        self._cache[(host, qtype)] = (now + ttl, ips)
                     self.log.warn(
                         f"DoH unreachable — serving the STALE cached answer "
                         f"for {host} (ttl {ttl}s); plaintext fallback skipped")
@@ -781,7 +785,7 @@ class Resolver:
             priv = [ip for ip in ips if _is_private_ip(ip)]
             if priv and len(priv) == len(ips):
                 with self._lock:
-                    self._neg_cache[host] = (
+                    self._neg_cache[(host, qtype)] = (
                         now + 120,
                         "plaintext answer pointed into a private range "
                         "(possible poisoning)")
@@ -802,7 +806,7 @@ class Resolver:
             self.log.debug(f"resolve {host}: dropped sinkhole answer(s) {', '.join(blocked)}")
             if not ips:
                 with self._lock:
-                    self._neg_cache[host] = (now + 120, "all resolvers returned a sinkhole")
+                    self._neg_cache[(host, qtype)] = (now + 120, "all resolvers returned a sinkhole")
                 raise ResolveError(f"no addresses for {host} (all resolvers returned a sinkhole)")
         # the Secure-DNS degradation notice: warn once per 5 minutes when
         # DoH was enabled but a plaintext path produced the address (after
@@ -843,7 +847,7 @@ class Resolver:
             if len(self._neg_cache) > neg_cap:
                 now2 = time.time()
                 self._neg_cache = {h: e for h, e in self._neg_cache.items() if e[0] > now2}
-            self._cache[host] = (now + ttl, list(ips))
+            self._cache[(host, qtype)] = (now + ttl, list(ips))
         self.log.debug(f"resolve {host} -> {', '.join(ips[:4])} (ttl {ttl}s)")
         return list(ips)
 

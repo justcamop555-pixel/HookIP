@@ -573,7 +573,7 @@ def test_unconfirmed_cached_60s():
             check("unconfirmed NX raises ResolveError",
                   "NXDOMAIN" in str(e) and "no addresses" in str(e), str(e)[:70])
     with r._lock:
-        entry = r._neg_cache.get("one60.test")
+        entry = r._neg_cache.get(("one60.test", 1))
     check("unconfirmed NX cached for 60 s (not 300)",
           entry is not None and 55 <= entry[0] - time.time() <= 65,
           f"ttl={entry[0] - time.time():.0f}s" if entry else "missing")
@@ -600,7 +600,7 @@ def test_tcp_confirms_doh_vote():
             # ResolveError carrying the real verdict
             check("TCP confirms DoH vote", "NXDOMAIN" in str(e), str(e)[:70])
     with r._lock:
-        entry = r._neg_cache.get("confirm.test")
+        entry = r._neg_cache.get(("confirm.test", 1))
     check("confirmed NX cached 300 s", entry is not None and entry[0] - time.time() > 200)
 
 
@@ -625,8 +625,8 @@ def test_cross_type_fallback():
     check("AAAA-only name: A-negative falls through to AAAA",
           ips == ["2606:4700::1234"], str(ips))
     with r._lock:
-        hit = r._cache.get("aaaaonly.test")
-        neg = r._neg_cache.get("aaaaonly.test")
+        hit = r._cache.get(("aaaaonly.test", 1))
+        neg = r._neg_cache.get(("aaaaonly.test", 1))
     check("AAAA-only name: positive cached, negative cleared",
           hit is not None and neg is None, f"hit={hit} neg={neg}")
 
@@ -647,7 +647,7 @@ def test_cross_type_fallback():
         check("both-NODATA merged verdict names both types",
               "no A or AAAA records" in str(e), str(e)[:90])
     with r2._lock:
-        entry = r2._neg_cache.get("dead.test")
+        entry = r2._neg_cache.get(("dead.test", 1))
     check("both-NODATA cached 300 s",
           entry is not None and entry[0] - time.time() > 200, str(entry))
 
@@ -829,19 +829,19 @@ def test_serve_stale_on_doh_outage():
     r._via_system = lambda *a, **k: ([], 0)
 
     # inside the window: stale served, neg-cache cleared, warn logged
-    r._cache["stale.host.name"] = (now - 60, ["5.5.5.5"])
+    r._cache[("stale.host.name", 1)] = (now - 60, ["5.5.5.5"])
     ips = r.resolve("stale.host.name")
     warns = [m for (lvl, m) in r.log.lines if lvl == "warn"]
     check("stale DoH answer served on total outage",
           ips == ["5.5.5.5"] and any("STALE" in w for w in warns),
           f"ips={ips} warns={len(warns)}")
     check("stale served with a short ttl (retry DoH soon)",
-          abs(r._cache["stale.host.name"][0] - (now + 30)) < 5,
-          str(r._cache.get("stale.host.name")))
+          abs(r._cache[("stale.host.name", 1)][0] - (now + 30)) < 5,
+          str(r._cache.get(("stale.host.name", 1))))
 
     # beyond the staleness window: still a hard failure
     r._cache.clear(); r._neg_cache.clear(); r.log.lines.clear()
-    r._cache["old.host.name"] = (now - 7000, ["6.6.6.6"])
+    r._cache[("old.host.name", 1)] = (now - 7000, ["6.6.6.6"])
     try:
         r.resolve("old.host.name")
         check("too-old stale answer refused", False, "served stale anyway")
@@ -852,7 +852,7 @@ def test_serve_stale_on_doh_outage():
     # secure DNS off: no serve-stale (plaintext IS the configured path)
     r.cfg.doh_enabled = False
     r._cache.clear(); r._neg_cache.clear(); r.log.lines.clear()
-    r._cache["off.host.name"] = (now - 60, ["7.7.7.7"])
+    r._cache[("off.host.name", 1)] = (now - 60, ["7.7.7.7"])
     try:
         r.resolve("off.host.name")
         check("doh disabled -> no serve-stale", False, "served")
@@ -865,14 +865,14 @@ def test_serve_stale_on_doh_outage():
     r.cfg.doh_enabled = True
     future_ts = now + 700          # > _STALE_MAX after the first serve
     r._cache.clear(); r._neg_cache.clear(); r.log.lines.clear()
-    r._cache["cap.host.name"] = (now - 60, ["8.8.8.8"])
+    r._cache[("cap.host.name", 1)] = (now - 60, ["8.8.8.8"])
     ips = r.resolve("cap.host.name")
     check("stale serve #1 works and stamps _stale_since",
           ips == ["8.8.8.8"] and "cap.host.name" in r._stale_since,
           f"ips={ips} since={r._stale_since}")
     # simulate a lookup far in the future: the re-cached (ttl 30) entry has
     # long expired again, and > STALE_MAX has passed since the FIRST serve
-    r._cache["cap.host.name"] = (future_ts - 40, ["8.8.8.8"])
+    r._cache[("cap.host.name", 1)] = (future_ts - 40, ["8.8.8.8"])
     with mock.patch.object(dohmod.time, "time", lambda: future_ts):
         try:
             r.resolve("cap.host.name")
@@ -1263,7 +1263,7 @@ def test_doh_bypass_skips_doh_attempt():
           str(doh_calls))
     check("bypassed domain still resolves", ips == ["1.2.3.4"], repr(ips))
     with r._lock:
-        r._cache.pop("skip.test", None)   # the fresh answer is still cached
+        r._cache.pop(("skip.test", 1), None)   # fresh answer still cached
         r._doh_bypass["skip.test"] = (time.time() - 1, "expired")
     r.resolve("skip.test")
     check("expired bypass: DoH asked again", len(doh_calls) == 2,
@@ -1311,12 +1311,32 @@ def test_split_horizon_system_rescue():
     check("system resolver answer beats a verified public NXDOMAIN",
           ips == ["10.0.0.5"], repr(ips))
     check("negative cache NOT poisoned after the rescue",
-          "corp.lan.example" not in r._neg_cache,
-          str(r._neg_cache.get("corp.lan.example")))
+          ("corp.lan.example", 1) not in r._neg_cache,
+          str(r._neg_cache.get(("corp.lan.example", 1))))
     snap = r.doh_bypass_snapshot()
     check("rescued domain force-ignored for secure DNS",
           any(h == "corp.lan.example" and "NXDOMAIN" in rr for h, rr in snap),
           str(snap))
+
+
+def test_cache_keys_include_qtype():
+    """Regression: the cache used to key by HOST only — an AAAA lookup of
+    a name whose A answer was cached got the A records back (and an AAAA
+    negative could poison the A lookups of the same name)."""
+    r = make_resolver()
+    r._via_doh = lambda host, qtype: ([f"2606:4700::{qtype}"], 300, None)
+    r._via_tcp_dns = lambda *a, **k: ([], 0)
+    r._via_udp_dns = lambda *a, **k: ([], 0)
+    r._via_system = lambda *a, **k: ([], 0)
+    a4 = r.resolve("dual.test")
+    a6 = r.resolve("dual.test", dohmod.dnsmsg.TYPE_AAAA)
+    check("A lookup answers with A records", a4 == ["2606:4700::1"], repr(a4))
+    check("AAAA lookup answers with AAAA records, NOT the cached A",
+          a6 == ["2606:4700::28"], repr(a6))
+    check("cache holds type-separated entries",
+          ("dual.test", 1) in r._cache and
+          ("dual.test", dohmod.dnsmsg.TYPE_AAAA) in r._cache,
+          str(sorted(r._cache)))
 
 
 if __name__ == "__main__":
@@ -1354,6 +1374,7 @@ if __name__ == "__main__":
     test_doh_bypass_skips_doh_attempt()
     test_doh_bypass_dropped_when_plaintext_dies()
     test_split_horizon_system_rescue()
+    test_cache_keys_include_qtype()
 
     print()
     print(f"Summary: {sum(1 for _, c in RESULTS if c)}/{len(RESULTS)} passed")
