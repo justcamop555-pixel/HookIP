@@ -1093,25 +1093,33 @@ class App:
         Tooltip(self.jump_latest,
                 "You scrolled up while new lines arrived — click to jump "
                 "back to the live tail (it follows again automatically).")
-        sf_lbl = tk.Label(bar, text=f"Session file: {self._log_file}", bg=PANEL,
-                          fg=MUTED, font=("Segoe UI", 8))
+        # basename only: the full path made the toolbar so wide it was
+        # clipped by the Find box (the full path lives in the tooltip)
+        sf_lbl = tk.Label(bar, text=f"Session: {os.path.basename(self._log_file)}",
+                          bg=PANEL, fg=MUTED, font=("Segoe UI", 8))
         sf_lbl.pack(side="right", padx=8)
         Tooltip(sf_lbl,
-                "This session's encrypted log file (.hlog): each line is "
-                "DPAPI-encrypted with a per-install key before it touches "
-                "disk — a copied file shows no browsing history. Logs are "
-                "kept in %LOCALAPPDATA%\\HookIP\\logs and pruned to the "
-                "newest 7 sessions.")
-        self.log_text = tk.Text(logf, bg="#0d1017", fg=FG, insertbackground=FG,
-                                font=("Consolas", 9), state="disabled", wrap="none",
-                                height=10)
+                f"This session's encrypted log file (.hlog): {self._log_file}\n\n"
+                "Each line is DPAPI-encrypted with a per-install key "
+                "before it touches disk — a copied file shows no browsing "
+                "history. Logs are kept in %LOCALAPPDATA%\\HookIP\\logs "
+                "and pruned to the newest 7 sessions.")
         logwrap = tk.Frame(logf, bg=PANEL)
         logwrap.pack(fill="both", expand=True)
+        # The Text MUST be a CHILD of logwrap. The first version packed it
+        # 'in_=logwrap' while its master was still logf — the packer left
+        # logwrap ABOVE it in logf's stacking order, and logwrap's opaque
+        # background painted over the ENTIRE log: the widget held every
+        # entry, the scrollbar worked, and the user saw a perfectly blank
+        # pane (the bug in the wild).
+        self.log_text = tk.Text(logwrap, bg="#0d1017", fg=FG, insertbackground=FG,
+                                font=("Consolas", 9), state="disabled", wrap="none",
+                                height=10)
         sb_x = tk.Scrollbar(logwrap, orient="horizontal", command=self.log_text.xview)
         self.log_text.configure(xscrollcommand=sb_x.set)
         # wrap='none' with NO horizontal scrollbar used to clip long lines
         # (hostnames, error text) — you could see they existed, never read them
-        self.log_text.pack(in_=logwrap, side="top", fill="both", expand=True)
+        self.log_text.pack(side="top", fill="both", expand=True)
         sb_x.pack(side="bottom", fill="x")
         Tooltip(self.log_text,
                 "Live log view — filtered by the 'Show' selector above. "
@@ -1806,8 +1814,10 @@ class App:
         return not q or q in str(msg).lower()
 
     def _jump_to_latest(self):
+        # vertical-only (see _pump_log): see("end") with wrap="none" also
+        # scrolls horizontally and can land the viewport in blank space
         try:
-            self.log_text.see("end")
+            self.log_text.yview_moveto(1.0)
         except tk.TclError:
             pass
         self.jump_latest.pack_forget()
@@ -1842,9 +1852,15 @@ class App:
                     self.log_text.configure(state="disabled")
                     # follow new lines only when the reader was already at the
                     # bottom — otherwise scrolling up gets yanked back down,
-                    # and the ↓ latest button tells them what they are missing
+                    # and the ↓ latest button tells them what they are missing.
+                    # VERTICAL-ONLY follow: Text.see("end") also scrolls
+                    # HORIZONTALLY to the end of the last line — with
+                    # wrap="none" and a long final line (most debug lines are
+                    # long) the viewport was pushed right of where the short
+                    # lines end, rendering the whole log BLANK. The empty
+                    # activity log in the wild was this, not a dead pump.
                     if at_bottom:
-                        self.log_text.see("end")
+                        self.log_text.yview_moveto(1.0)
                         try:
                             self.jump_latest.pack_forget()
                         except (tk.TclError, AttributeError):
@@ -1897,7 +1913,7 @@ class App:
                     self.log_text.insert("end", f"[{ts}] ", "ts")
                     self.log_text.insert("end", f"{msg}\n", tags)
             self.log_text.configure(state="disabled")
-            self.log_text.see("end")
+            self.log_text.yview_moveto(1.0)
             self.jump_latest.pack_forget()
         except tk.TclError:
             pass
