@@ -336,6 +336,23 @@ def test_strat_memory_persisted():
     check("seeding accepts the new form and drops stale entries",
           ps5._strat_pref.get("n.host.name") == "chunk" and
           "o.host.name" not in ps5._strat_pref, str(ps5._strat_pref))
+    # log_retention_days=0 means KEEP FOREVER (the log purge already
+    # honors it) — old seeded history must survive, not be aged out by
+    # the old `or 30` bug
+    cfg4 = types.SimpleNamespace(port=9401, fragment_size=2, strategy="smart",
+                                 excluded=[], doh_enabled=False,
+                                 proxy_mode="manual", upstream_proxy="",
+                                 log_retention_days=0,
+                                 strat_memory={"old.host.name":
+                                               {"s": "smart",
+                                                "t": int(time.time()
+                                                         - 400 * 86400)}})
+    ps6 = ProxyServer(cfg4, FakeLog(), Stats(), "tok")
+    check("retention 0 = keep forever: old seeded history survives",
+          ps6._strat_pref.get("old.host.name") == "smart",
+          str(ps6._strat_pref))
+    check("persist also honors keep-forever (dirty flag untouched)",
+          not ps6._strat_dirty, str(ps6._strat_dirty))
 
     # the config layer sanitizes what it loads (hand-edited settings.json)
     from hookip.config import Config

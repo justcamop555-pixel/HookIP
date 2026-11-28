@@ -211,7 +211,13 @@ class ProxyServer:
                 # (stamped t=now). Entries older than the retention
                 # window are strategy history — drop them like the logs.
                 now = time.time()
-                max_age = (getattr(cfg, "log_retention_days", 30) or 30) * 86400
+                # the retention knob is log_retention_days; 0 means KEEP
+                # FOREVER (the log purge already honors that — the old
+                # `or 30` turned a user's keep-forever into 30 days and
+                # silently dropped learned strategies)
+                days = getattr(cfg, "log_retention_days", 14)
+                max_age = days * 86400 \
+                    if isinstance(days, int) and days > 0 else None
                 for h, v in seed.items():
                     if not isinstance(h, str):
                         continue
@@ -227,7 +233,7 @@ class ProxyServer:
                         s, t = v, now
                     else:
                         continue
-                    if now - t > max_age:
+                    if max_age is not None and now - t > max_age:
                         continue              # stale history: dropped
                     self._strat_pref[h] = s
                     self._strat_ts[h] = float(t)
@@ -412,13 +418,15 @@ class ProxyServer:
         if not self._strat_dirty:
             return True            # nothing to do — not an error
         try:
-            max_age = (getattr(self.cfg, "log_retention_days", 30) or 30) * 86400
+            days = getattr(self.cfg, "log_retention_days", 14)
+            max_age = days * 86400 \
+                if isinstance(days, int) and days > 0 else None
             now = time.time()
             with self._state_lock:
                 items = [(h, s, self._strat_ts.get(h, now))
                          for h, s in self._strat_pref.items()]
             items = [(h, s, t) for (h, s, t) in items
-                     if now - t <= max_age][-256:]
+                     if max_age is None or now - t <= max_age][-256:]
             snap = {h: {"s": s, "t": int(t)} for (h, s, t) in items}
             self.cfg.strat_memory = snap
             ok = True
