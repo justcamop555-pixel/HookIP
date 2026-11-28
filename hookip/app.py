@@ -42,18 +42,56 @@ def resource_path(name):
     return os.path.join(base, name)
 
 
+def _parse_sha_file(txt):
+    """First token of a .sha256 release asset -> 64-hex lowercase, or None.
+    An HTML error page (or any non-hex junk) is NOT a checksum."""
+    parts = (txt or "").split()
+    tok = parts[0].strip().lower() if parts else None
+    if tok and re.fullmatch(r"[0-9a-f]{64}", tok):
+        return tok
+    return None
+
+
+def _sha_from_notes(txt):
+    """Fallback checksum source: the release notes text the API already
+    returned (github.com server side, not the asset CDN). Used only when
+    it is unambiguous — exactly one 64-hex token, or one sitting next to
+    the exe's name. None when nothing usable is there."""
+    txt = str(txt or "")
+    if not txt:
+        return None
+    hexes = re.findall(r"\b[0-9a-fA-F]{64}\b", txt)
+    if len(hexes) == 1:
+        return hexes[0].lower()
+    for h in hexes:
+        i = txt.find(h)
+        if "HookIP.exe" in txt[max(0, i - 80):i + 80]:
+            return h.lower()
+    return None
+
+
 class App:
     def __init__(self, root: tk.Tk):
         self.root = root
         saved = Config.load()
         # "Remember settings" unchecked → start from defaults (settings were forgotten)
         self.cfg = saved if saved.remember else Config()
+        # the load-state flags must survive the swap to defaults: the
+        # quarantine/degraded notices below read them, and with 'Remember
+        # settings' off they used to vanish (defaults had no idea a bad
+        # file had just been moved aside)
+        self.cfg.quarantine_path = getattr(saved, "quarantine_path", None)
+        self.cfg.degraded = getattr(saved, "degraded", False)
+        self.cfg.quarantined = getattr(saved, "quarantined", False)
         self.log = Log()
         self.log.verbose = self.cfg.verbose
         # session log file (mirrors everything; helps bug reports)
         from .config import APP_DIR
         self._log_dir = os.path.join(APP_DIR, "logs")
-        Log.prune_session_files(self._log_dir, keep=7)
+        # keep=60 is a hard SAFETY cap (runaway count of files), not the
+        # privacy control — that is retention by AGE
+        # (Config.log_retention_days, default 14 days)
+        Log.prune_session_files(self._log_dir, keep=60)
         # data-theft guard: encrypt legacy plaintext logs from older
         # versions (synchronously — migration must finish before the
         # logger opens any .hlog file, or lines appended in between
@@ -83,9 +121,9 @@ class App:
             try:
                 if (self.cfg.remember
                         and _dg.settings_needs_entropy_upgrade(SETTINGS_PATH)):
-                    self.cfg.save()
-                    self.log.ok("Data guard: settings re-encrypted with the "
-                                "per-install key.")
+                    if self._cfg_save("entropy upgrade"):
+                        self.log.ok("Data guard: settings re-encrypted with "
+                                    "the per-install key.")
             except OSError:
                 pass
         except Exception:
@@ -139,10 +177,16 @@ class App:
             # with 'Remember' off the file is deleted at Start anyway, and
             # writing it here recreated data the user asked not to keep
             if self.cfg.remember:
-                try:
-                    self.cfg.save()
-                except OSError:
-                    pass
+                self._cfg_save("PAC token bootstrap")
+        if getattr(self.cfg, "degraded", False):
+            # transient registry failure: this session cannot read the
+            # per-install key — settings were left untouched and saves
+            # are refused. Say it ONCE, loudly.
+            self.log.warn(
+                "The settings encryption key could not be read this "
+                "session (the registry was temporarily unavailable) — "
+                "your settings were left untouched and saving is paused "
+                "for this session. A restart is recommended.")
         if getattr(self.cfg, "quarantined", False):
             # the encrypted settings could not be decrypted (corrupt blob,
             # another Windows account, or a lost per-install key): defaults
@@ -291,6 +335,8 @@ class App:
                             pass
                 elif kind == "emergency_done":
                     self._set_running_ui(False)
+                elif kind == "reapply":
+                    self._reapply_system_proxy()
                 elif kind == "dl_progress":
                     mb, note = (args + ("",))[:2]
                     try:
@@ -388,9 +434,10 @@ class App:
 
     # -- update check ----------------------------------------------------
     UPDATE_REPO = "justcamop555-pixel/HookIP"
-    # Same-bytes mirrors used ONLY when GitHub's asset CDN is unreachable
-    # for a user; integrity stays with the checksum verified afterwards.
-    _DL_MIRRORS = ("https://ghproxy.net/", "https://gh-proxy.com/", "https://ghfast.top/")
+    # NO third-party mirrors: the update bytes and the checksum both come
+    # from GitHub only — a mirror serving a swapped exe would defeat the
+    # whole fail-closed design. Unreachable CDN ⇒ download fails visibly,
+    # it does not fall back to untrusted infrastructure.
 
     def _validate_numeric_fields(self, *_):
         """Live port/fragment validation: invalid entries turn red and show
@@ -776,51 +823,31 @@ class App:
         import urllib.error
 
         def fetch(u, timeout=30, deadline=None, what="asset"):
-            # Order: GitHub via system proxy (our own tunnel) → GitHub
-            # direct → public mirrors of the same bytes. The asset CDN
-            # (objects.githubusercontent.com) is unreachable for some
-            # users even when github.com works; mirrors close that gap.
-            # Integrity is NOT handed to the mirror — the checksum below
-            # still comes from GitHub-published data.
-            variants = [u] + [m + u for m in self._DL_MIRRORS]
+            # GITHUB ONLY: via the system proxy (our own tunnel), then
+            # direct. No third-party mirrors — every byte of the update
+            # and of the checksum must come from the same trusted host.
             last = None
-            for u2 in variants:
-                if deadline and time.monotonic() > deadline:
-                    break
-                for attempt in (0, 1):     # 0 = via system proxy, 1 = direct
-                    try:
-                        if attempt == 1:
-                            opener = urllib.request.build_opener(
-                                urllib.request.ProxyHandler({}))
-                            return opener.open(
-                                urllib.request.Request(
-                                    u2, headers={"User-Agent": "HookIP-updater"}),
-                                timeout=timeout)
-                        return urllib.request.urlopen(
+            if deadline and time.monotonic() > deadline:
+                raise OSError(f"download budget exhausted before {what}")
+            for attempt in (0, 1):         # 0 = via system proxy, 1 = direct
+                try:
+                    if attempt == 1:
+                        opener = urllib.request.build_opener(
+                            urllib.request.ProxyHandler({}))
+                        return opener.open(
                             urllib.request.Request(
-                                u2, headers={"User-Agent": "HookIP-updater"}),
+                                u, headers={"User-Agent": "HookIP-updater"}),
                             timeout=timeout)
-                    except (OSError, urllib.error.URLError) as exc:
-                        last = exc
-            raise OSError(f"all download sources failed for {what} ({last})")
+                    return urllib.request.urlopen(
+                        urllib.request.Request(
+                            u, headers={"User-Agent": "HookIP-updater"}),
+                        timeout=timeout)
+                except (OSError, urllib.error.URLError) as exc:
+                    last = exc
+            raise OSError(f"GitHub unreachable for {what} ({last})")
 
-        def body_sha256():
-            """Fallback checksum source: the release notes text the API
-            already returned (github.com server side, not the asset CDN).
-            Used only when it is unambiguous — exactly one 64-hex token,
-            or one sitting next to the exe's name."""
-            txt = str(getattr(self, "_update_body", "") or "")
-            if not txt:
-                return None
-            import re as _re
-            hexes = _re.findall(r"\b[0-9a-fA-F]{64}\b", txt)
-            if len(hexes) == 1:
-                return hexes[0].lower()
-            for h in hexes:
-                i = txt.find(h)
-                if "HookIP.exe" in txt[max(0, i - 80):i + 80]:
-                    return h.lower()
-            return None
+        body_sha256 = lambda: _sha_from_notes(
+            getattr(self, "_update_body", ""))
 
         # Destination: the exe's OWN directory when frozen — the install
         # step then renames the RUNNING exe to .old and takes its exact
@@ -881,7 +908,11 @@ class App:
                 try:
                     with fetch(sha_url, timeout=15, what="checksum") as sr:
                         txt = sr.read(512).decode("utf-8", "replace")
-                    expected = txt.split()[0].strip().lower() if txt.split() else None
+                    # STRICT hex validation INSIDE the parser: an HTML
+                    # error page must never become the 'expected' hash
+                    # (that would fail every genuine download with a
+                    # nonsense mismatch)
+                    expected = _parse_sha_file(txt)
                 except (OSError, urllib.error.URLError):
                     expected = None
             if expected is None:
@@ -889,18 +920,19 @@ class App:
                 if expected:
                     self.log.info("Update checksum taken from the release "
                                   "notes (asset CDN unreachable).")
-                if expected is None:
-                    self.log.error(
-                        "Update download REFUSED: the release publishes a "
-                        "checksum but no reachable source could provide "
-                        "it — install manually from the Releases page.")
-                    notify.notify(
-                        "HookIP — update download failed",
-                        "The checksum could not be verified, so the "
-                        "download was refused. Install manually from the "
-                        "Releases page.", timeout_s=12)
-                    self._ui_queue.put(("dl_done", (False,)))
-                    return
+            if expected is None:
+                self.log.error(
+                    "Update download REFUSED: no checksum could be "
+                    "obtained for this release (checksum asset and "
+                    "release notes both unavailable) — install manually "
+                    "from the Releases page.")
+                notify.notify(
+                    "HookIP — update download failed",
+                    "No checksum could be obtained for this release, so "
+                    "the download was refused. Install manually from the "
+                    "Releases page.", timeout_s=12)
+                self._ui_queue.put(("dl_done", (False,)))
+                return
             if expected:
                 actual = hashlib.sha256(data).hexdigest()
                 if actual != expected:
@@ -1306,7 +1338,7 @@ class App:
                 "Each line is DPAPI-encrypted with a per-install key "
                 "before it touches disk — a copied file shows no browsing "
                 "history. Logs are kept in %LOCALAPPDATA%\\HookIP\\logs "
-                "and pruned to the newest 7 sessions.")
+                "and pruned by age (default: 14 days).")
         logwrap = tk.Frame(logf, bg=PANEL)
         logwrap.pack(fill="both", expand=True)
         # The Text MUST be a CHILD of logwrap. The first version packed it
@@ -1660,7 +1692,13 @@ class App:
             cur = winproxy.read_current()
         except OSError:
             return
-        if self.running or not winproxy._is_ours(cur, self.cfg.port, self.pac_token):
+        # STALE-SESSION recognition: after a crash with 'Remember settings'
+        # off, THIS session's port/token differ from the crashed one — an
+        # exact _is_ours(cur, port, token) missed the stale entry and the
+        # caller then discarded the only backup. is_stale_hookip matches
+        # EITHER the current session or the session that wrote the backup.
+        if self.running or not winproxy.is_stale_hookip(cur, self.cfg.port,
+                                                        self.pac_token):
             return
         if winproxy.has_backup():
             # backup exists only when the last activation never stopped
@@ -1696,9 +1734,12 @@ class App:
             return
         try:
             if winproxy.has_backup():
-                if winproxy._is_ours(cur, self.cfg.port, self.pac_token):
-                    # the system still points at HookIP: the backup is the
-                    # real fix
+                if winproxy.is_stale_hookip(cur, self.cfg.port, self.pac_token):
+                    # the system still points at HOOKIP — this session's or
+                    # the crashed one's port/token (the crashed session's
+                    # entries used to be missed here, and the stale backup
+                    # — the only one — was then discarded below): the
+                    # backup is the real fix
                     if winproxy.restore_from_file():
                         self.log.ok("Internet restored: system proxy set back "
                                     "to your previous settings.")
@@ -1805,10 +1846,19 @@ class App:
                     found = winproxy.detect_network_proxy(prev_vals)
                 except Exception:
                     return
-                if found and self.running and \
+                # the race: running is only set AFTER apply_*/watchdog.start,
+                # so a fast LAN PAC fetch arrived while running was still
+                # False and was DROPPED — the bypass list was already
+                # written with the excluded domains. self.proxy is set as
+                # soon as the server is listening: gate on THAT instead.
+                if found and self.proxy is not None and \
                         not getattr(self.cfg, "upstream_proxy", ""):
                     self.cfg.upstream_proxy = found
                     self._announce_upstream(found)
+                    # re-apply the system proxy WITHOUT bypass entries
+                    # (restricted network: DIRECT is blocked, user
+                    # exclusions must not go direct) — main thread only
+                    self._ui_queue.put(("reapply", ()))
             threading.Thread(target=_late_detect, daemon=True).start()
         try:
             self.proxy = ProxyServer(cfg, self.log, self.stats, self.pac_token)
@@ -1826,12 +1876,7 @@ class App:
             # on restricted networks DIRECT is blocked: keep excluded domains
             # OUT of the bypass lists or they would break (round-2 finding)
             bypass = None if net_proxy else cfg.excluded
-            if cfg.proxy_mode == "manual":
-                winproxy.apply_manual(cfg.port, bypass=bypass)
-            elif cfg.proxy_mode == "pac":
-                winproxy.apply_pac(cfg.port, self.pac_token)
-            else:
-                winproxy.apply_both(cfg.port, self.pac_token, bypass=bypass)
+            self._apply_proxy_settings(cfg, bypass)
             # RunOnce FIRST: from the moment the registry points at HookIP,
             # a crash needs a recovery path — the watchdog covers the
             # running window, RunOnce covers the sign-in after a power
@@ -1848,6 +1893,13 @@ class App:
             (self.log.ok if n_w >= 2 else self.log.warn)(
                 f"Crash protection: {n_w}/2 watchdog process(es) watching "
                 "this session (heartbeat monitored).")
+        except winproxy.BackupError as exc:
+            # A FAILED BACKUP must not leave a half-started proxy: the
+            # apply_* calls abort BEFORE any registry write, so nothing
+            # was changed — stop the proxy and leave the user's settings
+            # exactly as they were.
+            self._handle_backup_error(exc)
+            return
         except Exception as exc:  # noqa: BLE001 — nothing after the proxy is
             # up may kill the startup sequence: Windows already routes
             # through HookIP here, so the running flag and the UI MUST be
@@ -1857,13 +1909,9 @@ class App:
                           f"{type(exc).__name__}: {exc}")
 
         if cfg.remember:
-            # Config.save already swallows OSError (the file keep its old
-            # content); guard anyway so NO exception can skip the running
-            # state below — by now Windows already routes through HookIP
-            try:
-                cfg.save()
-            except Exception:
-                pass
+            # save() reports failure with False (nothing raises); the
+            # warning is emitted once per session by _cfg_save
+            self._cfg_save("Start")
         else:
             # user chose not to remember — forget any previously stored settings
             try:
@@ -1979,6 +2027,69 @@ class App:
         # UI refresh happens on the main thread via _pump_ui ("emergency_done")
         # — this hook runs on the accept thread and must not touch Tk directly
 
+    def _apply_proxy_settings(self, cfg, bypass=None):
+        """Write the system proxy per the configured mode. May raise
+        winproxy.BackupError (nothing was written then) or OSError."""
+        if cfg.proxy_mode == "manual":
+            winproxy.apply_manual(cfg.port, bypass=bypass)
+        elif cfg.proxy_mode == "pac":
+            winproxy.apply_pac(cfg.port, self.pac_token)
+        else:
+            winproxy.apply_both(cfg.port, self.pac_token, bypass=bypass)
+
+    def _handle_backup_error(self, exc):
+        """A FAILED BACKUP must not leave a half-started proxy: the
+        apply_* calls abort BEFORE any registry write, so nothing was
+        changed — stop the proxy and leave the user's settings exactly
+        as they were. running stays False."""
+        self.log.error(
+            "Could not save your original proxy settings, HookIP was "
+            f"not started; nothing was changed ({exc})")
+        notify.notify(
+            "HookIP — not started",
+            "Your proxy settings could not be backed up, so HookIP "
+            "did not start. Nothing was changed — try freeing disk "
+            "space or restarting.", timeout_s=15)
+        try:
+            if self.proxy:
+                self.proxy.stop()
+        except Exception:
+            pass
+        self.proxy = None
+
+    def _reapply_system_proxy(self):
+        """Late network-proxy detection: re-apply the system proxy WITHOUT
+        bypass entries (restricted network: DIRECT is blocked, so user
+        exclusions must not be served as DIRECT). Runs on the MAIN thread
+        (via _pump_ui) — a background thread must never touch winreg/Tk;
+        does nothing when the proxy was stopped meanwhile."""
+        if not (self.running and self.proxy):
+            return                      # stopped while detection ran
+        try:
+            self._apply_proxy_settings(self.cfg, bypass=None)
+            self.log.ok("System proxy re-applied without bypass entries — "
+                        "the network's own proxy arrived late.")
+        except Exception as exc:  # noqa: BLE001 — re-apply is best-effort
+            self.log.warn(f"Could not re-apply the system proxy: "
+                          f"{type(exc).__name__}: {exc}")
+
+    def _cfg_save(self, where=""):
+        """cfg.save() with the once-per-session failure warning.
+        save() returns True/False and never raises; repeated failures
+        must not spam the log."""
+        ok = True
+        try:
+            ok = self.cfg.save()
+        except Exception as exc:  # noqa: BLE001 — defensive
+            ok = False
+            if not getattr(self.cfg, "last_save_error", None):
+                self.cfg.last_save_error = f"{type(exc).__name__}: {exc}"
+        if ok is False and not getattr(self, "_save_failed_warned", False):
+            self._save_failed_warned = True
+            reason = getattr(self.cfg, "last_save_error", "") or "unknown error"
+            self.log.warn(f"Settings could not be saved ({where}): {reason}")
+        return ok
+
     def _announce_upstream(self, net_proxy):
         """Log + toast a detected network proxy (credentials masked)."""
         shown = winproxy.mask_proxy(net_proxy)
@@ -1993,8 +2104,9 @@ class App:
         if not self.running:
             return
         self.running = False
-        if self.proxy:
-            self.proxy.stop()
+        proxy = self.proxy
+        if proxy:
+            proxy.stop()
             self.proxy = None
         try:
             # _live_port is deliberately KEPT across Stop: the next Start
@@ -2005,16 +2117,23 @@ class App:
                 self.log.ok("System proxy restored to previous settings.")
             else:
                 # no backup (e.g. wiped while running) — clear our own entries
+                # by EXACT match: the old '127.0.0.1 in …' heuristic wiped a
+                # local Clash/Fiddler/V2Ray config that was never HookIP's
                 cur = winproxy.read_current()
-                ours = "127.0.0.1" in str(cur.get("ProxyServer") or "") or \
-                    "127.0.0.1" in str(cur.get("AutoConfigURL") or "")
-                if ours:
+                if winproxy._is_ours(cur, self.cfg.port, self.pac_token):
                     winproxy.remove_proxy()
                     self.log.ok("Proxy backup missing — cleared HookIP proxy settings (direct connection).")
                 else:
                     self.log.warn("No proxy backup found and current proxy is not HookIP's; left untouched.")
         except OSError as exc:
             self.log.error(f"Restore failed: {exc}")
+        # the app (not proxy.stop()) persists strategy memory AFTER the
+        # system proxy is back — stop() itself must not do disk I/O
+        try:
+            if proxy:
+                proxy.persist_strat_memory()
+        except Exception:
+            pass
         self._set_running_ui(False)
         if tell_user:
             notify.notify("HookIP — internet restored",
@@ -2556,11 +2675,20 @@ class App:
             cfg_enc = (not os.path.exists(SETTINGS_PATH)) or dataguard.is_encrypted_file(
                 SETTINGS_PATH, dataguard.CFG_MAGIC)
             acl_ok = getattr(self, "_dg_acl_ok", False) or dataguard.acl_is_hardened(APP_DIR)
-            if n_plain == 0 and cfg_enc and acl_ok and not n_migrating:
+            # the key MODE is part of the truth: a degraded session writes
+            # with the LEGACY static entropy (public in the repo) — the
+            # user must know that, not read a green 'protected' row
+            try:
+                key_mode = ("per-install key" if dataguard.using_per_install_key()
+                            else "legacy entropy (registry unavailable)")
+            except Exception:
+                key_mode = "unknown"
+            degraded = getattr(self.cfg, "degraded", False)
+            if n_plain == 0 and cfg_enc and acl_ok and not n_migrating and not degraded:
                 self._diag_result(
                     "Data protection", "OK",
                     f"logs encrypted {n_enc}/{len(log_files)} · settings "
-                    "encrypted (per-install key) · folder locked to your "
+                    f"encrypted ({key_mode}) · folder locked to your "
                     "account · limits: same-user software can still "
                     "reverse DPAPI; old plaintext may persist in free "
                     "disk space, OneDrive history and backups")
@@ -2575,6 +2703,8 @@ class App:
                     missing.append("settings stored as plaintext")
                 if not acl_ok:
                     missing.append("folder ACL default")
+                if degraded or key_mode != "per-install key":
+                    missing.append(f"encryption key: {key_mode}")
                 self._diag_result("Data protection", "WARN",
                                   " · ".join(missing) + " — retry on next start", "warn")
         except Exception:
@@ -2642,7 +2772,15 @@ class App:
         for name, host, ip in RESOLVERS:
             t0 = time.time()
             try:
-                conn = _DoHConn(ip, host, timeout=4, chunk=frag)
+                try:
+                    conn = _DoHConn(ip, host, timeout=4, chunk=frag,
+                                    validate_by_ip=True)
+                except ssl.SSLCertVerificationError:
+                    # the resolver's cert has no IP SAN — retry with the
+                    # hostname SNI instead of reporting a flat FAIL (the
+                    # direct construction had NO fallback at all)
+                    conn = _DoHConn(ip, host, timeout=4, chunk=frag,
+                                    validate_by_ip=False)
                 try:
                     resp = conn.request(host, query)
                     rcode, answers = dnsmsg.parse_response(resp)
@@ -2650,10 +2788,12 @@ class App:
                     dt = time.time() - t0
                     if rcode == 0 and ips:
                         ok_count += 1
-                        # surface the SNI mode: 'ip' = SNI-LESS (validated by
-                        # IP SAN — the DoH bypass-by-name fix), 'host' = the
-                        # resolver's cert had no IP SAN
-                        sni = "SNI-less" if getattr(conn, "validate_by_ip", True) else "SNI sent"
+                        # surface the SNI mode from the CONNECTION's own
+                        # flag (the previous getattr(conn, ..., True)
+                        # defaulted to 'SNI-less' even when the attribute
+                        # was missing — it could lie)
+                        sni = ("SNI-less" if getattr(conn, "validate_by_ip",
+                                                    True) else "SNI sent")
                         self._diag_result(name, "OK",
                                           f"{dt:.2f}s · {sni} · A records: {', '.join(ips[:2])}",
                                           "ok")
@@ -2844,7 +2984,16 @@ class App:
             try:
                 self.cfg.minimize_to_tray = self.tray_var.get()
                 if self.cfg.remember:
-                    self.cfg.save()
+                    self._cfg_save("exit")
+            except Exception:
+                pass
+            # strategy memory is persisted by the APP after the system
+            # proxy is restored (stop() no longer saves); keep a local
+            # reference — self.proxy is cleared by stop_proxy
+            _proxy = self.proxy
+            try:
+                if _proxy:
+                    _proxy.persist_strat_memory()
             except Exception:
                 pass
             self.log.session_end()

@@ -33,7 +33,7 @@ import os
 import time
 
 from . import notify
-from .winproxy import _k32, restore_from_file, set_runonce
+from .winproxy import _k32, restore_from_file, set_runonce, _write as _write_proxy
 
 WAIT_OBJECT_0 = 0
 WAIT_TIMEOUT = 0x00000102          # 258
@@ -54,12 +54,42 @@ def _rewrite_backup(vals_text, path):
         return False
 
 
-def _do_restore(backup_path, mem_backup):
+def _parse_backup(text):
+    """Backup text -> settings dict ("_hookip" bookkeeping key dropped) or
+    None. HKCFG1-encrypted text is decrypted with dataguard (it holds the
+    user's original proxy config — never logged); a legacy plaintext
+    backup is json-loaded directly. Any failure -> None."""
+    try:
+        if isinstance(text, str) and text.startswith("HKCFG1:"):
+            from . import dataguard
+            plain = dataguard.decrypt_bytes(text)
+            vals = None
+            if plain is not None:
+                import json
+                try:
+                    vals = json.loads(plain.decode("utf-8"))
+                except ValueError:
+                    vals = None
+        else:
+            import json
+            vals = json.loads(text)          # legacy plaintext backup
+    except Exception:                        # noqa: BLE001 — parse failure is
+        vals = None                          # just 'no in-memory copy'
+    if isinstance(vals, dict):
+        vals = {k: v for k, v in vals.items() if k != "_hookip"}
+        return vals
+    return None
+
+
+def _do_restore(backup_path, mem_backup, mem_vals=None):
     """Restore the saved proxy settings, best effort.
 
     Order: (1) the backup file as-is, (2) rewritten from the in-memory
     copy, retried briefly — a transient AV lock on the file or the
-    registry should not defeat a crash restore.
+    registry should not defeat a crash restore, (3) the IN-MEMORY parsed
+    settings written straight to the registry — the file path needs the
+    DPAPI key to be readable at crash time, while mem_vals was already
+    decrypted at startup when everything still worked.
     Returns True when the registry was written."""
     for _ in range(3):
         try:
@@ -69,10 +99,16 @@ def _do_restore(backup_path, mem_backup):
             pass                    # registry/file error mid-restore — retry
         if not (mem_backup and _rewrite_backup(mem_backup, backup_path)):
             time.sleep(0.5)         # nothing to rewrite; pause before retry
+    if isinstance(mem_vals, dict):
+        try:
+            _write_proxy(mem_vals)
+            return True
+        except OSError:
+            pass
     return False
 
 
-def _log_marker(backup_path, reason):
+def _log_marker(backup_path, reason, mem_vals=None):
     """Write the crash record where the user can actually find it:
     (1) a marker file the NEXT app session turns into a visible log
     entry (a fresh session used to start with no hint of why the
@@ -80,19 +116,24 @@ def _log_marker(backup_path, reason):
     newest session .hlog so the post-mortem trail lives in the file.
     Never raises."""
     appdir = os.path.dirname(backup_path)
-    try:
-        # ENCRYPTED at rest (HKCFG1): the reason is an exception string and
-        # can carry hostnames from the failing operation — in plaintext the
-        # marker was a small but greppable leak sitting in the app dir.
-        from . import dataguard as _dg
-        blob = _dg.encrypt_bytes(
-            f"{reason or 'stopped unexpectedly'}\t"
-            f"{time.strftime('%Y-%m-%d %H:%M:%S')}\n".encode("utf-8"))
-        with open(os.path.join(appdir, "last_crash.txt"), "w",
-                  encoding="utf-8") as fh:
-            fh.write(blob)
-    except Exception:
-        pass
+    if reason != "unresponsive":
+        # 'unresponsive' restores happen while the app may STILL be
+        # running (and recover) — writing last_crash.txt would make the
+        # app's next launch report a crash that never happened. Only a
+        # real crash/stop gets the marker.
+        try:
+            # ENCRYPTED at rest (HKCFG1): the reason is an exception string and
+            # can carry hostnames from the failing operation — in plaintext the
+            # marker was a small but greppable leak sitting in the app dir.
+            from . import dataguard as _dg
+            blob = _dg.encrypt_bytes(
+                f"{reason or 'stopped unexpectedly'}\t"
+                f"{time.strftime('%Y-%m-%d %H:%M:%S')}\n".encode("utf-8"))
+            with open(os.path.join(appdir, "last_crash.txt"), "w",
+                      encoding="utf-8") as fh:
+                fh.write(blob)
+        except Exception:
+            pass
     try:
         import glob as _glob
         from . import dataguard as _dg
@@ -108,7 +149,8 @@ def _log_marker(backup_path, reason):
         pass
 
 
-def _restore_and_notify(backup_path, mem_backup, parent_pid=0, reason=None):
+def _restore_and_notify(backup_path, mem_backup, parent_pid=0, reason=None,
+                        mem_vals=None):
     """Restore + user feedback. Never raises. Twin-safe: a named mutex
     lets exactly one watchdog in (the winner acquires instantly; the
     twin blocks up to 8 s), and the 'HookIP_Restored_<pid>' event marks
@@ -135,7 +177,7 @@ def _restore_and_notify(backup_path, mem_backup, parent_pid=0, reason=None):
         owned = True                        # dedupe is an optimization —
         h_mutex = h_done = None             # restoring is the critical action
     try:
-        restored = _do_restore(backup_path, mem_backup)
+        restored = _do_restore(backup_path, mem_backup, mem_vals)
     except OSError:
         restored = False
     if not restored and mem_backup:
@@ -166,7 +208,7 @@ def _restore_and_notify(backup_path, mem_backup, parent_pid=0, reason=None):
                 "settings.", timeout_s=30)
     except Exception:
         pass                        # a dead notifier must not kill the restore
-    _log_marker(backup_path, reason)
+    _log_marker(backup_path, reason, mem_vals=mem_vals)
     if h_done:
         try:
             _k32.SetEvent(h_done)
@@ -189,13 +231,18 @@ def _restore_and_notify(backup_path, mem_backup, parent_pid=0, reason=None):
 def main(backup_path, parent_pid, event_name, beat_event_name=None):
     SYNCHRONIZE = 0x00100000
     # the backup content is the watchdog's own safe copy: load it BEFORE
-    # anything can go wrong, and keep it for the whole lifetime
+    # anything can go wrong, and keep it for the whole lifetime. It is
+    # also PARSED now (mem_vals): the DPAPI key may be unreadable at crash
+    # time, and restore_from_file would then fail all three attempts —
+    # mem_vals decrypted at startup is the restore that cannot fail for
+    # that reason.
     mem_backup = None
     try:
         with open(backup_path, "r", encoding="utf-8") as fh:
             mem_backup = fh.read()
     except OSError:
         mem_backup = None
+    mem_vals = _parse_backup(mem_backup)
     try:
         parent_pid = int(parent_pid)
     except (TypeError, ValueError):
@@ -217,7 +264,8 @@ def main(backup_path, parent_pid, event_name, beat_event_name=None):
             # cannot observe the parent (already gone / access denied):
             # give it a final grace moment, then restore unconditionally
             time.sleep(3)
-            _restore_and_notify(backup_path, mem_backup, parent_pid)
+            _restore_and_notify(backup_path, mem_backup, parent_pid,
+                                mem_vals=mem_vals)
             return 0
 
         # wait indices: 0 = parent died, then stop event, then heartbeat
@@ -238,7 +286,8 @@ def main(backup_path, parent_pid, event_name, beat_event_name=None):
                 arr = (ctypes.c_void_p * len(waits))(*waits)
                 w = _k32.WaitForMultipleObjects(len(waits), arr, False, timeout_ms)
             if w == WAIT_OBJECT_0:
-                _restore_and_notify(backup_path, mem_backup, parent_pid)
+                _restore_and_notify(backup_path, mem_backup, parent_pid,
+                                    mem_vals=mem_vals)
                 return 0
             if idx_stop is not None and w == WAIT_OBJECT_0 + idx_stop:
                 return 0                      # told to stop — clean exit
@@ -259,7 +308,8 @@ def main(backup_path, parent_pid, event_name, beat_event_name=None):
                         continue
                     # parent alive but silent for ~40 s: wedged — restore
                     _restore_and_notify(backup_path, mem_backup, parent_pid,
-                                        reason="unresponsive")
+                                        reason="unresponsive",
+                                        mem_vals=mem_vals)
                     return 0
                 if mem_backup and not os.path.isfile(backup_path):
                     _rewrite_backup(mem_backup, backup_path)
@@ -267,7 +317,8 @@ def main(backup_path, parent_pid, event_name, beat_event_name=None):
             # WAIT_FAILED or anything unexpected: fall back to polling so a
             # broken multi-wait can never leave the proxy unprotected
             if _k32.WaitForSingleObject(h_parent, 0) == 0:
-                _restore_and_notify(backup_path, mem_backup, parent_pid)
+                _restore_and_notify(backup_path, mem_backup, parent_pid,
+                                    mem_vals=mem_vals)
                 return 0
             time.sleep(1.0)
     finally:

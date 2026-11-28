@@ -19,6 +19,10 @@ SUITES = [
     "test_dnsmsg.py",
     "test_tlsfrag.py",
     "test_dataguard.py",
+    "test_config.py",
+    "test_logutil.py",
+    "test_winproxy.py",
+    "test_app_logic.py",
     "test_update.py",
     "test_doh.py",
     "test_proxy.py",       # real sockets (~25 s)

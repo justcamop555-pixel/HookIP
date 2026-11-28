@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from hookip import proxy as proxymod  # noqa: E402
 from hookip.proxy import (ProxyServer, Stats, DpiReset, UpstreamDied,  # noqa: E402
-                          ClientAbortError, is_excluded)
+                          ClientAbortError, ConnectDead, is_excluded)
 from hookip.doh import ResolveError  # noqa: E402
 
 RESULTS = []
@@ -252,36 +252,92 @@ def test_lf_header_smuggling_neutralized():
 
 def test_strat_memory_persisted():
     """The per-host strategy memory survives restarts: ProxyServer start
-    seeds from cfg.strat_memory; stop (and the 5-min ticker) persists the
-    learned map back, capped at 256."""
+    seeds from cfg.strat_memory; the app (or the 5-min ticker) persists
+    the learned map back, capped at 256, as {host: {"s": .., "t": ..}}
+    with the retention-window age filter."""
     ps = make_server()
     saved = {}
     ps.cfg.remember = True
-    ps.cfg.save = lambda: saved.update(ps.cfg.strat_memory)
+    ps.cfg.save = lambda: saved.update(ps.cfg.strat_memory) or True
     for i in range(300):
         ps._strat_pref[f"h{i}.host.name"] = "chunk"
+        ps._strat_ts[f"h{i}.host.name"] = time.time()
     ps._strat_dirty = True
-    ps._persist_strat_memory()
-    check("stop persists the learned strategies (capped at 256)",
-          len(saved) == 256 and saved.get("h299.host.name") == "chunk",
+    ps.persist_strat_memory()
+    check("persist writes the learned strategies (capped at 256)",
+          len(saved) == 256 and
+          saved.get("h299.host.name", {}).get("s") == "chunk" and
+          isinstance(saved.get("h299.host.name", {}).get("t"), int),
           f"{len(saved)} entries")
     check("dirty flag cleared after persist", not ps._strat_dirty)
 
-    # a fresh session seeds from settings
+    # a clean map persists NOTHING (no cfg.save call)
+    saves = []
+    ps.cfg.save = lambda: saves.append(1) or True
+    ps.persist_strat_memory()
+    check("clean map: persist is a no-op (no cfg.save)", not saves)
+
+    # old entries are dropped by the retention window on persist
+    ps2 = make_server()
+    ps2.cfg.save = lambda: True
+    ps2._strat_pref["old.host.name"] = "chunk"
+    ps2._strat_ts["old.host.name"] = time.time() - 400 * 86400
+    ps2._strat_pref["new.host.name"] = "smart"
+    ps2._strat_ts["new.host.name"] = time.time()
+    ps2._strat_dirty = True
+    ps2.cfg.strat_memory = {}
+    ps2.persist_strat_memory()
+    check("persist drops entries older than the retention window",
+          "old.host.name" not in ps2.cfg.strat_memory and
+          "new.host.name" in ps2.cfg.strat_memory,
+          str(ps2.cfg.strat_memory))
+
+    # a failed save keeps the dirty flag and retries within 60 s
+    ps3 = make_server()
+    ps3.cfg.save = lambda: False
+    ps3._strat_pref["x.host.name"] = "chunk"
+    ps3._strat_ts["x.host.name"] = time.time()
+    ps3._strat_dirty = True
+    before = ps3._strat_save_at
+    ps3.persist_strat_memory()
+    check("failed save keeps dirty + retry within 60 s",
+          ps3._strat_dirty and ps3._strat_save_at <= time.time() + 60
+          and ps3._strat_save_at < before, str(ps3._strat_save_at))
+
+    # a fresh session seeds from settings: legacy AND new form, ages applied
     cfg2 = types.SimpleNamespace(port=9401, fragment_size=2, strategy="smart",
                                  excluded=[], doh_enabled=False,
                                  proxy_mode="manual", upstream_proxy="",
+                                 log_retention_days=14,
                                  strat_memory={"seed.host.name": "random"})
-    ps2 = ProxyServer(cfg2, FakeLog(), Stats(), "tok")
-    check("start seeds strategy memory from settings",
-          ps2._strat_pref.get("seed.host.name") == "random",
-          str(ps2._strat_pref))
+    ps4 = ProxyServer(cfg2, FakeLog(), Stats(), "tok")
+    check("start seeds strategy memory from settings (legacy form)",
+          ps4._strat_pref.get("seed.host.name") == "random",
+          str(ps4._strat_pref))
+    cfg3 = types.SimpleNamespace(port=9401, fragment_size=2, strategy="smart",
+                                 excluded=[], doh_enabled=False,
+                                 proxy_mode="manual", upstream_proxy="",
+                                 log_retention_days=14,
+                                 strat_memory={"n.host.name":
+                                               {"s": "chunk",
+                                                "t": int(time.time())},
+                                               "o.host.name":
+                                               {"s": "raw",
+                                                "t": int(time.time()
+                                                         - 400 * 86400)}})
+    ps5 = ProxyServer(cfg3, FakeLog(), Stats(), "tok")
+    check("seeding accepts the new form and drops stale entries",
+          ps5._strat_pref.get("n.host.name") == "chunk" and
+          "o.host.name" not in ps5._strat_pref, str(ps5._strat_pref))
 
     # the config layer sanitizes what it loads (hand-edited settings.json)
     from hookip.config import Config
     c = Config({"strat_memory": {"a.host.name": "bogus", "b.host.name": "chunk"}})
+    got = c.strat_memory.get("b.host.name", {})
     check("invalid strategy values dropped on load",
-          c.strat_memory == {"b.host.name": "chunk"}, str(c.strat_memory))
+          "a.host.name" not in c.strat_memory and
+          got.get("s") == "chunk" and isinstance(got.get("t"), int),
+          str(c.strat_memory))
     big = {f"k{i}.host.name": "smart" for i in range(300)}
     check("oversized strat_memory pruned to 256",
           len(Config({"strat_memory": big}).strat_memory) == 256)
@@ -371,7 +427,7 @@ def test_dpi_flag_and_raw_last_resort():
     calls = []
 
     def fake_tunnel_once(csock, host, port, strategy, first, excl=False,
-                         force_no_frag=False):
+                         force_no_frag=False, count_first=True):
         calls.append((strategy, force_no_frag))
         if strategy == "raw" and force_no_frag:
             s1, s2 = socketpair()
@@ -410,7 +466,7 @@ def test_always_resets_falls_through_raw():
     calls = []
 
     def fake_tunnel_once(csock, host, port, strategy, first, excl=False,
-                         force_no_frag=False):
+                         force_no_frag=False, count_first=True):
         calls.append((strategy, force_no_frag))
         raise DpiReset(f"{host}:{port} connection reset during ClientHello "
                        f"(possible DPI reset)")
@@ -454,7 +510,7 @@ def test_no_string_matching():
     ps = make_server()
 
     def fake_tunnel_once(csock, host, port, strategy, first, excl=False,
-                         force_no_frag=False):
+                         force_no_frag=False, count_first=True):
         calls.append(strategy)
         raise OSError(f"{host}:{port} could not connect (timeout)")
 
@@ -853,7 +909,7 @@ def test_flap_retry_recovers_known_good():
     calls = []
 
     def fake_tunnel_once(csock, host, port, strategy, first, excl=False,
-                         force_no_frag=False):
+                         force_no_frag=False, count_first=True):
         calls.append(strategy)
         if len(calls) >= 2:
             s1, _s2 = socketpair()               # the alive window opens on
@@ -885,7 +941,7 @@ def test_flap_retry_skips_never_worked():
     calls = []
 
     def fake_tunnel_once(csock, host, port, strategy, first, excl=False,
-                         force_no_frag=False):
+                         force_no_frag=False, count_first=True):
         calls.append(strategy)
         raise proxymod.ConnectDead(
             f"{host}:{port} could not connect (1 address(es) tried, timed out)")
@@ -910,7 +966,7 @@ def test_flap_retry_time_budget():
     calls = []
 
     def fake_tunnel_once(csock, host, port, strategy, first, excl=False,
-                         force_no_frag=False):
+                         force_no_frag=False, count_first=True):
         calls.append(strategy)
         time.sleep(0.05)                     # simulated cost per attempt
         offset[0] += 7.0                     # each attempt 'costs' 7 s of
@@ -1023,7 +1079,9 @@ def test_bind_error_messages():
 
     ps3 = make_server()
     ps3.cfg.port = 8937
-    real_socket = proxymod.socket.socket
+    real_socket = proxymod.socket   # the MODULE (not .socket — that is the
+                                    # class, and restoring it here used to
+                                    # shadow the module for every later test)
 
     class FakeSock:
         def setsockopt(self, *a):
@@ -1039,7 +1097,8 @@ def test_bind_error_messages():
         socket=lambda *a, **k: FakeSock(), AF_INET=socket.AF_INET,
         SOCK_STREAM=socket.SOCK_STREAM, SOL_SOCKET=socket.SOL_SOCKET,
         SO_EXCLUSIVEADDRUSE=socket.SO_EXCLUSIVEADDRUSE,
-        IPPROTO_TCP=socket.IPPROTO_TCP, TCP_NODELAY=socket.TCP_NODELAY)
+        IPPROTO_TCP=socket.IPPROTO_TCP, TCP_NODELAY=socket.TCP_NODELAY,
+        create_connection=socket.create_connection)
     try:
         try:
             ps3.start()
@@ -1063,7 +1122,7 @@ def test_connect_dead_fail_fast():
     calls = []
 
     def fake_tunnel_once(csock, host, port, strategy, first, excl=False,
-                         force_no_frag=False):
+                         force_no_frag=False, count_first=True):
         calls.append(strategy)
         raise proxymod.ConnectDead(
             f"{host}:{port} could not connect (1 address(es) tried, timed out)")
@@ -1120,6 +1179,306 @@ def test_unconfirmed_nx_not_verified_dead():
     client.close(); client_peer.close()
 
 
+# ---- canonicalization keeps request BODIES intact ----------------------
+def test_post_body_bare_lf_intact():
+    """The old whole-buffer canonicalization rewrote every bare \n in an
+    upload body into \r\n, breaking Content-Length. The body must reach
+    the origin byte-identical — direct AND through a fake upstream proxy."""
+    for upstream in (False, True):
+        label = "upstream" if upstream else "non-upstream"
+        responses = (b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n"
+                     b"Connection: close\r\n\r\nhi")
+        got, done, _srv, origin_port = origin_server(responses=responses)
+        ps = make_server(upstream_proxy=("127.0.0.1:" + str(origin_port)
+                                         if upstream else ""))
+        client, client_peer = socketpair()
+        body = b"line1\nline2\n\nlast\n"          # bare-LF body bytes
+        head = (f"POST http://127.0.0.1:{origin_port}/upload HTTP/1.1\r\n"
+                f"Host: 127.0.0.1\r\nContent-Length: {len(body)}\r\n"
+                f"Connection: close\r\n\r\n").encode()
+        result = {}
+
+        def call():
+            try:
+                ps._plain_http(client, head + body, "POST",
+                               f"http://127.0.0.1:{origin_port}/upload",
+                               ProxyServer._parse_head(head)[2])
+                result["ok"] = True
+            except Exception as e:
+                result["err"] = e
+
+        th = threading.Thread(target=call, daemon=True)
+        th.start()
+        th.join(8)
+        check(f"body-intact POST completes ({label})", result.get("ok"),
+              repr(result.get("err")))
+        if not result.get("ok"):
+            continue
+        done.wait(5)
+        data = got["data"]
+        hdr, _sep, rcv_body = data.partition(b"\r\n\r\n")
+        cl = 0
+        for line in hdr.split(b"\r\n"):
+            if line.lower().startswith(b"content-length:"):
+                cl = int(line.split(b":")[1])
+        check(f"body byte-identical with matching Content-Length ({label})",
+              rcv_body.startswith(body) and cl == len(body),
+              f"cl={cl} body={rcv_body[:40]!r}")
+        client.close(); client_peer.close()
+
+
+def test_handle_canonicalizes_only_complete_heads():
+    """A complete head with interior bare LF is canonicalized (and the
+    request proceeds); a head WITHOUT a terminator is never manufactured
+    into a complete one (the incomplete-head handling stays)."""
+    responses = (b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n"
+                 b"Connection: close\r\n\r\nhi")
+    got, done, _srv, origin_port = origin_server(responses=responses)
+    ps = make_server()
+    client, client_peer = socketpair()
+    result = {}
+
+    def run_handle(sock, out):
+        try:
+            ps._handle(sock)
+            out["done"] = True
+        except Exception as e:
+            out["err"] = e
+
+    # (a) incomplete head: _handle must come back without a 431, without
+    # touching any origin, and without treating it as a request. The read
+    # tail waits out the full 30 s socket timeout before returning, so the
+    # join budget must cover it.
+    th = threading.Thread(target=run_handle, args=(client, result), daemon=True)
+    th.start()
+    time.sleep(0.15)
+    client_peer.sendall(b"GET http://x/y HTTP/1.1\nHost: x\n")   # no terminator
+    th.join(35)
+    check("head without terminator: handled, no crash",
+          result.get("done") and not result.get("err"), str(result))
+    check("head without terminator: origin never contacted",
+          got["data"] == b"", got["data"][:60])
+    client.close(); client_peer.close()
+
+    # (b) complete head with interior bare LF reaches the origin as clean
+    # CRLF lines (the smuggling fix, driven through the real _handle path)
+    got2, done2, _srv2, port2 = origin_server(responses=responses)
+    client2, peer2 = socketpair()
+    result2 = {}
+    th2 = threading.Thread(target=run_handle, args=(client2, result2), daemon=True)
+    th2.start()
+    time.sleep(0.15)
+    head = (f"GET http://127.0.0.1:{port2}/x HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+            f"X-A: v1\nX-B: v2\r\nConnection: close\r\n\r\n").encode()
+    peer2.sendall(head)
+    th2.join(15)
+    done2.wait(5)
+    check("complete mixed-LF head handled end to end",
+          result2.get("done") and not result2.get("err"), str(result2))
+    check("origin saw the canonicalized head",
+          b"x-a: v1\r\n" in got2["data"].lower()
+          and b"x-b: v2\r\n" in got2["data"].lower(),
+          got2["data"][:120])
+    client2.close(); peer2.close()
+
+
+def test_stop_does_no_disk_io():
+    """stop() must not call cfg.save (the emergency path calls it before
+    restoring the registry); persist_strat_memory() does, only when dirty."""
+    ps = make_server()
+    saves = []
+    ps.cfg.save = lambda: saves.append(1) or True
+    ps.stop()
+    check("stop() performs NO cfg.save()", saves == [], str(saves))
+    ps._strat_pref["a.host.name"] = "chunk"
+    ps._strat_ts["a.host.name"] = time.time()
+    ps._strat_dirty = True
+    ps.persist_strat_memory()
+    check("persist_strat_memory() saves when dirty", len(saves) == 1)
+
+
+def test_upstream_connect_failure_is_connectdead():
+    """A network-proxy CONNECT failure stops after ONE strategy attempt
+    (ConnectDead), instead of re-dialing all three."""
+    ps = make_server(upstream_proxy="lan-proxy.example:8080")
+
+    def dead_upstream(host, port, timeout=5.0):
+        raise OSError("network proxy refused CONNECT")
+
+    ps._via_upstream = dead_upstream
+    client, peer = socketpair()
+    try:
+        ps._tunnel_once(client, "target.test", 443, "smart", b"\x16hello")
+        check("upstream failure raises ConnectDead", False, "no raise")
+    except ConnectDead:
+        check("upstream failure raises ConnectDead", True)
+    except Exception as e:
+        check("upstream failure raises ConnectDead", False, repr(e))
+    client.close(); peer.close()
+
+    # and inside _tunnel: exactly ONE strategy is tried
+    ps2 = make_server(upstream_proxy="lan-proxy.example:8080")
+    calls = []
+
+    def fake_once(csock, host, port, strategy, first, excl=False,
+                  force_no_frag=False, count_first=True):
+        calls.append(strategy)
+        raise ConnectDead("network proxy refused")
+
+    ps2._tunnel_once = fake_once
+    client2, peer2 = socketpair()
+    result2 = {}
+    th = run_tunnel_async(ps2, client2, peer2, "target.test", 443, result2)
+    th.join(10)
+    check("upstream failure: only ONE strategy tried", len(calls) == 1,
+          str(calls))
+    # _tunnel's summary raise carries the ConnectDead text (the established
+    # contract: the caller sees an OSError whose message names the network
+    # proxy failure; the STOP-after-one-attempt behavior is the fix)
+    err2 = result2.get("err")
+    check("upstream failure surfaced with the ConnectDead text",
+          isinstance(err2, OSError) and "network proxy" in str(err2),
+          repr(err2))
+    client2.close(); peer2.close()
+
+
+def test_invalid_port_rejected():
+    """CONNECT 'host:99999' must be a malformed request (ValueError path),
+    not an OverflowError in a worker; stats stay balanced."""
+    ps = make_server()
+    client, peer = socketpair()
+    result = {}
+
+    def run():
+        try:
+            ps._handle(client)
+            result["done"] = True
+        except Exception as e:
+            result["err"] = e
+
+    th = threading.Thread(target=run, daemon=True)
+    th.start()
+    time.sleep(0.15)
+    peer.sendall(b"CONNECT badhost:99999 HTTP/1.1\r\nHost: badhost\r\n\r\n")
+    th.join(15)
+    warn_lines = [m for (lvl, m) in ps.log.lines
+                  if lvl == "warn" and "Malformed request" in m]
+    check("host:99999 -> malformed-request log", len(warn_lines) == 1,
+          str(ps.log.lines[-3:]))
+    tot, act, up, down, failed, blocked = ps.stats.totals()
+    check("host:99999 -> stats stay balanced (nothing opened)",
+          tot == 0 and act == 0 and failed == 0, str((tot, act, failed)))
+    client.close(); peer.close()
+
+
+def test_pac_wildcards_and_safety():
+    ps = make_server(port=9413)
+    pac = get_pac(ps, ["a*.com", "b\nhost.test", 'q"uote.test',
+                       "b\xfccher.de"])
+    check("PAC: mid-pattern wildcard uses shExpMatch",
+          "shExpMatch(host, 'a*.com')" in pac
+          and "host == 'a*.com'" not in pac, pac[:400])
+    check("PAC: IDN pattern punycoded",
+          "xn--bcher-kva.de" in pac and "b\xfccher" not in pac, pac[:400])
+    check("PAC: pattern with a NEWLINE is skipped",
+          "b\nhost" not in pac and "\\n" not in pac)
+    check("PAC: pattern with a double quote is skipped",
+          'q"uote' not in pac)
+    check("PAC script itself has no stray control characters",
+          all(ord(c) >= 0x20 or c in "\n\r\t" for c in pac))
+
+
+def test_connect_parallel_closes_late_winner():
+    """A connection completing after the winner is chosen must be closed,
+    not leaked."""
+    ps = make_server()
+    opened = []
+    closed = []
+    gate = threading.Event()
+
+    class FakeSock:
+        def __init__(self, ip):
+            self.ip = ip
+
+        def settimeout(self, t):
+            pass
+
+        def setsockopt(self, *a):
+            pass
+
+        def close(self):
+            closed.append(self.ip)
+
+    def fake_connect(addr, timeout=None):
+        s = FakeSock(addr[0])
+        opened.append(s)
+        if addr[0] == "10.0.0.1":
+            gate.wait(3)          # the FIRST candidate is slow
+        return s
+
+    with mock.patch.object(socket, "create_connection", fake_connect):
+        winner = ps._connect_parallel(["10.0.0.1", "10.0.0.2"], 443, timeout=3.0)
+    check("_connect_parallel returns the fast winner",
+          winner.ip == "10.0.0.2", winner.ip)
+    gate.set()                    # let the slow attempt complete (late)
+    time.sleep(0.3)
+    check("late winner is closed, not leaked",
+          "10.0.0.1" in closed, f"closed={closed}")
+
+
+def test_retry_stats_count_first_once():
+    """Across two attempts (first dies mid-handshake, retry succeeds), the
+    first flight is added to the upload stats exactly once."""
+    ps = make_server()
+    calls = []
+
+    def fake_once(csock, host, port, strategy, first, excl=False,
+                  force_no_frag=False, count_first=True):
+        calls.append((strategy, count_first))
+        if len(calls) == 1:
+            # pretend the relay ran and counted the first flight
+            ps.stats.add(host, up=len(first), down=0)
+            raise UpstreamDied(f"{host} upstream died mid-connection")
+        s1, _s2 = socketpair()
+        ps.stats.add(host, up=0, down=0)
+        return s1
+
+    ps._tunnel_once = fake_once
+    client, peer = socketpair()
+    res = {}
+    th = run_tunnel_async(ps, client, peer, "retry.test", 443, res)
+    th.join(10)
+    check("retry flow completes", res.get("ok"), repr(res.get("err")))
+    check("first attempt counted, retry passes count_first=False",
+          calls[0][1] is True and calls[1][1] is False and len(calls) == 2,
+          str(calls))
+    _tot, _act, up, _down, _f, _b = ps.stats.totals()
+    hello_len = len(b"\x16\x03\x01hello-bytes")
+    check("upload stats equal len(first) ONCE across two attempts",
+          up == hello_len, f"up={up} hello={hello_len}")
+    client.close(); peer.close()
+
+    # relay-level: count_first=False keeps initial_up out of the stats
+    # but still uses it for the died-mid-handshake DETECTION
+    ps2 = make_server()
+    c1, c2 = socketpair()
+    s1, s2 = socketpair()
+    s2.close()                      # upstream closes cleanly right away
+    try:
+        ps2._relay(c1, s1, "relay2.test", initial_up=7, count_first=False)
+        check("count_first=False still detects died-mid-handshake",
+              False, "no raise")
+    except UpstreamDied:
+        check("count_first=False still detects died-mid-handshake", True)
+    except Exception as e:
+        check("count_first=False still detects died-mid-handshake", False,
+              repr(e))
+    _tot, _act, up2, _down, _f, _b = ps2.stats.totals()
+    check("count_first=False: initial_up NOT added to stats", up2 == 0,
+          f"up={up2}")
+    c1.close(); c2.close(); s1.close()
+
+
 if __name__ == "__main__":
 
     test_parse_head_body()
@@ -1149,6 +1508,14 @@ if __name__ == "__main__":
     test_bind_error_messages()
     test_recent_fail_cleared_on_success()
     test_exclusion_matching()
+    test_post_body_bare_lf_intact()
+    test_handle_canonicalizes_only_complete_heads()
+    test_stop_does_no_disk_io()
+    test_upstream_connect_failure_is_connectdead()
+    test_invalid_port_rejected()
+    test_pac_wildcards_and_safety()
+    test_connect_parallel_closes_late_winner()
+    test_retry_stats_count_first_once()
 
     print()
     print(f"Summary: {sum(1 for _, c in RESULTS if c)}/{len(RESULTS)} passed")

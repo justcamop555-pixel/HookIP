@@ -184,15 +184,42 @@ class ProxyServer:
         self.pac_token = pac_token
         self.resolver = Resolver(cfg, log, chunk=cfg.fragment_size)
         self._strat_pref = {}                 # host -> strategy that last worked
+        self._strat_ts = {}                   # host -> epoch of the last put
         self._strat_cap = 512                 # keep the memory map bounded
         # strategy memory SURVIVES restarts: seeded from settings at start,
-        # persisted back at stop / every 5 min — DPI behavior of a filter
-        # does not change between runs, so 'what worked last time' is
-        # worth keeping
+        # persisted back every 5 min (and by the app AFTER the system
+        # proxy is restored — stop() itself must not do disk I/O, it
+        # would delay the internet restore behind a locked settings
+        # file). DPI behavior of a filter does not change between runs,
+        # so 'what worked last time' is worth keeping.
         try:
             seed = getattr(cfg, "strat_memory", None)
             if isinstance(seed, dict):
-                self._strat_pref.update(seed)
+                # persisted form: {host: {"s": strategy, "t": epoch}};
+                # the legacy {host: "smart"} form is still accepted
+                # (stamped t=now). Entries older than the retention
+                # window are strategy history — drop them like the logs.
+                now = time.time()
+                max_age = (getattr(cfg, "log_retention_days", 30) or 30) * 86400
+                for h, v in seed.items():
+                    if not isinstance(h, str):
+                        continue
+                    if isinstance(v, dict):
+                        s, t = v.get("s"), v.get("t")
+                        if not (isinstance(s, str) and
+                                s in ("smart", "chunk", "random", "raw")):
+                            continue
+                        t = t if (isinstance(t, (int, float)) and
+                                  not isinstance(t, bool)) else now
+                    elif isinstance(v, str) and \
+                            v in ("smart", "chunk", "random", "raw"):
+                        s, t = v, now
+                    else:
+                        continue
+                    if now - t > max_age:
+                        continue              # stale history: dropped
+                    self._strat_pref[h] = s
+                    self._strat_ts[h] = float(t)
         except (OSError, ValueError, TypeError):
             pass
         self._strat_dirty = False
@@ -257,8 +284,12 @@ class ProxyServer:
         self.log.ok(f"Proxy listening on 127.0.0.1:{self.cfg.port}")
 
     def stop(self):
+        # NO disk I/O here: the app's emergency restore calls stop() BEFORE
+        # restoring the registry — a save (DPAPI + fsync) behind a locked
+        # settings.json would delay the internet restore. Strategy memory
+        # is persisted by the app via persist_strat_memory() AFTER the
+        # system proxy is back (and by the 5-min ticker while running).
         self.running = False
-        self._persist_strat_memory()
         if self._lsock:
             try:
                 self._lsock.close()
@@ -350,23 +381,62 @@ class ProxyServer:
         while self.running:
             self.stats.tick()
             if self._strat_dirty and time.time() >= self._strat_save_at:
-                self._persist_strat_memory()
+                self.persist_strat_memory()
             time.sleep(1.0)
 
-    def _persist_strat_memory(self):
+    def persist_strat_memory(self):
         """Write the learned host->strategy map into settings (capped to
-        256 entries — the config layer prunes on load too). Never raises:
-        a failed save must not stop the proxy or the exit sequence."""
+        256 entries, aged by the retention window — the config layer
+        prunes on load too). Persists with the CURRENT form
+        {host: {"s": strategy, "t": epoch}}; only writes when the map
+        actually changed (strat_dirty). Returns True when something was
+        persisted (or there was nothing to do); a failed save keeps the
+        dirty flag and retries within 60 s. Never raises: a failed save
+        must not stop the proxy or the exit sequence."""
+        if not self._strat_dirty:
+            return True            # nothing to do — not an error
         try:
+            max_age = (getattr(self.cfg, "log_retention_days", 30) or 30) * 86400
+            now = time.time()
             with self._state_lock:
-                snap = dict(list(self._strat_pref.items())[-256:])
+                items = [(h, s, self._strat_ts.get(h, now))
+                         for h, s in self._strat_pref.items()]
+            items = [(h, s, t) for (h, s, t) in items
+                     if now - t <= max_age][-256:]
+            snap = {h: {"s": s, "t": int(t)} for (h, s, t) in items}
             self.cfg.strat_memory = snap
+            ok = True
             if getattr(self.cfg, "remember", True):
-                self.cfg.save()
-            self._strat_dirty = False
-            self._strat_save_at = time.time() + 300
+                ok = self.cfg.save()   # True/False — never raises
+            if ok:
+                self._strat_dirty = False
+                self._strat_save_at = time.time() + 300
+            else:
+                # keep the dirty flag: the data is NOT on disk yet; retry
+                # soon but never further out than 60 s
+                self._strat_save_at = min(self._strat_save_at,
+                                          time.time() + 60)
+            return ok
         except Exception:  # noqa: BLE001 — persistence is best-effort
-            pass
+            return False
+
+    # compatibility alias (older callers/tests use the private name)
+    _persist_strat_memory = persist_strat_memory
+
+    def _remember_strat(self, host, strategy):
+        """Record the winning strategy for a host — preference AND age —
+        under _state_lock, bounded. Every put updates _strat_ts so the
+        persisted history can be aged out by the retention window."""
+        with self._state_lock:
+            if len(self._strat_pref) >= self._strat_cap and host not in self._strat_pref:
+                self._strat_pref.pop(next(iter(self._strat_pref)), None)
+                self._strat_ts.pop(next(iter(self._strat_ts)), None)
+            self._strat_pref[host] = strategy
+            self._strat_ts[host] = time.time()
+            if len(self._strat_ts) > self._strat_cap:
+                # keep both maps bounded together (arbitrary eviction)
+                self._strat_ts.pop(next(iter(self._strat_ts)), None)
+        self._strat_dirty = True
 
     def _bounded_state_put(self, d, key, value, cap):
         """Store in a shared state dict under _state_lock with bounded
@@ -436,8 +506,15 @@ class ProxyServer:
                 # embedded \n then became a real attacker-chosen header line
                 # in the upstream request (request smuggling).
                 # 1:1 byte-for-byte, so length checks stay valid.
-                head = head.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
-                complete = b"\r\n\r\n" in head
+                # ONLY the header block is canonicalized: the recv buffer
+                # also carries the start of the request BODY, and rewriting
+                # every bare \n there broke Content-Length (uploads were
+                # received byte-shifted upstream).
+                hdr, term, body = head.partition(b"\r\n\r\n")
+                if term:
+                    head = hdr.replace(b"\r\n", b"\n").replace(
+                        b"\n", b"\r\n") + term + body
+                complete = term != b""
             if not complete:
                 if len(head) >= 262144:
                     # headers too big to be a legitimate request — tell the
@@ -465,13 +542,20 @@ class ProxyServer:
                     port = int(port_s) if port_s.isdigit() else 443
                 else:
                     host, port = hostport, 443
+                # 'host:99999' passed isdigit() and later raised
+                # OverflowError deep in a worker thread — validate here,
+                # before anything is opened (stats stay balanced)
+                if not 1 <= port <= 65535:
+                    raise ValueError("invalid port")
                 host = host.strip("[]").lower()
                 opened = True
                 ssock = self._tunnel(csock, host, port)
-                # success instantly clears the repeat-failure cap: a host
-                # that flapped once used to stay capped for its full 60 s
-                # expiry even after recovery, so connections that would
-                # work via another strategy were refused in that window
+                # a SUCCESSFUL connection clears the repeat-failure cap
+                # (this runs after the connection ends, not instantly): a
+                # host that flapped once used to stay capped for its full
+                # 60 s expiry even after recovery, so connections that
+                # would work via another strategy were refused in that
+                # window
                 with self._fails_lock:
                     self._fails.pop(host, None)
             elif method in ("GET", "POST", "HEAD", "OPTIONS",
@@ -631,22 +715,33 @@ class ProxyServer:
             "host == '[::1]'",
         ]
 
-        def esc(p):
-            return p.replace("\\", "\\\\").replace("'", "\\'")
-
         # On restricted networks (network proxy required) DIRECT is blocked,
         # so user exclusions are deliberately NOT served as DIRECT —
         # everything must go through the chain or it breaks.
         net_up = str(getattr(self.cfg, "upstream_proxy", "") or "").strip()
         for pat in (() if net_up else (self.cfg.excluded or [])):
-            pat = esc(str(pat).strip().lower())
+            raw = str(pat).strip().lower()
+            # a control character or a double quote in a hand-edited
+            # pattern BREAKS the PAC script — the browser then goes DIRECT
+            # silently for everything. Skip those patterns.
+            if any(ord(c) < 0x20 or ord(c) == 0x7f for c in raw) or '"' in raw:
+                continue
+            # punycode IDN patterns like the tunnel side (is_excluded uses
+            # _norm_domain too — both sides must compare the same form)
+            pat = _norm_domain(raw)
             if not pat:
                 continue
             if pat.startswith("*."):
                 host = pat[2:]
                 rules.append(f"shExpMatch(host, '*.{host}')")
                 rules.append(f"host == '{host}'")   # bare domain too
-            elif "." in pat:
+            elif "*" in pat or "?" in pat:
+                # wildcards other than a leading '*.' are fnmatch on the
+                # tunnel side — emit shExpMatch so the PAC matches the same
+                # (the old code emitted an exact host == 'a*.com' that
+                # never matched anything)
+                rules.append(f"shExpMatch(host, '{pat}')")
+            elif "." in pat and not pat.replace(".", "").isdigit():
                 rules.append(f"host == '{pat}'")
                 rules.append(f"shExpMatch(host, '*.{pat}')")   # subdomains
             else:
@@ -689,6 +784,9 @@ class ProxyServer:
         last_err = None
         attempt_errors = []
         saw_dpi = False
+        count_first = True         # stats: only the FIRST attempt that reached
+                                   # the relay adds len(first) — each
+                                   # UpstreamDied retry used to re-add it
         t_start = time.time()      # flap-retry budget: total elapsed across
                                    # attempts must stay under ~6 s
         try:
@@ -737,11 +835,14 @@ class ProxyServer:
         if pref == "raw":
             try:
                 ssock = self._tunnel_once(csock, host, port, "raw", first,
-                                          excl, force_no_frag=True)
+                                          excl, force_no_frag=True,
+                                          count_first=count_first)
                 return ssock
             except ResolveError:
                 raise
             except OSError as exc:
+                if isinstance(exc, UpstreamDied):
+                    count_first = False    # its first flight was counted
                 if isinstance(exc, DpiReset):
                     saw_dpi = True
                 last_err = exc
@@ -752,10 +853,9 @@ class ProxyServer:
 
         for attempt, strategy in enumerate(strategies):
             try:
-                ssock = self._tunnel_once(csock, host, port, strategy, first, excl)
-                self._bounded_state_put(self._strat_pref, host, strategy,
-                                        self._strat_cap)
-                self._strat_dirty = True
+                ssock = self._tunnel_once(csock, host, port, strategy, first,
+                                          excl, count_first=count_first)
+                self._remember_strat(host, strategy)
                 return ssock
             except ResolveError as exc:
                 # DNS-level failure (NXDOMAIN / SERVFAIL / sinkhole-only):
@@ -776,6 +876,10 @@ class ProxyServer:
                 self.log.debug(f"{host}: attempt {attempt+1} ({strategy}) failed: {exc}")
                 break
             except OSError as exc:
+                if isinstance(exc, UpstreamDied):
+                    # the relay RAN: its stats.add already included the
+                    # first flight — a retry must not re-add len(first)
+                    count_first = False
                 if isinstance(exc, DpiReset):
                     saw_dpi = True
                 last_err = exc
@@ -801,15 +905,14 @@ class ProxyServer:
         if saw_dpi and not excl:
             try:
                 ssock = self._tunnel_once(csock, host, port, "raw", first,
-                                          excl, force_no_frag=True)
+                                          excl, force_no_frag=True,
+                                          count_first=count_first)
                 self.log.info(
                     f"{host}:{port} fragmented handshakes kept dying — "
                     "sent one unfragmented (server or middlebox dislikes "
                     "tiny segments); protection was still active for the "
                     "handshake attempt itself.")
-                self._bounded_state_put(self._strat_pref, host, "raw",
-                                        self._strat_cap)
-                self._strat_dirty = True
+                self._remember_strat(host, "raw")
                 return ssock
             except (OSError, ResolveError) as exc2:
                 attempt_errors.append(f"unfragmented: {exc2}")
@@ -823,14 +926,13 @@ class ProxyServer:
         # stay fast. Skipped for excluded hosts (single attempt by design).
         if not excl and host in self._strat_pref and (time.time() - t_start) < 6.0:
             try:
-                ssock = self._tunnel_once(csock, host, port, "smart", first, excl)
+                ssock = self._tunnel_once(csock, host, port, "smart", first,
+                                          excl, count_first=count_first)
                 self.log.info(
                     f"{host}:{port} recovered on a second round after all "
                     "strategies failed — the host is flapping (intermittent "
                     "upstream), not blocked.")
-                self._bounded_state_put(self._strat_pref, host, "smart",
-                                        self._strat_cap)
-                self._strat_dirty = True
+                self._remember_strat(host, "smart")
                 return ssock
             except (OSError, ResolveError) as exc3:
                 attempt_errors.append(f"flap-retry: {exc3}")
@@ -890,10 +992,22 @@ class ProxyServer:
                 break
             if not any(t.is_alive() for t in threads) and not socks:
                 break
-        won.set()
+        # set `won` UNDER the lock: a connection completing in this instant
+        # could otherwise append to `socks` after the final check and leak
+        # (never closed). The attempt() callback closes anything that
+        # arrives after won is set — but only if it SEES won set.
+        with lock:
+            won.set()
         if socks:
             # winner found — do NOT wait for losing attempts to finish; a hung
             # connect on a dead IP would otherwise delay the return (measured 2s)
+            with lock:
+                extras = socks[1:]
+            for s in extras:          # a late second winner: closed, not leaked
+                try:
+                    s.close()
+                except OSError:
+                    pass
             return socks[0]
         for t in threads:
             t.join(timeout=0.5)
@@ -956,7 +1070,7 @@ class ProxyServer:
             raise
 
     def _tunnel_once(self, csock, host, port, strategy, first, exclude_frag=False,
-                     force_no_frag=False):
+                     force_no_frag=False, count_first=True):
         t0 = time.time()
         upstream_set = bool(str(getattr(self.cfg, "upstream_proxy", "") or "").strip())
         if upstream_set:
@@ -978,7 +1092,13 @@ class ProxyServer:
             try:
                 server = self._via_upstream(host, port)
             except OSError as exc:
-                raise OSError(f"{host}:{port} through network proxy {upstream}: {exc}") from exc
+                # ConnectDead (not a plain OSError): the CONNECT to the
+                # network proxy died BEFORE any ClientHello byte, so a
+                # different fragmentation strategy cannot help — a plain
+                # OSError made _tunnel re-try all three strategies against
+                # a proxy that had just refused/timed out
+                raise ConnectDead(
+                    f"{host}:{port} through network proxy {upstream}: {exc}") from exc
         else:
             try:
                 server = self._connect_parallel(ips, port, timeout=3.0)
@@ -1052,7 +1172,8 @@ class ProxyServer:
                 self._tunnel_detail.clear()
             self._tunnel_detail[host] = (strategy, dns_ms, conn_ms, nseg, total_ms)
         try:
-            self._relay(csock, server, host, initial_up=len(first))
+            self._relay(csock, server, host, initial_up=len(first),
+                        count_first=count_first)
         except BaseException:
             # FIX: the _relay call sat outside the close-on-error guard —
             # an exception leaked the upstream socket
@@ -1063,12 +1184,18 @@ class ProxyServer:
             raise
         return server
 
-    def _relay(self, csock, server, host, initial_up=0):
+    def _relay(self, csock, server, host, initial_up=0, count_first=True):
         # initial_up: bytes already pushed upstream before relay started
         # (the ClientHello). Without counting them, a clean FIN right
         # after the handshake read as outcome 'ok' and UpstreamDied never
         # fired — and the first flight was missing from the stats.
-        up = initial_up
+        # count_first: whether initial_up belongs in the stats. A retry
+        # attempt after UpstreamDied re-sends the SAME captured first
+        # flight — counting it again double-counted the upload stats,
+        # while the DETECTION must always see it (a retry whose ClientHello
+        # was sent but got nothing back is still 'died mid-handshake').
+        sent = initial_up          # detection counter (always counts)
+        up = initial_up if count_first else 0
         down = 0
         started = time.time()
         sockets = [csock, server]
@@ -1096,7 +1223,7 @@ class ProxyServer:
                             # request sent but zero bytes ever came back and
                             # the upstream closed → died mid-handshake;
                             # anything else is a normal end of stream
-                            outcome = "server" if (up and not down) else "ok"
+                            outcome = "server" if (sent and not down) else "ok"
                         else:
                             outcome = "client"
                         stop = True
@@ -1108,6 +1235,7 @@ class ProxyServer:
                         stop = True
                         break
                     if s is csock:
+                        sent += len(data)
                         up += len(data)
                     else:
                         down += len(data)
@@ -1161,6 +1289,9 @@ class ProxyServer:
             port = int(port_s) if port_s.isdigit() else 80
         else:
             host, port = hostport, 80
+        if not 1 <= port <= 65535:
+            # before conn_open: stats must stay balanced on the reject path
+            raise ValueError("invalid port")
         host = host.strip("[]").lower()
         self.stats.conn_open(host)
         path = "/" + (rest[1].split("/", 1)[1] if "/" in rest[1] else "")

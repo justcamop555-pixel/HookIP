@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import types
 import unittest.mock as mock
 
@@ -425,15 +426,25 @@ try:
     open(stale, "w").write("plaintext leftover\n")
     stale_tmp = os.path.join(d_sweep, "settings.json.123.tmp")
     open(stale_tmp, "w").write("HKCFG1:xyz\n")
+    # a FRESH tmp is Config.save's staging file, possibly about to be
+    # os.replace()d — a sweep deleting it would break the save
+    fresh_tmp = os.path.join(d_sweep, "settings.json.456.tmp")
+    open(fresh_tmp, "w").write("HKCFG1:xyz\n")
     keep = os.path.join(d_sweep, "settings.json")
     open(keep, "w").write("HKCFG1:real\n")
     removed = dg.sweep_plaintext(d_sweep)
     check("sweep removes legacy winhttp_backup.txt",
           "winhttp_backup.txt" in removed and not os.path.isfile(stale),
           str(removed))
-    check("sweep removes stale settings tmp files",
+    check("sweep skips a FRESH tmp file (a live Config.save may need it)",
+          "settings.json.456.tmp" not in removed and os.path.isfile(fresh_tmp),
+          str(removed))
+    os.utime(stale_tmp, (time.time() - 120, time.time() - 120))
+    removed = dg.sweep_plaintext(d_sweep)
+    check("sweep removes a 2-minute-old tmp file",
           "settings.json.123.tmp" in removed and not os.path.isfile(stale_tmp),
           str(removed))
+    os.remove(fresh_tmp)
     check("sweep keeps settings.json", os.path.isfile(keep))
     # idempotent for the APP-DIR leftovers (the %TEMP% toast sweep is
     # global — another process could drop a new file between calls, so
@@ -444,6 +455,98 @@ try:
           "settings.json.123.tmp" not in again, str(again))
 finally:
     shutil.rmtree(d_sweep, ignore_errors=True)
+
+# ------------------------------------------------- key state (throwaway
+# registry path — the REAL HKCU\Software\HookIP\DataKey is never touched)
+_TEST_KEY_PATH = r"Software\HookIPTest\DataKeyTests"
+
+
+def _save_key_state():
+    return (dg._KEY_REGISTRY_PATH, dg._ENTROPY_BLOB, dg._KEY_BUF,
+            dg._entropy, dg._legacy_fallback)
+
+
+def _restore_key_state(saved):
+    (dg._KEY_REGISTRY_PATH, dg._ENTROPY_BLOB, dg._KEY_BUF,
+     dg._entropy, dg._legacy_fallback) = saved
+
+
+def _wipe_test_key():
+    import winreg
+    try:
+        winreg.DeleteKey(winreg.HKEY_CURRENT_USER, _TEST_KEY_PATH)
+    except OSError:
+        pass
+
+
+# 1. a fresh key environment creates a per-install key and reports it
+saved = _save_key_state()
+_wipe_test_key()
+try:
+    with mock.patch.object(dg, "_KEY_REGISTRY_PATH", _TEST_KEY_PATH):
+        dg._ENTROPY_BLOB = dg._KEY_BUF = dg._entropy = None
+        dg._legacy_fallback = False
+        check("fresh env: using_per_install_key() True",
+              dg.using_per_install_key() is True,
+              f"legacy_fallback={dg._legacy_fallback}")
+        import winreg as _wr
+        with _wr.OpenKey(_wr.HKEY_CURRENT_USER, _TEST_KEY_PATH) as k:
+            raw, _t = _wr.QueryValueEx(k, dg._KEY_REGISTRY_VALUE)
+        check("fresh env: 32-byte random key written to the test path",
+              isinstance(raw, bytes) and len(raw) == 32,
+              f"len={len(raw) if isinstance(raw, bytes) else raw!r}")
+finally:
+    _restore_key_state(saved)
+    _wipe_test_key()
+
+# 2. registry unreachable both probes -> degraded legacy session, key
+#    untouched (status-based probe: a transient error must not create)
+saved = _save_key_state()
+_wipe_test_key()
+try:
+    with mock.patch.object(dg, "_KEY_REGISTRY_PATH", _TEST_KEY_PATH), \
+         mock.patch.object(dg, "_read_key_value",
+                           side_effect=OSError("AV lock")):
+        dg._ENTROPY_BLOB = dg._KEY_BUF = dg._entropy = None
+        dg._legacy_fallback = False
+        check("registry unreachable twice: using_per_install_key() False",
+              dg.using_per_install_key() is False,
+              f"legacy_fallback={dg._legacy_fallback}")
+        import winreg as _wr2
+        try:
+            _wr2.OpenKey(_wr2.HKEY_CURRENT_USER, _TEST_KEY_PATH)
+            created = True
+        except FileNotFoundError:
+            created = False
+        check("degraded session never created a key",
+              not created, f"created={created}")
+finally:
+    _restore_key_state(saved)
+    _wipe_test_key()
+
+# 3. _legacy_plaintext: legacy blob -> text; current blob / corrupt -> None
+saved = _save_key_state()
+try:
+    # force a legacy-entropy blob (this session would write with it)
+    dg._entropy = dg._LEGACY_ENTROPY
+    dg._KEY_BUF = ctypes.create_string_buffer(dg._LEGACY_ENTROPY,
+                                              len(dg._LEGACY_ENTROPY))
+    dg._ENTROPY_BLOB = dg._LEGACY_BLOB
+    dg._legacy_fallback = True
+    legacy_line = dg.encrypt_line("legacy-era line")
+finally:
+    _restore_key_state(saved)
+check("_legacy_plaintext: legacy blob decrypts (needs upgrade)",
+      dg._legacy_plaintext(legacy_line, dg.LOG_MAGIC) == "legacy-era line",
+      repr(dg._legacy_plaintext(legacy_line, dg.LOG_MAGIC)))
+current_line = dg.encrypt_line("current-era line")
+check("_legacy_plaintext: current blob -> None",
+      dg._legacy_plaintext(current_line, dg.LOG_MAGIC) is None)
+check("_legacy_plaintext: corrupt blob -> None",
+      dg._legacy_plaintext(dg.LOG_MAGIC + "!!!not-b64!!!", dg.LOG_MAGIC)
+      is None)
+check("_legacy_plaintext: plain text -> None",
+      dg._legacy_plaintext("plain line", dg.LOG_MAGIC) is None)
 
 # ------------------------------------------------- log retention purge
 from hookip import logutil as _lu
@@ -634,8 +737,10 @@ try:
     check("Config.save swallows an early makedirs failure (no NameError)",
           not raised)
 
-    # 8. winproxy.backup same pattern: a failing encrypt must not raise
-    # out of backup() and must not leave a half-written temp file
+    # 8. winproxy.backup: a failing encrypt now RAISES BackupError (the
+    # apply_* path must abort before any registry write — silently losing
+    # the backup meant Stop's remove_proxy() could erase the user's
+    # original corporate proxy) and must not leave a half-written temp
     import tempfile as _tf
     d_bp = _tf.mkdtemp()
     try:
@@ -644,14 +749,16 @@ try:
              _mock.patch.object(_wpx, "_write_restore_cmd", lambda vals: None), \
              _mock.patch.object(dg, "encrypt_bytes",
                                 lambda data: (_ for _ in ()).throw(OSError("dpapi down"))):
-            raised = False
+            raised = None
             try:
                 _wpx.backup()
             except Exception as exc:  # noqa: BLE001
-                raised = True
+                raised = exc
                 print("   backup raised:", type(exc).__name__, exc)
-        check("winproxy.backup swallows a failing encrypt (no NameError)",
-              not raised and not [n for n in os.listdir(d_bp) if ".tmp" in n],
+        check("winproxy.backup raises BackupError on a failed encrypt",
+              isinstance(raised, _wpx.BackupError), repr(raised))
+        check("winproxy.backup leaves no half-written temp file",
+              not [n for n in os.listdir(d_bp) if ".tmp" in n],
               str(os.listdir(d_bp)))
     finally:
         shutil.rmtree(d_bp, ignore_errors=True)

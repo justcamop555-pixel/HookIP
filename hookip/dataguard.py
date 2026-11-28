@@ -99,71 +99,136 @@ _KEY_BUF = None            # keeps the key bytes alive for the process
 _ENTROPY_BLOB = None       # DATA_BLOB over the per-install key (lazy)
 
 
-def _load_key():
-    """Load (or create) the per-install key. Called on every crypto call
-    but does real work once per process; thread-safe."""
-    global _entropy, _legacy_fallback, _ENTROPY_BLOB, _KEY_BUF
-    with _key_lock:
-        if _ENTROPY_BLOB is not None:
-            return
-        # outcome of the registry probe: 'ok' (key loaded), 'missing'
-        # (value absent — safe to create), 'invalid' (present but wrong
-        # type/len — can never decrypt anything), 'unreachable' (transient
-        # registry failure — we do NOT know whether the value exists)
-        status = "ok"
-        key = None
+def _read_key_value():
+    """Raw registry value behind the per-install key (raises OSError)."""
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _KEY_REGISTRY_PATH) as k:
+        raw, _typ = winreg.QueryValueEx(k, _KEY_REGISTRY_VALUE)
+    return raw
+
+
+def _probe_key():
+    """Registry probe. Returns (status, key):
+    'ok' (key loaded), 'missing' (value absent — safe to create),
+    'invalid' (present but wrong type/len — can never decrypt anything),
+    'unreachable' (transient registry failure — we do NOT know whether
+    the value exists). Only 'missing'/'invalid' may be answered with a
+    NEW key."""
+    for attempt in (0, 1):
         try:
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-                                _KEY_REGISTRY_PATH) as k:
-                raw, _typ = winreg.QueryValueEx(k, _KEY_REGISTRY_VALUE)
+            raw = _read_key_value()
             if isinstance(raw, bytes) and len(raw) == _KEY_LEN:
-                key = raw
-            else:
-                status = "invalid"
+                return ("ok", raw)
+            return ("invalid", None)
         except FileNotFoundError:
-            status = "missing"
+            return ("missing", None)
         except OSError:
             # TRANSIENT registry failure (AV lock, key momentarily busy):
             # the old code regenerated the key on ANY OSError and
             # OVERWROTE a perfectly good one, orphaning every file ever
             # written with it. Retry once; only create a key when the
             # absence/invalidity is PROVEN.
-            try:
+            if attempt == 0:
                 time.sleep(0.05)
-                with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-                                    _KEY_REGISTRY_PATH) as k:
-                    raw, _typ = winreg.QueryValueEx(k, _KEY_REGISTRY_VALUE)
-                if isinstance(raw, bytes) and len(raw) == _KEY_LEN:
-                    key = raw
+                continue
+            return ("unreachable", None)
+    return ("unreachable", None)   # pragma: no cover — loop returns above
+
+
+def _create_key():
+    """Write a fresh per-install key; None when the registry refuses."""
+    key = secrets.token_bytes(_KEY_LEN)
+    try:
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER,
+                              _KEY_REGISTRY_PATH) as k:
+            winreg.SetValueEx(k, _KEY_REGISTRY_VALUE, 0,
+                              winreg.REG_BINARY, key)
+    except OSError:
+        return None
+    return key
+
+
+# first-run cross-process race: two HookIP processes probing the (still
+# missing) key at the same instant would each create one and the loser's
+# files would be orphaned. A named mutex serializes the probe-and-create.
+_KEY_INIT_MUTEX = r"Local\HookIP_KeyInit"
+_WAIT_OBJECT_0 = 0x00000000
+_WAIT_ABANDONED = 0x00000080
+
+
+def _load_key():
+    """Load (or create) the per-install key. Called on every crypto call
+    but does real work once per process; thread-safe."""
+    global _entropy, _legacy_fallback, _ENTROPY_BLOB, _KEY_BUF
+    if _ENTROPY_BLOB is not None:      # lock-free fast path
+        return
+    with _key_lock:
+        if _ENTROPY_BLOB is not None:
+            return
+        # cross-process init mutex: if it cannot be created or the wait
+        # times out we continue without it exactly as before (best-effort)
+        held = None
+        try:
+            m = _kernel32.CreateMutexW(None, False, _KEY_INIT_MUTEX)
+            if m:
+                if _kernel32.WaitForSingleObject(m, 5000) in (
+                        _WAIT_OBJECT_0, _WAIT_ABANDONED):
+                    held = m      # WAIT_ABANDONED: previous owner died;
+                                  # the mutex IS ours, safe to proceed
                 else:
-                    status = "invalid"
-            except FileNotFoundError:
-                status = "missing"
-            except OSError:
-                status = "unreachable"
-        if key is None and status in ("missing", "invalid"):
-            # absent or provably garbage: create a fresh per-install key
-            key = secrets.token_bytes(_KEY_LEN)
-            try:
-                with winreg.CreateKey(winreg.HKEY_CURRENT_USER,
-                                      _KEY_REGISTRY_PATH) as k:
-                    winreg.SetValueEx(k, _KEY_REGISTRY_VALUE, 0,
-                                      winreg.REG_BINARY, key)
-            except OSError:
-                # no usable registry access: degrade to the legacy static
-                # entropy (old behavior) rather than failing every write
+                    _kernel32.CloseHandle(m)   # 5 s timeout: unguarded
+        except Exception:  # noqa: BLE001 — mutex trouble must not break crypto
+            held = None
+        try:
+            status, key = _probe_key()
+            if key is None and status in ("missing", "invalid"):
+                # absent or provably garbage: create a fresh per-install
+                # key — under the mutex when we hold it
+                key = _create_key()
+                if key is not None:
+                    # AFTER writing, re-read and use what the registry
+                    # ACTUALLY holds: an unguarded writer (older process)
+                    # may have overwritten ours in between.
+                    try:
+                        raw = _read_key_value()
+                        if isinstance(raw, bytes) and len(raw) == _KEY_LEN:
+                            key = raw
+                    except OSError:
+                        pass          # keep the key we just wrote
+            elif key is None:
+                # 'unreachable': do NOT write anything — the stored key
+                # (if any) stays untouched, old files remain readable on
+                # the next run; this session degrades to the legacy
+                # entropy
                 key = _LEGACY_ENTROPY
                 _legacy_fallback = True
-        elif key is None:
-            # 'unreachable': do NOT write anything — the stored key (if
-            # any) stays untouched, old files remain readable on the next
-            # run; this session degrades to the legacy entropy
+        finally:
+            if held is not None:
+                try:
+                    _kernel32.ReleaseMutex(held)
+                except Exception:
+                    pass
+                try:
+                    _kernel32.CloseHandle(held)
+                except Exception:
+                    pass
+        if key is None:
+            # no usable registry access: degrade to the legacy static
+            # entropy (old behavior) rather than failing every write
             key = _LEGACY_ENTROPY
             _legacy_fallback = True
         _entropy = key
         _KEY_BUF = ctypes.create_string_buffer(key, len(key))
         _ENTROPY_BLOB = _DATA_BLOB(
             len(key), ctypes.cast(_KEY_BUF, ctypes.POINTER(ctypes.c_char)))
+
+
+def using_per_install_key():
+    """True when blobs are/will be written with the random per-install
+    key; False when this session degraded to the legacy static entropy
+    (registry unreachable). Public: Diagnostics' 'Data protection' row
+    and Config.save's degraded-mode guard read it."""
+    _load_key()
+    return not _legacy_fallback
 
 # sentinel: the line IS ours (HKLOG1:) but the blob failed to decrypt
 # (truncated, corrupted, or re-encrypted under a different account).
@@ -219,6 +284,8 @@ _crypt32.CryptUnprotectData.argtypes = [
     _BLOB_PTR,
 ]
 _crypt32.CryptUnprotectData.restype = wintypes.BOOL
+# _unprotect_once keeps the failed call's Windows error code here
+_last_unprotect_error = 0
 _kernel32.LocalFree.argtypes = [wintypes.HLOCAL]
 _kernel32.LocalFree.restype = wintypes.HLOCAL
 
@@ -235,6 +302,13 @@ _advapi32.ConvertSidToStringSidW.restype = wintypes.BOOL
 _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
 _kernel32.CloseHandle.restype = wintypes.BOOL
 _kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+_kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL,
+                                   wintypes.LPCWSTR]
+_kernel32.CreateMutexW.restype = wintypes.HANDLE
+_kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+_kernel32.WaitForSingleObject.restype = wintypes.DWORD
+_kernel32.ReleaseMutex.argtypes = [wintypes.HANDLE]
+_kernel32.ReleaseMutex.restype = wintypes.BOOL
 
 # CRYPTPROTECT_UI_FORBIDDEN: never surface a DPAPI prompt from a
 # background thread
@@ -256,7 +330,9 @@ def _blob(data):
 
 def _unprotect_once(blob, ent_blob):
     """One CryptUnprotectData attempt with the given entropy blob.
-    Returns bytes or None (never raises for a failed decrypt)."""
+    Returns bytes or None (never raises for a failed decrypt). The last
+    Windows error code of the failed call is kept in
+    _last_unprotect_error for the diagnostics message."""
     pin, keep_in = _blob(blob)
     pout = _DATA_BLOB()
     ok = _crypt32.CryptUnprotectData(ctypes.byref(pin), None,
@@ -265,6 +341,9 @@ def _unprotect_once(blob, ent_blob):
                                      _CRYPTPROTECT_UI_FORBIDDEN,
                                      ctypes.byref(pout))
     if not ok:
+        global _last_unprotect_error
+        # use_last_error=True keeps this accurate inside the failed call
+        _last_unprotect_error = ctypes.get_last_error()
         return None
     try:
         return ctypes.string_at(pout.pbData, pout.cbData)
@@ -286,7 +365,8 @@ def _crypt(data, decrypt):
         if out is None and not _legacy_fallback and _entropy != _LEGACY_ENTROPY:
             out = _unprotect_once(data, _LEGACY_BLOB)
         if out is None:
-            raise OSError("DPAPI CryptUnprotectData failed: blob not "
+            raise OSError("DPAPI CryptUnprotectData failed (last error "
+                          f"{_last_unprotect_error}): blob not "
                           "decryptable with the per-install or legacy key")
         return out
     _load_key()
@@ -324,8 +404,8 @@ def encrypt_line(text, magic=LOG_MAGIC):
     Encodes with errors='replace': log lines carry raw host strings that
     Python may decode with surrogateescape — a lone surrogate crashes a
     strict utf-8 encode, and that exception used to escape _emit into
-    the proxy's handler. Unpaired surrogates become '?' (b'\\x3f',
-    Python 3.15's replace behavior) — round-trippable, never an escape.
+    the proxy's handler. Unpaired surrogates are replaced by '?' —
+    lossy, but never an exception.
     """
     if text is None:
         text = ""
@@ -508,32 +588,39 @@ def acl_is_hardened(path):
 
 # ------------------------------------------------- entropy upgrade
 
-def _blob_is_legacy(blob):
-    """True when `blob` decrypts with the legacy static entropy (and not
-    already with the per-install key). False for current/foreign/corrupt
-    blobs — nothing to upgrade."""
+def _legacy_plaintext(line, magic):
+    """The decrypted str when `line` decrypts ONLY with the legacy
+    static entropy — i.e. it still needs an entropy upgrade.
+
+    None for: current-key blobs (nothing to do), foreign/plaintext/blank
+    input, corrupt blobs, and when this session itself runs on the legacy
+    entropy (legacy and current are then the same key — no decision is
+    possible). Costs one failed current-key attempt and one legacy
+    decrypt; the caller re-encrypts the result without re-decrypting
+    (the old check+decrypt path cost twice that)."""
+    if not isinstance(line, str):
+        return None
+    line = line.strip()
+    if not line.startswith(magic):
+        return None
+    try:
+        blob = base64.b64decode(line[len(magic):], validate=True)
+    except Exception:
+        return None
     _load_key()
     if _unprotect_once(blob, _ENTROPY_BLOB) is not None:
-        return False
+        return None               # already encrypted with the current key
     if _legacy_fallback or _entropy == _LEGACY_ENTROPY:
-        return False
-    return _unprotect_once(blob, _LEGACY_BLOB) is not None
+        return None               # this session cannot tell legacy apart
+    out = _unprotect_once(blob, _LEGACY_BLOB)
+    return None if out is None else out.decode("utf-8", "replace")
 
 
 def _needs_upgrade(line, magic):
     """For a single guarded line/blob: True = written with the legacy
     static entropy and should be re-encrypted. Foreign/plaintext/blank
     and corrupt lines are False (left exactly as they are)."""
-    if not isinstance(line, str):
-        return False
-    line = line.strip()
-    if not line.startswith(magic):
-        return False
-    try:
-        blob = base64.b64decode(line[len(magic):], validate=True)
-    except Exception:
-        return False
-    return _blob_is_legacy(blob)
+    return _legacy_plaintext(line, magic) is not None
 
 
 def settings_needs_entropy_upgrade(path):
@@ -567,21 +654,28 @@ def upgrade_entropy(log_dir):
         try:
             with open(path, "r", encoding="utf-8", errors="replace") as fh:
                 lines = fh.read().splitlines()
-            # probe the first encrypted line (blank lines ahead of it
-            # must not mask a legacy file)
-            probe = next((ln for ln in lines if ln.startswith(LOG_MAGIC)), None)
-            if probe is None or not _needs_upgrade(probe, LOG_MAGIC):
+            # probe the FIRST and the LAST encrypted line (a file mixing
+            # current and legacy lines — e.g. after a merge whose source
+            # was skipped — may only carry legacy blobs at the tail;
+            # blank lines ahead of the first must not mask a legacy file)
+            enc = [ln for ln in lines if ln.startswith(LOG_MAGIC)]
+            if not enc:
                 continue
+            if _needs_upgrade(enc[0], LOG_MAGIC) or \
+                    _needs_upgrade(enc[-1], LOG_MAGIC):
+                pass                        # legacy blob present: rewrite
+            else:
+                continue                    # all-current file: skip cheap
             out = []
             for ln in lines:
                 # rewrite ONLY blobs still on the legacy static entropy —
                 # already-current lines are left byte-identical
-                if ln.startswith(LOG_MAGIC) and _needs_upgrade(ln, LOG_MAGIC):
-                    v = decrypt_line(ln)          # dual-entropy read
-                    if isinstance(v, str):
-                        out.append(encrypt_line(v))
-                        lines_done += 1
-                        continue
+                v = _legacy_plaintext(ln, LOG_MAGIC) if ln.startswith(LOG_MAGIC) \
+                    else None
+                if v is not None:
+                    out.append(encrypt_line(v))
+                    lines_done += 1
+                    continue
                 out.append(ln)   # current / blank / foreign / unreadable stay
             with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
                 fh.write("\n".join(out) + "\n")
@@ -610,6 +704,19 @@ def is_marker(text):
     return isinstance(text, str) and bool(_MARKER_RE.match(text.strip()))
 
 
+def _has_marker(lines, src_sha):
+    """True when one of the (encrypted) .hlog lines decrypts to an
+    idempotency marker carrying the same source-file sha256."""
+    for ex in lines:
+        v = decrypt_line(ex)
+        # is_marker(v) implies v is a plain str (UNREADABLE/None are
+        # falsy/non-str) — but proving that to a checker needs the str
+        # test spelled out here too
+        if isinstance(v, str) and is_marker(v) and                 _MARKER_RE.match(v.strip()).group(1) == src_sha:
+            return True
+    return False
+
+
 def _decode_legacy(raw):
     """utf-8, then cp1252 (smart quotes/dashes), then latin-1 (cannot
     fail) — plain latin-1 would mangle cp1252's 0x80-0x9F bytes into
@@ -623,7 +730,7 @@ def _decode_legacy(raw):
 
 
 def migrate_plaintext_logs(log_dir):
-    """Encrypt legacy .log files (older versions wrote plaintext).
+    r"""Encrypt legacy .log files (older versions wrote plaintext).
 
     Per file: read BINARY, decode utf-8 -> cp1252 -> latin-1 (so
     non-UTF-8 bytes survive instead of being 'replace'-altered), split
@@ -760,19 +867,6 @@ def migrate_plaintext_logs(log_dir):
     return (converted, total)
 
 
-def _has_marker(lines, src_sha):
-    """True when one of the (encrypted) .hlog lines decrypts to an
-    idempotency marker carrying the same source-file sha256."""
-    for ex in lines:
-        v = decrypt_line(ex)
-        # is_marker(v) implies v is a plain str (UNREADABLE/None are
-        # falsy/non-str) — but proving that to a checker needs the str
-        # test spelled out here too
-        if isinstance(v, str) and is_marker(v) and \
-                _MARKER_RE.match(v.strip()).group(1) == src_sha:
-            return True
-    return False
-
 
 # ------------------------------------------------- plaintext hygiene sweep
 _SWEEP_FILES = ("winhttp_backup.txt",)   # legacy SNIper-era leftovers
@@ -805,8 +899,15 @@ def sweep_plaintext(app_dir):
         except OSError:
             pass
     try:
+        # .tmp files are the atomic-save staging files of Config.save:
+        # a background sweep deleting the one a save is about to
+        # os.replace() would make that save fail. Only sweep ones older
+        # than 60 s — a live temp cannot be that old.
+        tmp_cut = _time.time() - 60
         for p in _glob.glob(os.path.join(app_dir, "settings.json.*.tmp")):
             try:
+                if os.path.getmtime(p) >= tmp_cut:
+                    continue
                 os.remove(p)
                 removed.append(os.path.basename(p))
             except OSError:

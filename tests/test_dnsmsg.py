@@ -164,10 +164,66 @@ def test_rcode_and_aaaa():
     check("AAAA ttl parsed", ttl == 120)
 
 
-test_trailing_dot()
-test_qname_filter()
-test_compression_pointers()
-test_rcode_and_aaaa()
+# ---- strict encode_query validation -------------------------------------
+# valid forms still encode
+try:
+    q = dm.encode_query("example.com.", dm.TYPE_A)
+    check("valid: trailing dot encodes", len(q) > 17)
+except ValueError as exc:
+    check("valid: trailing dot encodes", False, exc)
+try:
+    q = dm.encode_query("exämple.com", dm.TYPE_A)
+    check("valid: IDN encodes (punycode labels)", b"xn--" in q)
+except ValueError as exc:
+    check("valid: IDN encodes (punycode labels)", False, exc)
+try:
+    q = dm.encode_query("a" * 63 + ".com", dm.TYPE_A)
+    check("valid: 63-byte label encodes", len(q) > 17)
+except ValueError as exc:
+    check("valid: 63-byte label encodes", False, exc)
+
+# each invalid case raises ValueError (the proxy reports it as malformed)
+for label, bad in [
+        ("empty name", ""),
+        ("only dots", "."),
+        ("empty label a..b", "a..b"),
+        ("leading dot", ".a.com"),
+        ("64-byte label", "a" * 64 + ".com"),
+        ("254-byte name", "b" * 63 + "." + "c" * 63 + "." +
+         "d" * 63 + "." + "e" * 63 + ".com"),
+        ("IDN that fails idna", "exämple..com")]:
+    try:
+        dm.encode_query(bad, dm.TYPE_A)
+        check(f"invalid: {label} raises ValueError", False, "no exception")
+    except ValueError:
+        check(f"invalid: {label} raises ValueError", True)
+    except Exception as exc:
+        check(f"invalid: {label} raises ValueError", False, repr(exc))
+
+# round trip: hand-built response where the CNAME appears AFTER its A record
+# (order-independent chain, then extract_ips) — plus qname filter drops
+# unrelated A records
+resp = (b"\xab\xcd\x81\x80\x00\x01\x00\x03\x00\x00\x00\x00"
+        b"\x07example\x03com\x00\x00\x01\x00\x01"
+        # answer 1: unrelated A (web.test) — must be DROPPED
+        b"\x03web\x04test\x00\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04\x09\x09\x09\x09"
+        # answer 2: A for example.com (appears BEFORE the CNAME)
+        b"\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04\x01\x02\x03\x04"
+        # answer 3: CNAME example.com -> alias.test (AFTER its A record)
+        b"\xc0\x0c\x00\x05\x00\x01\x00\x00\x00\x3c\x00\x08"
+        b"\x05alias\x04test\x00")
+rcode, answers = dm.parse_response(resp, qname="example.com")
+check("round trip: rcode 0, 2 owned records",
+      rcode == 0 and len(answers) == 2, str((rcode, answers)))
+check("round trip: CNAME after its A record is followed",
+      dm._norm_name(answers[1][3]) == "alias.test" and
+      answers[0][3] == "1.2.3.4", str(answers))
+check("round trip: unrelated A record dropped by the qname filter",
+      "9.9.9.9" not in str(answers))
+check("round trip: extract_ips returns only A values",
+      dm.extract_ips(answers, dm.TYPE_A) == ["1.2.3.4"],
+      str(dm.extract_ips(answers, dm.TYPE_A)))
+
 print()
 print(f"Summary: {sum(1 for _, c in RESULTS if c)}/{len(RESULTS)} passed")
 sys.exit(0 if all(c for _, c in RESULTS) else 1)

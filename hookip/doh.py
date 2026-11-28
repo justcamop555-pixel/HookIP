@@ -122,8 +122,19 @@ class _DoHConn:
         # push HookIP down the plaintext fallbacks. Certificates without
         # an IP SAN fail here; _new_conn retries with the hostname.
         sni = ip if validate_by_ip else host
-        self.ssl = ctx.wrap_bio(self._bio_in, self._bio_out, server_hostname=sni)
-        self._handshake(chunk)
+        # everything after create_connection is wrapped: a wrap_bio/handshake
+        # failure used to leave the raw socket open (leaked FDs, one per bad
+        # cert until the pool burned out)
+        try:
+            self.ssl = ctx.wrap_bio(self._bio_in, self._bio_out,
+                                    server_hostname=sni)
+            self._handshake(chunk)
+        except BaseException:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+            raise
         self.keepalive = keepalive
         self.alive = True
         self.used = time.time()
@@ -399,17 +410,25 @@ class Resolver:
                     else:
                         stale.append(c)
                 self._pool[name] = conns
-                # reservation check AND increment in ONE lock section —
-                # split sections let N threads all pass the same check
-                if len(conns) + self._pending.get(name, 0) < self._pool_max:
-                    self._pending[name] = self._pending.get(name, 0) + 1
-                    reserved = True
             for c in stale:
                 c.close()
+            # check out an IDLE connection FIRST. The old order (reserve,
+            # then look for an idle conn) leaked the reservation forever
+            # when an idle conn was returned: on pool-max>1 tiers that
+            # shrank the pool until len(conns)+pending >= max with an EMPTY
+            # pool, and the wait branch then spun on sleep(0.01) forever.
             for conn in conns:
                 if conn._reqlock.acquire(blocking=False):
                     conn.used = time.time()   # refresh at checkout
                     return conn
+            # no idle conn: NOW reserve a creation slot. Check + increment
+            # in ONE lock section — split sections let N threads all pass
+            # the same check.
+            with self._pool_lock:
+                if len(self._pool.get(name, [])) + \
+                        self._pending.get(name, 0) < self._pool_max:
+                    self._pending[name] = self._pending.get(name, 0) + 1
+                    reserved = True
             # CONFLICT FIX: connection setup (TCP+TLS, up to ~3.5 s) must NOT
             # happen while holding _pool_lock — every other resolver's checkout
             # would stall behind it. Create outside, register after (the
@@ -702,7 +721,15 @@ class Resolver:
         # applies to the plaintext fallbacks only. LAN-plausible names
         # (single-label, .local/.lan style, excluded domains) keep their
         # private answers.
-        if (source not in ("doh", None) and self.cfg.doh_enabled
+        # SPLIT-HORIZON FIX: the guard applies ONLY when DoH produced NO
+        # verdict at all (doh_note None AND no DoH-driven verified
+        # negative) — i.e. DoH was genuinely unreachable. When DoH itself
+        # answered NXDOMAIN/NODATA, a corporate split-horizon name that
+        # exists only on the company resolver (answering 10.x over
+        # plaintext) must be ACCEPTED, not refused as 'poisoning'.
+        doh_answered = doh_note is not None or verified_neg is not None
+        if (self.cfg.doh_enabled and not doh_answered
+                and source not in ("doh", None)
                 and ips and _public_hostname(host, getattr(self.cfg, "excluded", ()) or ())):
             priv = [ip for ip in ips if _is_private_ip(ip)]
             if priv and len(priv) == len(ips):
@@ -1072,6 +1099,15 @@ class Resolver:
             self._cb_note(name, ok=False)     # transport failure → breaker
             self.log.debug(f"DoH {name} failed: {exc}")
             return ("err", f"{name}: {exc}", None)
+        except Exception as exc:  # noqa: BLE001 — an unexpected exception
+            # used to kill the worker thread and the attempt became 'no
+            # result'; counting it toward the breaker keeps the resolver
+            # from being retried forever while it is broken
+            self._note_latency(name, time.time() - t0, ok=False)
+            self._cb_note(name, ok=False)
+            self.log.debug(f"DoH {name} failed: "
+                           f"{type(exc).__name__}: {exc}")
+            return ("err", f"{name}: {type(exc).__name__}: {exc}", None)
         finally:
             if conn is not None:
                 self._release_doh(conn)

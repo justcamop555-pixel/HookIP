@@ -116,14 +116,25 @@ class Log:
         with self._lock:
             if self._file:
                 try:
+                    # always flush on close — the time-based flush policy
+                    # can leave a last info burst in the OS buffer, and a
+                    # session that ends there would lose it on disk
+                    self._file.flush()
+                except Exception:
+                    pass
+                try:
                     self._file.close()
                 except OSError:
                     pass
                 self._file = None
 
     @staticmethod
-    def prune_session_files(log_dir, keep=7):
-        """Delete old session logs, newest `keep` are kept."""
+    def prune_session_files(log_dir, keep=60):
+        """Delete old session logs, newest `keep` are kept.
+
+        This is a hard SAFETY cap (a runaway count of session files), not
+        the privacy control — that is retention by age
+        (purge_old_logs / Config.log_retention_days)."""
         try:
             files = [p for pat in ("hookip_*.log", "hookip_*.hlog")
                      for p in glob.glob(os.path.join(log_dir, pat))]

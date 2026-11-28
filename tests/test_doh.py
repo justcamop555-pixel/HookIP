@@ -945,7 +945,7 @@ def test_private_ip_poisoning_guard():
         return r
 
     # plaintext TCP answers a public domain with a private IP -> refused
-    r = chain(([], 120, "error: doh down"), (["10.0.0.5"], 60))
+    r = chain(([], 120, None), (["10.0.0.5"], 60))
     try:
         r.resolve("rebind.host.name")
         check("private-range plaintext answer refused", False, "no raise")
@@ -960,29 +960,53 @@ def test_private_ip_poisoning_guard():
     check("DoH answers are NOT private-filtered", ips == ["10.0.0.5"], str(ips))
 
     # a .local name through plaintext keeps its private answer
-    r3 = chain(([], 120, "error: doh down"), (["192.168.1.10"], 60))
+    r3 = chain(([], 120, None), (["192.168.1.10"], 60))
     ips = r3.resolve("printer.local")
     check(".local hostname keeps private answer", ips == ["192.168.1.10"], str(ips))
 
     # a user-excluded domain keeps private answers
-    r4 = chain(([], 120, "error: doh down"), (["192.168.1.20"], 60))
+    r4 = chain(([], 120, None), (["192.168.1.20"], 60))
     r4.cfg.excluded = ["nas.home.internal"]
     ips = r4.resolve("nas.home.internal")
     check("excluded domain keeps private answer", ips == ["192.168.1.20"], str(ips))
 
     # mixed public+private plaintext answer: public kept, private dropped
-    r5 = chain(([], 120, "error: doh down"), (["93.184.216.34", "192.168.0.1"], 60))
+    r5 = chain(([], 120, None), (["93.184.216.34", "192.168.0.1"], 60))
     ips = r5.resolve("mixed.host.name")
     check("mixed answer keeps only the public address",
           ips == ["93.184.216.34"], str(ips))
 
     # IPv4-mapped IPv6 private form is caught too
-    r6 = chain(([], 120, "error: doh down"), (["::ffff:10.0.0.9"], 60))
+    r6 = chain(([], 120, None), (["::ffff:10.0.0.9"], 60))
     try:
         r6.resolve("mapped.host.name")
         check("v4-mapped v6 private form refused", False, "no raise")
     except ResolveError as exc:
         check("v4-mapped v6 private form refused", "private-range" in str(exc))
+
+    # SPLIT-HORIZON: DoH ANSWERED (NXDOMAIN verdict) — the company name
+    # exists only on the corporate resolver, whose plaintext answer (10.x)
+    # must be ACCEPTED, not dropped as poisoning
+    r7 = chain(([], 120, "NXDOMAIN (unconfirmed, single resolver)"),
+               (["10.7.0.5"], 60))
+    ips = r7.resolve("wiki.corp.internal")
+    check("split horizon: private answer accepted when DoH said NXDOMAIN",
+          ips == ["10.7.0.5"], str(ips))
+    # same for a DoH NODATA verdict
+    r8 = chain(([], 120, "no A records (NODATA, verified via DoH Google)"),
+               (["10.7.0.6"], 60))
+    ips = r8.resolve("wiki.corp.internal")
+    check("split horizon: private answer accepted when DoH said NODATA",
+          ips == ["10.7.0.6"], str(ips))
+    # but when DoH produced NO verdict (note None = unreachable), the
+    # guard still applies
+    r9 = chain(([], 120, None), (["10.9.0.9"], 60))
+    try:
+        r9.resolve("rebind2.host.name")
+        check("guard still applies when DoH was unreachable", False, "no raise")
+    except ResolveError as exc:
+        check("guard still applies when DoH was unreachable",
+              "private-range" in str(exc))
 
     check("_is_private_ip sanity",
           dohmod._is_private_ip("10.1.2.3") and dohmod._is_private_ip("100.64.0.1")
@@ -1039,6 +1063,167 @@ check("is_sinkhole uses module-level socket (hoisted)",
       dohmod.is_sinkhole("0.0.0.0") and dohmod.is_sinkhole("::")
       and not dohmod.is_sinkhole("1.2.3.4"))
 
+# ---- pool reservation leak fix + related -----------------------------
+def test_pool_reservation_no_leak():
+    """24 threads / pool max 2: never more than 2 connections, and the
+    reservation counter drains to 0 afterwards. With an IDLE conn in the
+    pool, checking it out must NOT leak a reservation (pool max 4)."""
+    r = make_resolver(pool_max=2)
+    gate = threading.Event()
+
+    class SlowConn(FakeConn):
+        def __init__(self, *a, **kw):
+            gate.wait(5)
+            super().__init__(*a, **kw)
+
+    served = []
+    errs = []
+
+    def worker():
+        try:
+            c = r._doh_session("Cloudflare", "h", "1.1.1.1")
+            served.append(1)
+            r._release_doh(c)
+        except Exception as e:  # noqa: BLE001
+            errs.append(e)
+
+    with mock.patch.object(dohmod, "_DoHConn", SlowConn):
+        ths = [threading.Thread(target=worker, daemon=True) for _ in range(24)]
+        for t in ths:
+            t.start()
+        gate.set()
+        for t in ths:
+            t.join(20)
+    check("24 threads / pool 2: no errors", not errs, str(errs[:2]))
+    with r._pool_lock:
+        n_pool = len(r._pool.get("Cloudflare", []))
+    check("24 threads / pool 2: never more than 2 connections",
+          n_pool <= 2 and FakeConn.created_per_name.get("h", 0) <= 2,
+          f"pool={n_pool} created={FakeConn.created_per_name.get('h', 0)}")
+    with r._pool_lock:
+        pending_left = r._pending.get("Cloudflare", 0)
+    check("24 threads / pool 2: _pending returns to 0", pending_left == 0,
+          str(pending_left))
+
+    # an idle connection in the pool: checking it out must not leave a
+    # reservation behind (the old order reserved FIRST and leaked it)
+    r2 = make_resolver(pool_max=4)
+    idle = FakeConn("1.1.1.1", "h2")
+    r2._pool["Cloudflare"] = [idle]
+    c = r2._doh_session("Cloudflare", "h2", "1.1.1.1")
+    with r2._pool_lock:
+        pending_left = r2._pending.get("Cloudflare", 0)
+    check("idle checkout leaves no reservation (pool max 4)",
+          pending_left == 0 and c is idle, f"pending={pending_left}")
+    r2._release_doh(c)
+
+
+def test_pending_full_waits_without_cpu_spin():
+    """Every slot reserved-but-not-yet-registered: the wait branch sleeps
+    (no 100%% CPU spin on continue)."""
+    r = make_resolver(pool_max=1)
+    r._pending["Cloudflare"] = 1          # the one slot is being created
+    sleeps = []
+
+    def counting_sleep(s):
+        sleeps.append(s)
+        # release the pending slot after the first sleep so the loop can
+        # finish instead of hanging
+        with r._pool_lock:
+            r._pending["Cloudflare"] = 0
+
+    with mock.patch.object(dohmod.time, "sleep", counting_sleep):
+        try:
+            r._doh_session("Cloudflare", "h", "1.1.1.1")
+        except Exception:  # noqa: BLE001 — creation will fail with 0 pending
+            pass            # and _new_conn hits _DoHConn; that is fine here
+    check("pool full of pending reservations WAITS (sleeps, no hot spin)",
+          len(sleeps) >= 1 and all(s <= 0.05 for s in sleeps), str(sleeps[:3]))
+
+
+def test_doh_attempt_unexpected_exception():
+    """_doh_attempt catches EVERYTHING: dnsmsg.parse_response raising
+    TypeError becomes an ('err', ...) tuple, not a dead worker."""
+    r = make_resolver(pool_max=2)
+
+    class BoomDns:
+        TYPE_A = 1
+        TYPE_AAAA = 28
+
+        @staticmethod
+        def encode_query(h, q):
+            return b"Q"
+
+        @staticmethod
+        def parse_response(resp, qname=None):
+            raise TypeError("unexpected int internal")
+
+        @staticmethod
+        def extract_ips(answers, q):
+            return []
+
+    r._via_tcp_dns = lambda *a, **k: ([], 0)
+    r._via_udp_dns = lambda *a, **k: ([], 0)
+    r._via_system = lambda *a, **k: ([], 0)
+    def fake_session(name, dns_host, ip):
+        c = FakeConn("1.1.1.1", name)
+        c.default = b"RESP"       # non-empty so parse_response is reached
+        c._reqlock.acquire()      # a real session returns a CHECKED-OUT conn
+        return c
+
+    r._doh_session = fake_session
+    with mock.patch.object(dohmod, "dnsmsg", BoomDns):
+        res = r._doh_attempt("Cloudflare", "dns.host", "1.1.1.1",
+                             "x.host.name", 1, b"Q")
+    check("unexpected parse exception -> ('err', ...) tuple",
+          res[0] == "err" and "TypeError" in res[1], str(res))
+    check("unexpected exception still counts toward the breaker",
+          r._cb_fail.get("Cloudflare", 0) == 1, str(r._cb_fail))
+
+
+def test_dohconn_handshake_failure_closes_socket():
+    """A handshake failure after create_connection must close the socket
+    (the old code leaked one FD per bad cert)."""
+    closed = []
+
+    class FakeSock:
+        def setsockopt(self, *a):
+            pass
+
+        def settimeout(self, t):
+            pass
+
+        def recv(self, n):
+            return b""
+
+        def sendall(self, data):
+            pass
+
+        def close(self):
+            closed.append(1)
+
+    class BoomSsl:
+        def do_handshake(self):
+            raise RuntimeError("cert without IP SAN")
+
+    class FakeCtx:
+        def wrap_bio(self, inn, out, server_hostname=None):
+            return BoomSsl()
+
+    with mock.patch.object(dohmod.socket, "create_connection",
+                           lambda addr, timeout=None: FakeSock()), \
+         mock.patch.object(dohmod, "_ssl_context", lambda: FakeCtx()):
+        raised = None
+        try:
+            dohmod._DoHConn("1.1.1.1", "dns.host", chunk=2)
+        except Exception as exc:  # noqa: BLE001
+            raised = exc
+    check("handshake failure propagates",
+          isinstance(raised, RuntimeError), repr(raised))
+    check("handshake failure closes the socket", len(closed) == 1,
+          str(closed))
+
+
 if __name__ == "__main__":
 
     test_pool_max()
@@ -1064,6 +1249,10 @@ if __name__ == "__main__":
     test_circuit_breaker()
     test_serve_stale_on_doh_outage()
     test_sni_less_preferred_in_rotation()
+    test_pool_reservation_no_leak()
+    test_pending_full_waits_without_cpu_spin()
+    test_doh_attempt_unexpected_exception()
+    test_dohconn_handshake_failure_closes_socket()
 
     print()
     print(f"Summary: {sum(1 for _, c in RESULTS if c)}/{len(RESULTS)} passed")

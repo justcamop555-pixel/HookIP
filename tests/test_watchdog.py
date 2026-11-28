@@ -2,7 +2,9 @@
 Registry-touching paths are mocked; the parent/child spawn cycle uses a
 FAKE backup that the real watchdog never gets to apply (we stop it via
 the event before anything else). Run: python tests/test_watchdog.py"""
+import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -108,7 +110,7 @@ def test_self_check_rebuilds_backup():
          mock.patch.object(wd._k32, "OpenEventW",
                            lambda access, inh, name: None), \
          mock.patch.object(wd, "_restore_and_notify",
-                           lambda p, m, pid=0, reason=None:
+                           lambda p, m, pid=0, reason=None, mem_vals=None:
                            restored.append(1) or True), \
          mock.patch.object(wd, "SELF_CHECK_MS", 300):
         result = {}
@@ -237,7 +239,7 @@ def test_heartbeat_wedge_detection():
          mock.patch.object(wd, "HEARTBEAT_TIMEOUT_MS", 300), \
          mock.patch.object(wd, "HEARTBEAT_GRACE_MS", 200), \
          mock.patch.object(wd, "_restore_and_notify",
-                           lambda p, m, pid=0, reason=None:
+                           lambda p, m, pid=0, reason=None, mem_vals=None:
                            restored.append(reason) or True):
         th = threading.Thread(
             target=wd.main, args=(path, str(os.getpid()), "HookIP_Stop_x",
@@ -273,7 +275,7 @@ def test_heartbeat_alive_keeps_watching():
          mock.patch.object(wd, "HEARTBEAT_TIMEOUT_MS", 400), \
          mock.patch.object(wd, "HEARTBEAT_GRACE_MS", 200), \
          mock.patch.object(wd, "_restore_and_notify",
-                           lambda p, m, pid=0, reason=None:
+                           lambda p, m, pid=0, reason=None, mem_vals=None:
                            restored.append(reason) or True):
         th = threading.Thread(
             target=wd.main, args=(path, str(os.getpid()), "HookIP_Stop_x",
@@ -350,6 +352,74 @@ def test_twin_children():
 
 
 test_do_restore_memory_fallback()
+# ---- 8. mem_vals: decrypt at STARTUP, restore without the key later -----
+d = tempfile.mkdtemp()
+try:
+    # (a) encrypted backup parses at startup (decrypt works NOW); later
+    #     restore_from_file keeps failing, but _write(mem_vals) succeeds
+    from hookip import dataguard as _dg2
+    real_vals = {"ProxyEnable": 0, "ProxyServer": None,
+                 "ProxyOverride": None, "AutoConfigURL": None}
+    enc_text = _dg2.encrypt_bytes(json.dumps(real_vals).encode("utf-8"))
+    check("_parse_backup: encrypted backup -> dict (at startup)",
+          wd._parse_backup(enc_text) == real_vals)
+    check("_parse_backup: '_hookip' key stripped",
+          wd._parse_backup(json.dumps(
+              {**real_vals, "_hookip": {"port": 1, "token": "t"}}))
+          == real_vals)
+    check("_parse_backup: legacy plaintext parses",
+          wd._parse_backup('{"ProxyEnable": 0}') == {"ProxyEnable": 0})
+    check("_parse_backup: corrupt/foreign text -> None",
+          wd._parse_backup("HKCFG1:zzz") is None and
+          wd._parse_backup("{not json") is None)
+
+    writes = []
+    with mock.patch.object(wd, "restore_from_file", lambda p: False), \
+         mock.patch.object(wd, "_write_proxy",
+                           lambda v: writes.append(dict(v)) or True):
+        ok = wd._do_restore(os.path.join(d, "no.json"), None, mem_vals=real_vals)
+    check("restore succeeds from mem_vals when the file path keeps failing",
+          ok is True and writes == [real_vals], str((ok, writes)))
+
+    # (b) mem_vals write raising OSError: falls through, RunOnce registered
+    runonce = []
+    with mock.patch.object(wd, "restore_from_file", lambda p: False), \
+         mock.patch.object(wd, "_write_proxy",
+                           lambda v: (_ for _ in ()).throw(OSError("key gone"))), \
+         mock.patch.object(wd, "set_runonce", lambda: runonce.append(1)), \
+         mock.patch.object(wd.notify, "notify", lambda *a, **k: None):
+        ok = wd._restore_and_notify(d, enc_text, parent_pid=0, mem_vals=real_vals)
+    check("all paths failing still returns False + RunOnce",
+          ok is False and len(runonce) == 1, str((ok, runonce)))
+finally:
+    shutil.rmtree(d, ignore_errors=True)
+
+# ---- 9. crash markers: 'unresponsive' writes NO last_crash.txt ----------
+d = tempfile.mkdtemp()
+try:
+    logs_dir = os.path.join(d, "logs")
+    os.makedirs(logs_dir)
+    hlog = os.path.join(logs_dir, "hookip_20250101_000000.hlog")
+    open(hlog, "w", encoding="utf-8").write("")
+    # _log_marker takes the BACKUP FILE path (app dir = its dirname)
+    fake_backup = os.path.join(d, "proxy_backup.json")
+    wd._log_marker(fake_backup, "unresponsive")
+    check("unresponsive: NO last_crash.txt (app may still be alive)",
+          not os.path.isfile(os.path.join(d, "last_crash.txt")))
+    wd._log_marker(fake_backup, "crash")
+    check("crash: last_crash.txt written (encrypted)",
+          os.path.isfile(os.path.join(d, "last_crash.txt")) and
+          open(os.path.join(d, "last_crash.txt"), encoding="utf-8")
+          .read().startswith("HKCFG1:"))
+    wd._log_marker(fake_backup, None)
+    check("plain stop: last_crash.txt written too",
+          os.path.isfile(os.path.join(d, "last_crash.txt")))
+    check(".hlog WARN line appended in all cases",
+          len(open(hlog, encoding="utf-8").read().splitlines()) == 3)
+finally:
+    shutil.rmtree(d, ignore_errors=True)
+
+
 test_restore_and_notify_failure()
 test_self_check_rebuilds_backup()
 test_parent_child_cycle()

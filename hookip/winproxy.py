@@ -182,12 +182,31 @@ def describe(vals, pac_token=""):
 
 
 # ----------------------------------------------------------------------
-def backup():
+class BackupError(OSError):
+    """The encrypted proxy backup could not be written (DPAPI failure,
+    disk error). Raised by backup() so apply_manual/apply_pac/apply_both
+    abort BEFORE any registry write — without a backup, Stop's fallback
+    remove_proxy() would erase the user's original (possibly corporate)
+    proxy configuration with no way back."""
+
+
+def backup(port=None, token=""):
+    """Snapshot the CURRENT system proxy into the encrypted backup.
+
+    port/token identify the HookIP session this backup belongs to (stored
+    inside the encrypted JSON under "_hookip"; legacy backups without it
+    keep working). Raises BackupError when the backup itself cannot be
+    written — callers (apply_*) must abort with nothing changed. It still
+    succeeds SILENTLY when it deliberately skips: the registry already
+    holds this very session's state (an exact _is_ours match), so there
+    is nothing new to save."""
     cur = read_current()
     # Never overwrite the saved original with HookIP's own proxy state —
     # that would happen if a second instance (or a restart) backed up while
-    # the first instance's proxy was already active.
-    if has_backup() and _is_ours(cur):
+    # the first instance's proxy was already active. EXACT match on this
+    # session's port/token: the old heuristic also swallowed a local
+    # Clash/Fiddler on 127.0.0.1:<other port>.
+    if has_backup() and _is_ours(cur, port, token):
         return
     os.makedirs(_app_dir(), exist_ok=True)
     # ENCRYPTED at rest (HKCFG1): the backup holds the user's ORIGINAL
@@ -201,20 +220,78 @@ def backup():
     # backup means losing the user's original proxy config
     tmp = None
     try:
-        blob = dataguard.encrypt_bytes(json.dumps(cur).encode("utf-8"))
+        payload = dict(cur)
+        payload["_hookip"] = {"port": port, "token": token}
+        blob = dataguard.encrypt_bytes(json.dumps(payload).encode("utf-8"))
         tmp = BACKUP_PATH + f".{threading.get_ident()}.tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
             fh.write(blob)
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp, BACKUP_PATH)
-    except OSError:
+    except OSError as exc:
         try:
             if tmp and os.path.exists(tmp):
                 os.remove(tmp)
         except OSError:
             pass
+        # NOT silent: apply_* must not overwrite the proxy settings with
+        # no backup on disk
+        raise BackupError(f"could not write the proxy backup: {exc}") from exc
     _write_restore_cmd(cur)
+
+
+def _parse_backup_text(raw):
+    """Backup text -> dict or None (HKCFG1-encrypted or legacy plaintext).
+    Shared by restore_from_file / backup_meta / the watchdog child."""
+    if not isinstance(raw, str):
+        return None
+    vals = None
+    if raw.startswith("HKCFG1:"):
+        from . import dataguard
+        plain = dataguard.decrypt_bytes(raw)
+        if plain is not None:
+            try:
+                vals = json.loads(plain.decode("utf-8"))
+            except ValueError:
+                vals = None
+    else:
+        try:
+            vals = json.loads(raw)   # legacy plaintext backup
+        except ValueError:
+            vals = None
+    return vals if isinstance(vals, dict) else None
+
+
+def backup_meta():
+    """(port, token) of the session that WROTE the current backup, or
+    (None, ""). Decrypts the backup; never raises."""
+    try:
+        with open(BACKUP_PATH, "r", encoding="utf-8") as fh:
+            raw = fh.read()
+    except OSError:
+        return (None, "")
+    vals = _parse_backup_text(raw)
+    meta = vals.get("_hookip") if isinstance(vals, dict) else None
+    if isinstance(meta, dict):
+        port = meta.get("port")
+        token = meta.get("token")
+        if isinstance(port, int) and not isinstance(port, bool) and \
+                1 <= port <= 65535:
+            return (port, str(token or ""))
+    return (None, "")
+
+
+def is_stale_hookip(vals, port, token):
+    """Does this registry state belong to HOOKIP — the current session OR
+    the session that wrote the backup?
+
+    After a crash with 'Remember settings' off, the new session's
+    port/PAC token differ from the crashed one, so an exact
+    _is_ours(cur, port, token) missed the stale entry — and the caller
+    then discarded the only backup. Matching EITHER session fixes that;
+    an unrelated third-party proxy still returns False."""
+    return _is_ours(vals, port, token) or _is_ours(vals, *backup_meta())
 
 
 def has_backup():
@@ -242,7 +319,10 @@ def discard_backup(path=None):
         return False
 
 
-def restore_from_file(path=BACKUP_PATH):
+def restore_from_file(path=None):
+    if path is None:
+        path = BACKUP_PATH    # bound at CALL time: a def-time default
+                              # would freeze the module constant forever
     try:
         with open(path, "r", encoding="utf-8") as fh:
             raw = fh.read()
@@ -251,20 +331,7 @@ def restore_from_file(path=BACKUP_PATH):
     # current format: encrypted (HKCFG1). A legacy plaintext backup is
     # honored once (restore is best-effort and the file is removed
     # afterwards either way) — fail-closed on unreadable ours-format blobs
-    vals = None
-    if raw.startswith("HKCFG1:"):
-        from . import dataguard
-        plain = dataguard.decrypt_bytes(raw)
-        if plain is not None:
-            try:
-                vals = json.loads(plain.decode("utf-8"))
-            except ValueError:
-                vals = None
-    else:
-        try:
-            vals = json.loads(raw)   # legacy plaintext backup
-        except ValueError:
-            vals = None
+    vals = _parse_backup_text(raw)
     if not isinstance(vals, dict):
         return False
     _write(vals)
@@ -306,7 +373,7 @@ def _dedupe_override(override, extra):
 
 
 def apply_manual(port, bypass=None):
-    backup()
+    backup(port)
     override = LOCAL_PROXY_OVERRIDE
     extra = bypass_patterns(bypass)
     if extra:
@@ -321,7 +388,7 @@ def apply_manual(port, bypass=None):
 
 
 def apply_pac(port, token):
-    backup()
+    backup(port, token)
     vals = {
         "ProxyEnable": 0,
         "ProxyServer": None,
@@ -336,7 +403,7 @@ def apply_both(port, token, bypass=None):
     mechanism now goes through HookIP. Both point at the same local
     listener, so there is no conflict — this simply widens coverage to
     apps that ignore one of the two settings."""
-    backup()
+    backup(port, token)
     override = LOCAL_PROXY_OVERRIDE
     extra = bypass_patterns(bypass)
     if extra:
@@ -405,8 +472,9 @@ def detect_network_proxy(vals, pac=True):
             import urllib.request
             req = urllib.request.Request(acu, headers={"User-Agent": "HookIP"})
             with urllib.request.urlopen(req, timeout=4) as r:
-                pac = r.read(65536).decode("latin1", "replace")
-            for cand in re.findall(r"PROXY\s+([^;\s]+:\d+)", pac, re.IGNORECASE):
+                pac_text = r.read(65536).decode("latin1", "replace")
+            for cand in re.findall(r"PROXY\s+([^;\s]+:\d+)", pac_text,
+                                   re.IGNORECASE):
                 cand = _clean_upstream(cand)
                 if cand and _lan_address(cand):
                     return cand
@@ -566,7 +634,7 @@ class Watchdog:
 
     def __init__(self):
         self._event = None
-        self._beat = None
+        self._beat = []      # one auto-reset beat event per child
         self._beat_stop = None
         self._beat_thread = None
         self._procs = []
@@ -581,10 +649,16 @@ class Watchdog:
             return None
 
     def _beat_loop(self):
-        # SetEvent every 2 s while the watchdog owns a beat event: the
-        # children treat silence as 'app not responding'
-        while self._beat and self._beat_stop and not self._beat_stop.wait(2.0):
-            _k32.SetEvent(self._beat)
+        # SetEvent every 2 s while the watchdog owns beat events: the
+        # children treat silence as 'app not responding'. ONE auto-reset
+        # event wakes only ONE waiter per SetEvent — with two children on
+        # a single event, one child could starve past 25 s + 15 s grace
+        # and restore the proxy under a LIVE app. Each child now waits on
+        # its OWN event and every tick signals both.
+        beats = self._beat
+        while beats and self._beat_stop and not self._beat_stop.wait(2.0):
+            for h in beats:
+                _k32.SetEvent(h)
 
     def start(self, port):
         self.stop()
@@ -601,29 +675,43 @@ class Watchdog:
         self._event = _k32.CreateEventW(None, True, False, self.event_name)
         if self._event:
             _k32.ResetEvent(self._event)
-        self._beat = _k32.CreateEventW(None, False, False, self.beat_name)  # auto-reset
+        # ONE auto-reset beat event per child: a SetEvent wakes exactly one
+        # waiter, so with a shared event one twin could starve. Child i
+        # waits on "<beat_name>_<i>"; _beat_loop signals both every tick.
+        # self.beat_name stays the prefix (diagnostics name it in logs).
+        self._beat = []
+        beat_names = []
+        for i in range(2):
+            name = f"{self.beat_name}_{i}"
+            h = _k32.CreateEventW(None, False, False, name)   # auto-reset
+            if h:
+                self._beat.append(h)
+                beat_names.append(name)
         backup, ppid = BACKUP_PATH, str(pid)
-        extra = [self.beat_name] if self._beat else []
         if getattr(sys, "frozen", False):
             # packaged exe: the exe itself understands --hookip-watchdog
-            args = [sys.executable, WATCHDOG_FLAG, backup, ppid, self.event_name] + extra
+            base_args = [sys.executable, WATCHDOG_FLAG, backup, ppid, self.event_name]
             env = None
         else:
             pkg_parent = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             launcher = os.path.join(pkg_parent, "run_hookip.py")
             if os.path.isfile(launcher):
-                args = [sys.executable, launcher, WATCHDOG_FLAG, backup, ppid,
-                        self.event_name] + extra
+                base_args = [sys.executable, launcher, WATCHDOG_FLAG, backup, ppid,
+                             self.event_name]
                 env = None
             else:
-                args = [sys.executable, "-c",
-                        "import sys; from hookip.watchdog import main; main(*sys.argv[1:])",
-                        backup, ppid, self.event_name] + extra
+                base_args = [sys.executable, "-c",
+                             "import sys; from hookip.watchdog import main; main(*sys.argv[1:])",
+                             backup, ppid, self.event_name]
                 env = dict(os.environ, PYTHONPATH=pkg_parent)
         flags = 0x08000000  # CREATE_NO_WINDOW
         # TWO children: killing one (Task Manager end-task on the wrong
         # HookIP.exe row, AV heuristic) must not leave the proxy unwatched
-        procs = self._procs = [self._spawn(args, flags, env) for _ in range(2)]
+        procs = []
+        for i in range(2):
+            extra = [beat_names[i]] if i < len(beat_names) else []
+            procs.append(self._spawn(base_args + extra, flags, env))
+        self._procs = procs
         self._beat_stop = threading.Event()
         self._beat_thread = threading.Thread(target=self._beat_loop, daemon=True)
         self._beat_thread.start()
@@ -633,17 +721,22 @@ class Watchdog:
         # OFF THE CALLER'S THREAD: this slept 0.4 s inline, and
         # _refresh_dashboard calls start() on the UI thread — a dead
         # watchdog froze the window ~2 s per re-arm.
-        def _verify(spawn_args, spawn_flags, spawn_env, snapshot):
+        # per-child full command lines (child i waits on its own beat
+        # event, so a respawned child must get THAT child's name back)
+        child_args = [base_args + ([beat_names[i]] if i < len(beat_names) else [])
+                      for i in range(2)]
+
+        def _verify(all_args, spawn_flags, spawn_env, snapshot):
             time.sleep(0.4)
             if self._procs is not snapshot:
                 return          # stop() ran meanwhile — do not respawn
             fresh = [p if (p is not None and p.poll() is None)
-                     else self._spawn(spawn_args, spawn_flags, spawn_env)
-                     for p in snapshot]
+                     else self._spawn(all_args[i], spawn_flags, spawn_env)
+                     for i, p in enumerate(snapshot)]
             if self._procs is snapshot:
                 self._procs = fresh
                 self._proc = next((p for p in fresh if p is not None), None)
-        threading.Thread(target=_verify, args=(args, flags, env, procs),
+        threading.Thread(target=_verify, args=(child_args, flags, env, procs),
                          daemon=True).start()
 
     def stop(self):
@@ -681,9 +774,9 @@ class Watchdog:
             threading.Thread(target=_reap, daemon=True).start()
         self._procs = []
         self._proc = None
-        if self._beat:
-            _k32.CloseHandle(self._beat)
-            self._beat = None
+        for h in getattr(self, "_beat", None) or []:
+            _k32.CloseHandle(h)
+        self._beat = []
 
     def alive(self):
         return any(p is not None and p.poll() is None

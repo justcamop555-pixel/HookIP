@@ -12,8 +12,32 @@ def encode_query(name, qtype=TYPE_A):
     # emit an empty label before the terminator and every resolver
     # would answer FormErr/ignore
     name = name.rstrip(".")
-    name = name.encode("idna") if any(ord(c) > 127 for c in name) else name.encode("ascii")
-    labels = b"".join(bytes([len(p)]) + p for p in name.split(b".")) + b"\x00"
+    # strict validation BEFORE encoding: a malformed name (empty, empty
+    # label, oversized label/name) used to encode into a garbage wire
+    # query that every resolver rejects; the proxy already reports
+    # ValueError from here as a malformed request
+    if not name:
+        raise ValueError("invalid DNS name")
+    if any(ord(c) > 127 for c in name):
+        try:
+            name = name.encode("idna")
+        except UnicodeError as exc:
+            raise ValueError("invalid DNS name") from exc
+    else:
+        try:
+            name = name.encode("ascii")   # raises UnicodeEncodeError (a
+                                          # ValueError) for non-ASCII that
+                                          # slipped past the ord() check
+        except UnicodeError as exc:
+            raise ValueError("invalid DNS name") from exc
+    labels_split = name.split(b".")
+    if any(not p for p in labels_split):
+        raise ValueError("invalid DNS name")      # 'a..b' / '.a' / 'a.'
+    if any(len(p) > 63 for p in labels_split):
+        raise ValueError("invalid DNS name")      # label > 63 bytes
+    if len(name) > 253:
+        raise ValueError("invalid DNS name")      # FQDN exceeds 253
+    labels = b"".join(bytes([len(p)]) + p for p in labels_split) + b"\x00"
     header = struct.pack(">HHHHHH", int.from_bytes(os.urandom(2), "big"), 0x0100, 1, 0, 0, 0)
     return header + labels + struct.pack(">HH", qtype, 1)
 
