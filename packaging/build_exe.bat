@@ -15,6 +15,7 @@ python -m PyInstaller --onefile --windowed --clean ^
   --icon assets\hookip.ico ^
   --version-file packaging\version_info.txt ^
   --add-data "assets\hookip.ico;assets" ^
+  --add-data "assets\hookip_32.png;assets" ^
   --hidden-import hookip ^
   --hidden-import hookip.app ^
   --hidden-import hookip.config ^

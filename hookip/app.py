@@ -1188,8 +1188,19 @@ class App:
         # header ----------------------------------------------------------
         head = tk.Frame(self.root, bg=BG)
         head.pack(fill="x", padx=16, pady=(14, 8))
-        tk.Label(head, text="⚓ HookIP", font=("Segoe UI Semibold", 18),
-                 bg=BG, fg=FG).pack(side="left")
+        # Brand: the real HookIP logo image next to the title. The old
+        # '⚓' text symbol rendered as an empty box (tofu) on font stacks
+        # without the glyph — a bundled PNG cannot fail to exist.
+        self._brand_img = None
+        try:
+            self._brand_img = tk.PhotoImage(
+                file=resource_path(os.path.join("assets", "hookip_32.png")))
+            tk.Label(head, image=self._brand_img, bg=BG).pack(side="left")
+            tk.Label(head, text="HookIP", font=("Segoe UI Semibold", 18),
+                     bg=BG, fg=FG).pack(side="left", padx=(6, 0))
+        except (tk.TclError, OSError):
+            tk.Label(head, text="⚓ HookIP", font=("Segoe UI Semibold", 18),
+                     bg=BG, fg=FG).pack(side="left")   # fallback keeps the old look
         self.status_pill = tk.Label(head, text="● Stopped", font=("Segoe UI Semibold", 11),
                                     bg=BG, fg=MUTED)
         self.status_pill.pack(side="left", padx=16)

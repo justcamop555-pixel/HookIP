@@ -23,7 +23,9 @@ $ErrorActionPreference = "Stop"
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
 $repo = "justcamop555-pixel/HookIP"
 $UA = "HookIP-installer"
-$mirrors = @("https://ghproxy.net/", "https://gh-proxy.com/", "https://ghfast.top/")
+# NO third-party mirrors: the exe, the checksum and the installer itself
+# must all come from GitHub only — a mirror serving a swapped exe would
+# defeat the SHA-256 fail-closed design the app enforces on itself.
 $dest = Join-Path $Destination "HookIP.exe"
 if (-not (Test-Path $Destination)) {
     New-Item -ItemType Directory -Path $Destination -Force | Out-Null
@@ -31,13 +33,13 @@ if (-not (Test-Path $Destination)) {
 
 Write-Host "⚓ Installing HookIP -> $dest" -ForegroundColor Cyan
 
-# downloads with mirror fallback: GitHub first, then same-bytes mirrors
-# (integrity is still enforced by the SHA-256 check below)
+# downloads from GitHub only (github.com asset CDN); integrity is
+# enforced by the SHA-256 check below
 function Get-Asset($url, $out, $minBytes = 1KB) {
     # minBytes must fit the asset: the .sha256 file is ~100 BYTES — the
     # old fixed 1 KB gate deleted a perfectly valid checksum file and
     # silently downgraded verification
-    foreach ($u in @($url) + ($mirrors | ForEach-Object { "$($_)$url" })) {
+    foreach ($u in @($url)) {
         try {
             Invoke-WebRequest -Uri $u -OutFile $out -UseBasicParsing -UserAgent $UA
             if ((Get-Item $out -ErrorAction SilentlyContinue).Length -ge $minBytes) { return $true }
@@ -65,8 +67,8 @@ if (-not $done) {
     } catch {
         $why = $_.Exception.Message
     }
-    # 3) redirect form + mirrors — for users where the API is blocked but
-    #    github.com (or a mirror) still answers
+    # 3) redirect form — for users where the API is blocked but
+    #    github.com still answers
     if (-not $done -and $asset) {
         if (Get-Asset $asset.browser_download_url $dest) { $done = $true }
     }
@@ -78,15 +80,6 @@ if (-not $done) {
         } catch {
             $why = $_.Exception.Message
         }
-        if (-not $done) {
-            foreach ($m in $mirrors) {
-                try {
-                    Invoke-WebRequest -Uri "${m}https://github.com/$repo/releases/latest/download/HookIP.exe" `
-                        -OutFile $dest -UseBasicParsing -UserAgent $UA
-                    if ((Test-Path $dest) -and ((Get-Item $dest).Length -gt 1MB)) { $done = $true; break }
-                } catch { }
-            }
-        }
     }
 }
 if (-not $done) {
@@ -96,7 +89,7 @@ if (-not $done) {
     throw @"
 
 Download failed. ($why)
-Tried: GitHub API, the release-redirect URL, and public mirrors.
+Tried: GitHub API and the release-redirect URL.
 Fix either way:
   * check your internet / proxy (some networks block github.com), or
   * log in the GitHub CLI once:  gh auth login
@@ -106,8 +99,8 @@ Fix either way:
 }
 
 # 4) verify SHA-256 checksum published alongside the exe (supply-chain
-#    safety). Same mirror fallback as the exe: GitHub asset first, then
-#    mirrors, then the sha256 printed in the release notes.
+#    safety). Sources: the GitHub .sha256 asset, then the sha256 printed
+#    in the release notes. No third-party source is ever trusted.
 $hashFile = Join-Path $Destination "HookIP.exe.sha256"
 $expected = $null
 try {

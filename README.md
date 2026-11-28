@@ -1,6 +1,8 @@
 <div align="center">
 
-# ⚓ HookIP
+<img src="assets/hookip_256.png" width="128" alt="HookIP logo">
+
+# HookIP
 
 **A modern, zero-install DPI/SNI bypass for Windows — no admin, no VPN, no drivers, no dependencies.**
 
@@ -8,7 +10,10 @@
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2B-blue?style=flat-square)
 ![Python](https://img.shields.io/badge/python-3.9%2B-blue?style=flat-square&logo=python&logoColor=white)
 ![Portable](https://img.shields.io/badge/portable-no%20install-blue?style=flat-square)
+![Tests](https://img.shields.io/badge/tests-673%20checks-brightgreen?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
+
+<img src="assets/screenshot.png" width="820" alt="HookIP main window — dashboard with live stats, VPN pill and one-click Start">
 
 </div>
 
@@ -34,19 +39,21 @@ no-admin, user-space idea and pushes it much further.
 | | SNIper | HookIP |
 |---|:---:|:---:|
 | ClientHello fragmentation | ✅ | ✅ **3 strategies**: `smart` (splits exactly at the SNI hostname, randomized per connection), `chunk`, `random` |
-| Adaptive retry on DPI kills | ❌ | ✅ detects the kill and **retries with a different strategy automatically** — remembers what worked per host, and gives known-good hosts that *flap* one free extra round |
-| DoH, SNI-less | ✅ (frag. only) | ✅ **4 resolvers**, TLS validated by **IP SAN — no SNI sent at all** (a filter can't block DoH by name), latency-ordered rotating failover |
+| Adaptive retry on DPI kills | ❌ | ✅ remembers every kill per host, **backs off and escalates** (stealthier 2-byte fragments after the first kill), starts *hot* hosts at maximum stealth, and gives a fully-killed host **one second round with the hardest split** before giving up |
+| DoH, SNI-less | ✅ (frag. only) | ✅ **4 resolvers**, TLS validated by **IP SAN — no SNI sent at all** (a filter can't block DoH by name), latency-ordered rotating failover with a circuit breaker |
 | Verified DNS verdicts | ❌ | ✅ NXDOMAIN is a **vote, not a verdict** — one filtering resolver can't kill a domain; plaintext fallbacks need corroboration; CNAME chains followed **order-independently** (reordered/cached answers can't hide the addresses) |
+| VPN-aware | ❌ | ✅ detects Cloudflare WARP (and VPN proxy modes), shows an honest **why** pill — HookIP's fragmentation is redundant *while* a full-tunnel VPN is up, and it says so instead of implying double protection; a **manual upstream proxy field** covers VPN-proxy-mode chaining |
 | DNS cache | ❌ | ✅ **TTL cache + negative caching + in-flight coalescing** (10 parallel browser connections cause one lookup, not ten) |
 | Per-domain exclusions | ❌ | ✅ wildcard list — bypassed in **every** proxy mode (Windows bypass list / PAC `DIRECT`), pasted URLs auto-normalized |
 | Live dashboard | activity log | ✅ **connections, active, data up/down, failed, blocked + live traffic graph + top-domains table** |
 | Activity log | basic | ✅ color-coded, importance filter **+ live 🔍 text find**, horizontal scroll (nothing clipped), **↓ latest** jump when you scroll up, crash records, per-session encrypted file |
 | Diagnostics | ❌ | ✅ **one-click checks**: system/antivirus, every DoH resolver, port availability (**reserved-range detection** — Hyper-V/WSL blocks are named as such), end-to-end tunnel test — with **Copy report** |
-| Proxy modes | manual / PAC | ✅ `manual` + self-served **PAC** + **`both`** (widest app coverage) |
+| Proxy modes | manual / PAC | ✅ `manual` + self-served **PAC** + **`both`** (widest app coverage) + an optional **upstream proxy** (chain through the network's own proxy or a VPN's local proxy) |
 | System tray | ❌ | ✅ X hides to tray and keeps protecting; tray menu shows/restores/exits |
-| Notifications | ❌ | ✅ Windows toasts for start, stop, restore, crash-recovery and updates — **click a toast to bring HookIP up** |
-| Crash safety | ✅ watchdog + RunOnce | ✅ registry backup, **TWO identical watchdog children** (killing one leaves the other), instant event-driven reaction, **heartbeat monitoring** (a frozen-but-alive app is detected ~40 s in), `RunOnce` restore, next-launch self-heal, emergency listener recovery |
-| Self-updating | ❌ | ✅ see **🔄 Updates** below — check, download, **Install now** in one click |
+| Notifications | ❌ | ✅ Windows toasts for start, stop, restore, crash-recovery and updates — click a toast to bring HookIP up; identical repeated toasts are **auto-coalesced** so a flapping network can't spam you |
+| Tooltips everywhere | ❌ | ✅ every control explains itself — including disabled ones ("why can't I click this yet") and the tab headers |
+| Crash safety | ✅ watchdog + RunOnce | ✅ encrypted registry backup, **TWO identical watchdog children** (killing one leaves the other), instant event-driven reaction, **heartbeat monitoring** (a frozen-but-alive app is detected ~40 s in), `RunOnce` restore, next-launch self-heal, emergency listener recovery, **plaintext recovery script fallback** when the encrypted backup can't be read |
+| Self-updating | ❌ | ✅ see **🔄 Updates** below — check, download, install — all in one click |
 | Hardware-aware | ❌ | ✅ a performance profile derived from cores + RAM (connection budgets, DoH pools, cache caps, UI cadence) — a 2-core laptop stays smooth, a desktop gets full throttle |
 | Data protection | ❌ | ✅ logs and settings **DPAPI-encrypted**, per-install key stored in the registry, ACL-hardened data folder — a copied folder yields nothing |
 | Portable, no install | ✅ | ✅ pure stdlib — **zero pip dependencies**, runs on x64 & ARM64 |
@@ -64,19 +71,18 @@ HookIP keeps itself current without any installer daemon:
   a mismatch deletes the file instead of leaving it for someone to run by mistake. If the
   checksum asset can't be fetched, the sha256 printed in the release notes is used; if no
   source can produce one, the download is **refused** (fails closed).
-- **Fetch fallbacks for restrictive networks**: the update check also uses the
-  `github.com → releases/latest` redirect when `api.github.com` is blocked or
-  rate-limited, and downloads fall back to public mirrors of the same bytes — integrity
-  still enforced by the GitHub-published checksum either way.
+- **GitHub only** — update bytes and checksums come from GitHub via your proxy or
+  direct; no third-party mirrors ever touch them.
 - **▶ Install now** — a verified download turns the button into an installer: HookIP
-  closes cleanly (proxy stopped, internet restored, settings saved) and the new version
-  starts ~2 s later. No hunting in Downloads, no "already running" fight.
+  closes cleanly (proxy stopped, internet restored, settings saved), swaps itself in
+  **under the same name in the same folder**, and starts the new version automatically.
+  No hunting in Downloads, no "already running" fight, your shortcuts keep working.
 
 ## 📦 Downloads
 
 | Version | Download | Notes |
 |---|---|---|
-| **v1.2.0** (latest) | [`HookIP.exe`](https://github.com/justcamop555-pixel/HookIP/releases/latest) | portable, ~14 MB, no Python needed |
+| **latest** | [`HookIP.exe`](https://github.com/justcamop555-pixel/HookIP/releases/latest) | portable, ~14 MB, no Python needed |
 
 Every version lives under [**Releases**](https://github.com/justcamop555-pixel/HookIP/releases) —
 each release ships its built `HookIP.exe`, a `HookIP.exe.sha256` checksum, the
@@ -94,9 +100,9 @@ irm https://github.com/justcamop555-pixel/HookIP/releases/latest/download/instal
 
 Downloads the latest `HookIP.exe` to your Desktop and launches it. The installer enforces
 TLS 1.2 (fixes Windows PowerShell 5.1 failures on older builds), prefers the GitHub CLI
-when present, and falls back through the GitHub API → the release-redirect URL → public
-mirrors, so it works on networks where one of those routes is blocked. Every download is
-SHA-256 verified before launch; no login needed (the repo is public).
+when present, and falls back from the GitHub API to the release-redirect URL, so it works
+on networks where one of those routes is blocked. Every download is SHA-256 verified
+before launch; no login needed (the repo is public).
 
 ## 🚀 Usage
 
@@ -107,7 +113,10 @@ automatically (restart Discord-like apps that read the proxy at startup).
 - **X button** hides HookIP to the system tray — the proxy keeps running; the tray icon
   restores the window or exits for real
 - **↺ Restore internet** is the rescue button: it puts Windows back on your previous
-  connection at any time
+  connection at any time (even after a crash, even from a previous session, even when
+  the encrypted backup can't be read — it falls back to the plaintext recovery script)
+- **⛓ VPN pill** appears when a VPN such as Cloudflare WARP is detected, with an honest
+  explanation of what HookIP does and doesn't add while it's up
 - **Exit** always stops the proxy and restores your settings first
 
 > The exe is not code-signed, so SmartScreen may ask about it on first launch —
@@ -124,8 +133,8 @@ python run_hookip.py
 ### Rebuild the exe yourself
 
 Run `packaging\build_exe.bat` — PyInstaller bundles everything into a single portable
-binary. `__build_id__` in `hookip/__init__.py` marks unpublished builds so the updater
-never offers a downgrade for them.
+binary (with the logo as its icon). `__build_id__` in `hookip/__init__.py` marks
+unpublished builds so the updater never offers a downgrade for them.
 
 ### Project layout
 
@@ -134,8 +143,8 @@ HookIP/
 ├── HookIP.exe              ← the runnable build (only on machines that built it)
 ├── run_hookip.py           ← entry point (source)
 ├── hookip/                 ← the application package (proxy, DoH, UI, tray, …)
-├── tests/                  ← 344 self-contained checks — `python tests/run_all.py`
-├── assets/                 ← icon + artwork
+├── tests/                  ← 673 self-contained checks — `python tests/run_all.py`
+├── assets/                 ← logo (.ico + PNG sizes), app screenshot
 ├── packaging/              ← PyInstaller build script + version info
 ├── install.ps1             ← one-line installer (also attached to each release)
 ├── LICENSE                 ← MIT
@@ -147,9 +156,10 @@ HookIP/
 | Setting | Default | What it does |
 |---|:---:|---|
 | Local port | `8890` | Port the proxy listens on — live availability probe beside the field (works while running too: "free — press Stop, then Start to switch"), reserved-range and in-use errors told apart |
-| Fragment size | `2` | Bytes per TCP segment while splitting the ClientHello (1–255; 2 is stealthiest) |
+| Fragment size | `2` | Bytes per TCP segment while splitting the ClientHello (1–255; 2 is stealthiest). After a DPI kill the adaptive retry goes *at least* this small automatically |
 | Strategy | `smart` | `smart` = split at the SNI hostname · `chunk` = uniform pieces · `random` = randomized desync. Failed hosts remember what worked |
 | System proxy mode | `manual` | `pac` serves a PAC file · **`both`** sets manual + PAC together for the widest app coverage |
+| Upstream proxy | *(empty)* | Optional chain target: `host:port` or `http://user:pass@host:port`. For VPN **proxy mode** (e.g. WARP's `127.0.0.1:40000`) or restricted networks that force their own proxy. Leave empty with a full-tunnel VPN |
 | Secure DNS | on | DNS-over-HTTPS with SNI-less fragmented TLS + failover; off = system DNS |
 | Excluded domains | `localhost`, … | Sites that skip HookIP completely, in every mode (banking apps etc.). Accepts wildcards and pasted URLs |
 | Verbose log | off | Debug-level detail in the on-screen log (the log file always keeps it) |
@@ -168,8 +178,9 @@ folder-scanning malware harvests:
   re-encrypted on the next save; old-format log lines are upgraded to the per-install
   key automatically.
 - **The key is per-install** — a random 32-byte secret stored in the registry under
-  `HKCU\Software\HookIP`, never next to the data. Copying the HookIP folder to another
-  machine (or scanning it with strings) yields nothing.
+  `HKCU\Software\HookIP`, never next to the data. First-run creation is serialized by a
+  cross-process mutex so two copies of HookIP can never orphan each other's files.
+  Copying the HookIP folder to another machine (or scanning it with strings) yields nothing.
 - **The data folder is ACL-hardened**: inherited access is stripped so only your account
   and SYSTEM can read `%LOCALAPPDATA%\HookIP` — other (non-admin) accounts get nothing.
 
@@ -188,6 +199,9 @@ else. Status is shown in **Diagnostics → System → Data protection**.
 - **Sites still blocked?** The Diagnostics tab pinpoints it: DNS (resolver failover),
   antivirus HTTPS scanning (see below), or a dead endpoint — the Blocked counter counts
   genuinely dead/blocked domains so they don't look like failures
+- **Filter fighting back?** Adaptive retry escalates on its own: backoff between killed
+  attempts, stealthier fragments after each kill, a hot-start for recently killed hosts,
+  and a second round with the hardest split — all logged in plain language
 - **Flaky site that sometimes works?** A host that tunneled successfully before gets one
   automatic extra round when the endpoint is *flapping* — and the first success after any
   failure clears the single-attempt cap instantly
@@ -199,23 +213,28 @@ else. Status is shown in **Diagnostics → System → Data protection**.
   (event-driven, not polling); killing one watchdog leaves the other.
 - A **heartbeat** runs while the app is alive: a frozen (but not dead) HookIP is detected
   and its restore performed ~40 s later, with an explanatory toast — and the crash is
-  recorded in the next session's log.
+  recorded in the next session's log. An unresponsive-but-recoverable app is *not*
+  reported as crashed.
 - A `RunOnce` entry restores them at next sign-in after a power loss, even if HookIP was deleted.
-- **Stop / exit** restores immediately; the next launch also self-heals leftovers.
+- **Stop / exit** restores immediately; the next launch also self-heals leftovers; the
+  rescue button recognizes stale entries from **previous sessions** (port/token changed
+  after a crash) and clears them.
 - If the proxy listener dies while Windows still points at it, HookIP performs an
   **emergency restore** and tells you what happened.
-- While running, Windows proxy settings show `127.0.0.1:8890` — that is HookIP. Task
+- While running, Windows proxy settings show `127.0.0.1:<port>` — that is HookIP. Task
   Manager may show two extra small `HookIP.exe` (or `python`) rows — those are the watchdogs.
 
 ## 🚧 Limitations
 
 HookIP only defeats SNI-based filtering; it does not encrypt traffic or hide your IP
-(that is a VPN's job). Firefox must be set to *Use system proxy settings*. Antivirus HTTPS
-scanning (ESET, Kaspersky…) can undo the fragmentation — disable its SSL scanning if sites
-stay blocked. QUIC/HTTP-3 can't be fragmented, but browsers fall back to TCP automatically.
-Windows services (Store downloads, Windows Update) bypass the user proxy by design.
-An on-path filter can still block the DoH resolvers **by IP** — HookIP then falls back to
-vote-gated plaintext DNS and the activity log warns you when that happens.
+(that is a VPN's job — and while a full-tunnel VPN like WARP is up, HookIP's core trick
+is redundant, which the app tells you honestly). Firefox must be set to *Use system
+proxy settings*. Antivirus HTTPS scanning (ESET, Kaspersky…) can undo the fragmentation —
+disable its SSL scanning if sites stay blocked. QUIC/HTTP-3 can't be fragmented, but
+browsers fall back to TCP automatically. Windows services (Store downloads, Windows
+Update) bypass the user proxy by design. An on-path filter can still block the DoH
+resolvers **by IP** — HookIP then falls back to vote-gated plaintext DNS and the activity
+log warns you when that happens.
 
 ## 🛡️ Antivirus false positive — resolved
 
