@@ -184,6 +184,116 @@ finally:
 check("beta tag does not beat newer stable",
       not (vt("1.1.9-beta") > vt("1.2.0")))
 
+
+
+# ---- checksum-source fallbacks (the 'No checksum could be obtained' ----
+#      toast root cause) --------------------------------------------------
+import io as _io2
+import urllib.request as _urlreq
+def test_sha_pre_fallback_chain():
+    """_download_worker checksum chain: .sha256 asset -> check-time
+    pre-fetched sha (github.com, API-rate-limit-proof) -> release notes.
+    The middle source is what fixed the repeated 'No checksum could be
+    obtained' refusals when the API was rate-limited."""
+    got_ok = []
+    import hashlib as _hl
+    payload = b'PRE-FETCH-SHA-TEST' * 50
+    sha = _hl.sha256(payload).hexdigest()
+    d = tempfile.mkdtemp()
+    app = make_fake_app()
+    app._update_body = ""              # notes carry no sha either
+    app._downloaded_ok = False
+    app._dl_progress = lambda *a, **k: None
+    app.log = types.SimpleNamespace(
+        debug=lambda *a, **k: None, warn=lambda *a, **k: None,
+        error=lambda *a, **k: None, info=lambda *a, **k: None,
+        ok=lambda *a, **k: got_ok.append(a[0]))
+    app._update_asset_url = ("https://github.com/r/HookIP/releases/download/"
+                             "v9.9.9/HookIP.exe")
+    app._update_sha_url = None         # asset fetch will find nothing
+    app._update_sha_pre = sha          # the NEW middle source
+    app._pending_ver = "v9.9.9"
+    exe = os.path.join(d, 'HookIP.exe')
+
+    def fake_urlopen(req, timeout=None):
+        url = req.full_url if hasattr(req, "full_url") else str(req)
+        if url.endswith(".sha256"):
+            raise OSError("checksum asset unreachable (rate-limited CDN)")
+        return _io2.BytesIO(payload)
+
+    with _mock.patch.object(appmod.sys, "frozen", True, create=True), \
+         _mock.patch.object(appmod.sys, "executable", exe), \
+         _mock.patch.object(_urlreq, "urlopen", fake_urlopen), \
+         _mock.patch.object(_urlreq, "build_opener",
+                            lambda *a, **k: (_ for _ in ()).throw(OSError("x"))):
+        appmod.App._download_worker(app, 'https://github.com/r/HookIP/releases/'
+                                    'download/v9.9.9/HookIP.exe')
+    newexe = os.path.join(d, 'HookIP.exe.new')
+    check("pre-fetched (check-time) checksum verifies the download",
+          os.path.isfile(newexe) and open(newexe, 'rb').read() == payload,
+          "download refused" if not os.path.isfile(newexe) else "ok")
+    # the verify log names the source
+    check("checksum source logged as check-time fetch",
+          any("check-time" in m for m in got_ok), str(got_ok))
+
+
+
+def test_worker_redirect_populates_checksum_sources():
+    """API rate-limited (403) -> the releases/latest redirect still finds
+    the tag AND the tag's .sha256 asset is probed via github.com (not
+    API-rate-limited). The result must carry asset/sha_asset/sha_pre so
+    the download can never hit 'no checksum could be obtained'."""
+    import urllib.error as _uerr
+
+    class _RateLimitError(_uerr.HTTPError):
+        """Mimics the 403 the rate-limited API returns (an HTTPError
+        subclass so _update_worker's except branch catches it)."""
+        def __init__(self, url):
+            # hdrs=None is what the real API 403 looks like; the checker
+            # wants a Message — the fake deliberately passes None
+            hdrs: Any = None   # real API 403 ships no headers; checker wants a Message
+            super().__init__(url, 403, "API rate limit exceeded", hdrs, None)
+
+    sha_line = ("ab" * 32) + "  HookIP.exe" + chr(10)
+
+    def fake_urlopen(req, timeout=None):
+        url = req.full_url if hasattr(req, "full_url") else str(req)
+        if "api.github.com" in url:
+            raise _RateLimitError(url)
+        class R:
+            def __init__(self, u): self._u = u
+            def geturl(self): return self._u
+            def read(self, n=-1): return sha_line.encode()
+            def __enter__(self): return self
+            def __exit__(self, *a): return None
+        if url.endswith("/releases/latest"):
+            return R("https://github.com/justcamop555-pixel/HookIP/"
+                     "releases/tag/v1.2.0")
+        return R(url)
+
+    captured = []
+    app = make_fake_app()
+    app.UPDATE_REPO = appmod.App.UPDATE_REPO
+    app._ui_queue = types.SimpleNamespace(put=lambda item: captured.append(item))
+    with _mock.patch.object(_urlreq, "urlopen", fake_urlopen),          _mock.patch.object(_urlreq, "build_opener",
+                            lambda *a, **k: (_ for _ in ()).throw(OSError("direct blocked"))):
+        appmod.App._update_worker(app)
+    kinds = [k for k, _a in captured]
+    check("worker emitted one update result", kinds == ["update"], str(kinds))
+    (_latest, _url, _off, _asset, _sha_asset, _pre, _body,
+     _herr, sha_pre) = captured[0][1]
+    check("rate-limited check still resolves the tag",
+          _latest == "v1.2.0" and _off is False, f"{_latest} off={_off}")
+    check("tag .sha256 probed via github.com (not API)",
+          sha_pre == "ab" * 32 and _sha_asset and _sha_asset.endswith(
+              "v1.2.0/HookIP.exe.sha256"),
+          f"pre={str(sha_pre)[:12]}… asset={_sha_asset}")
+    check("exe asset derived from the .sha256 asset name",
+          _asset and _asset.endswith("v1.2.0/HookIP.exe"), str(_asset))
+
+
+test_worker_redirect_populates_checksum_sources()
+
 print()
 print(f"Summary: {sum(1 for _, c in RESULTS if c)}/{len(RESULTS)} passed")
 sys.exit(0 if all(c for _, c in RESULTS) else 1)

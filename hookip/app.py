@@ -436,6 +436,9 @@ class App:
 
     # -- update check ----------------------------------------------------
     UPDATE_REPO = "justcamop555-pixel/HookIP"
+    # checksum fetched at CHECK time (see _update_worker.tag_checksum);
+    # None until a check completes
+    _update_sha_pre = None
     # NO third-party mirrors: the update bytes and the checksum both come
     # from GitHub only — a mirror serving a swapped exe would defeat the
     # whole fail-closed design. Unreachable CDN ⇒ download fails visibly,
@@ -588,6 +591,8 @@ class App:
         latest, url, offline, asset, sha_asset, prerelease = (None, None, False,
                                                               None, None, False)
         body = None
+        sha_pre = None           # checksum fetched at CHECK time (github.com,
+                                 # API-rate-limit-proof) — a fallback source
         http_error = None          # HTTP status / 0 for a bad body — never
                                    # an 'offline' verdict (the network was
                                    # reachable enough to answer)
@@ -602,6 +607,25 @@ class App:
                 opener = urllib.request.build_opener(
                     urllib.request.ProxyHandler({}))
                 return opener.open(req, timeout=timeout)
+
+        def tag_checksum(tag):
+            """github.com is NOT API-rate-limited: the tag's .sha256 release
+            asset is a ~70-byte download that works even when the API
+            returns 403. Returns (sha_hex, sha_url, exe_url) or None."""
+            base = f"https://github.com/{self.UPDATE_REPO}/releases/download/{tag}"
+            for sha_name in ("HookIP.exe.sha256", "HookIP_x64.exe.sha256"):
+                try:
+                    req3 = urllib.request.Request(
+                        f"{base}/{sha_name}",
+                        headers={"User-Agent": "HookIP-updater"})
+                    with fetch(req3, timeout=10) as r3:
+                        got = _parse_sha_file(r3.read(512).decode("utf-8", "replace"))
+                    if got:
+                        exe_url = f"{base}/{sha_name[:-len('.sha256')]}"
+                        return (got, f"{base}/{sha_name}", exe_url)
+                except (OSError, urllib.error.URLError, ValueError):
+                    continue
+            return None
 
         def redirect_fallback():
             """Some users cannot reach api.github.com at all (DNS/TLS
@@ -637,6 +661,13 @@ class App:
                         asset = a.get("browser_download_url")
                     elif nm.endswith(".sha256") and not sha_asset:
                         sha_asset = a.get("browser_download_url")
+                if not sha_asset and latest:
+                    # notes of some releases carry no sha256 — probe the
+                    # asset directly so the download can always verify
+                    found = tag_checksum(latest)
+                    if found:
+                        sha_pre, sha_asset, asset2 = found
+                        asset = asset or asset2
         except urllib.error.HTTPError as exc:
             offline = exc.code in (403, 429, 500, 502, 503)
             http_error = exc.code   # NOT 'offline': the network answered
@@ -644,11 +675,20 @@ class App:
             if latest is None:
                 tag = redirect_fallback()
                 if tag:
-                    # the redirect fallback succeeded — we are NOT offline
+                    # the redirect fallback succeeded — we are NOT offline.
+                    # github.com is not API-rate-limited: probe the tag's
+                    # .sha256 asset so the download still has a checksum
+                    # source (the API assets list is unavailable here —
+                    # without this the download used to be REFUSED with
+                    # 'no checksum could be obtained' on rate-limited
+                    # networks even though the checksum was one GET away)
                     latest, url, offline = (tag,
                         f"https://github.com/{self.UPDATE_REPO}/releases/tag/{tag}",
                         False)
                     prerelease = "-" in tag
+                    found = tag_checksum(tag)
+                    if found:
+                        sha_pre, sha_asset, asset = found
         except OSError:
             # api.github.com unreachable for this user (DNS/TLS filtering,
             # timeouts): the redirect form lives on other infrastructure —
@@ -660,6 +700,9 @@ class App:
                     f"https://github.com/{self.UPDATE_REPO}/releases/tag/{tag}",
                     False)
                 prerelease = "-" in tag
+                found = tag_checksum(tag)   # same rate-limit reasoning
+                if found:
+                    sha_pre, sha_asset, asset = found
             else:
                 offline = True
         except ValueError:
@@ -667,8 +710,8 @@ class App:
             # leave the update check permanently stuck on 'already running')
             offline = True
             http_error = 0          # bad response, not offline
-        self._ui_queue.put(("update", (latest, url, offline, asset,
-                                       sha_asset, prerelease, body, http_error)))
+        self._ui_queue.put(("update", (latest, url, offline, asset, sha_asset,
+                                       prerelease, body, http_error, sha_pre)))
 
     @staticmethod
     def _ver_tuple(s):
@@ -688,8 +731,12 @@ class App:
 
     def _update_result(self, latest, url, offline=False, asset=None,
                        sha_asset=None, prerelease=False, body=None,
-                       http_error=None):
+                       http_error=None, sha_pre=None):
         self._update_running = False
+        # checksum obtained at CHECK time (github.com, rate-limit-proof):
+        # a fallback source when the .sha256 asset cannot be fetched at
+        # DOWNLOAD time (same origin, fetched minutes earlier)
+        self._update_sha_pre = sha_pre
         # a running download OWNS the download button: a concurrent
         # 'Check for updates' used to rebind it to '⬇ Download' (or hide
         # it) mid-download — and a second download then corrupted the
@@ -773,6 +820,7 @@ class App:
                     self._update_asset_url = asset
                     self._update_sha_url = sha_asset
                     self._update_body = body
+                    self._update_sha_pre = sha_pre
                     self._pending_ver = latest
                     if not dl_locked:
                         self._dl_btn.configure(text=f"⬇ Download {latest}", state="normal")
@@ -918,6 +966,11 @@ class App:
                 except (OSError, urllib.error.URLError):
                     expected = None
             if expected is None:
+                expected = getattr(self, "_update_sha_pre", None)
+                if expected:
+                    self.log.info("Update checksum taken from the check-time "
+                                  "fetch (asset unreachable right now).")
+            if expected is None:
                 expected = body_sha256()
                 if expected:
                     self.log.info("Update checksum taken from the release "
@@ -950,7 +1003,9 @@ class App:
                     # leave it stuck on 'downloading…' forever
                     self._ui_queue.put(("dl_done", (False,)))
                     return
-                self.log.ok("Downloaded update verified against the release checksum.")
+                src = ("check-time fetch" if sha_url is None and not body_sha256()
+                       else "release checksum")
+                self.log.ok(f"Downloaded update verified against the {src}.")
             with open(tmp, "wb") as fh:
                 fh.write(data)
             os.replace(tmp, dest)   # atomic: the exe appears only when complete
