@@ -537,6 +537,85 @@ check("mask_proxy hides password inside ProxyServer list",
 cfgc = tempfile.mkdtemp()
 try:
     from hookip.config import Config as _Cfg
+    # ---- review round: encrypt_line surrogate-safety + _load_key guard +
+    # _is_ours exactness + detect sanitization + masking
+    from hookip import logutil as _lg
+    from hookip import winproxy as _wpx
+
+    # 1. a lone surrogate (surrogateescape-decoded path/host strings) must
+    #    not raise out of encrypt_line (it used to escape _emit into the
+    #    proxy's handler)
+    enc = dg.encrypt_line("bad path: \udcff")
+    dec = dg.decrypt_line(enc)
+    check("lone surrogate encrypts without raising (round-trippable)",
+          isinstance(dec, str) and "bad path:" in dec, repr(dec))
+
+    # 2. a failing file sink must never lose the entry nor raise
+    class _BoomFile:
+        def write(self, s): raise UnicodeError("boom")
+        def flush(self): pass
+        def close(self): pass
+    lg = _lg.Log(maxlen=10)
+    lg._file = _BoomFile()
+    raised = False
+    try:
+        lg.warn("must not raise, must stay buffered")
+    except Exception:  # noqa: BLE001
+        raised = True
+    check("file-sink failure: no exception escapes _emit",
+          not raised and len(lg._buf) == 1,
+          f"raised={raised} buf={len(lg._buf)}")
+    check("file-sink failure surfaces in file_error",
+          lg.file_error is not None, str(lg.file_error))
+
+    # 3. _is_ours: exact port+token — another local tool is NOT HookIP's
+    ours = {"ProxyEnable": 1, "ProxyServer": "127.0.0.1:8890",
+            "AutoConfigURL": None}
+    other = {"ProxyEnable": 1, "ProxyServer": "127.0.0.1:7890",
+             "AutoConfigURL": None}
+    pac = {"ProxyEnable": 0, "ProxyServer": None,
+           "AutoConfigURL": "http://127.0.0.1:8890/tok123.pac"}
+    check("_is_ours exact port match", _wpx._is_ours(ours, 8890, "t"))
+    check("_is_ours: a local Clash/Fiddler is NOT HookIP's",
+          not _wpx._is_ours(other, 8890, "t"))
+    check("_is_ours heuristic still works without port context",
+          _wpx._is_ours(other))
+    check("_is_ours PAC needs the token",
+          _wpx._is_ours(pac, 8890, "tok123")
+          and not _wpx._is_ours(pac, 8890, "other"))
+
+    # 4. detect_network_proxy sanitization
+    check("detect: scheme prefix + embedded creds stripped",
+          _wpx.detect_network_proxy({"ProxyEnable": 1,
+              "ProxyServer": "http://user:secret@corp:8080"}) == "corp:8080",
+          _wpx.detect_network_proxy({"ProxyEnable": 1,
+              "ProxyServer": "http://user:secret@corp:8080"}))
+    check("detect: socks= segments skipped (HTTP CONNECT would break)",
+          _wpx.detect_network_proxy({"ProxyEnable": 1,
+              "ProxyServer":
+              "socks=user:pass@h:1080;http=corp2:8080"}) == "corp2:8080")
+    check("detect: file:// PAC URL rejected",
+          _wpx.detect_network_proxy({"ProxyEnable": 0,
+              "AutoConfigURL": "file:///C:/wpad.dat"}) == "")
+    check("detect: malformed AutoConfigURL does not raise",
+          _wpx.detect_network_proxy({"ProxyEnable": 0,
+              "AutoConfigURL": "http://[bad"}) == "")
+
+    # 5. mask/strip: a password containing @ no longer leaks its tail
+    check("mask_proxy: @-password tail not leaked",
+          "ss@" not in _wpx.mask_proxy("http://u:p@ss@h:8080"),
+          _wpx.mask_proxy("http://u:p@ss@h:8080"))
+    check("strip_creds drops credentials entirely",
+          _wpx.strip_creds("http://u:p@ss@h:8080") == "http://h:8080",
+          _wpx.strip_creds("http://u:p@ss@h:8080"))
+
+    # 6. describe masks the PAC token (bug-report safe)
+    d = _wpx.describe({"ProxyEnable": 0,
+                       "AutoConfigURL": "http://127.0.0.1:8890/sectok.pac"},
+                      "sectok")
+    check("describe masks the PAC token", "sectok" not in d and "***" in d,
+          d)
+
     c = _Cfg({"log_retention_days": "bogus"})
     check("config: bogus retention falls back to default",
           c.log_retention_days == _Cfg().log_retention_days,

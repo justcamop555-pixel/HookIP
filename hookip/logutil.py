@@ -52,15 +52,17 @@ class Log:
     def __init__(self, maxlen=None):
         # default buffer scales with the hardware tier (perf.py): a 2-core
         # laptop keeps 1200 entries, a desktop 3000 — the file sink always
-        # gets everything regardless
+        # gets everything regardless. getattr: a Log built by the run()
+        # crash handler must not die if perf.profile() lacks the field.
         if maxlen is None:
-            maxlen = profile().log_buffer
+            maxlen = getattr(profile(), "log_buffer", 2000) or 2000
         self._lock = threading.Lock()
         self._buf = deque(maxlen=maxlen)
         self._subs = []
         self._file = None
         self.file_error = None     # last file-sink failure, surfaced once
         self.verbose = False
+        self._last_flush = 0.0     # monotonic — time-based flush for info/ok
 
     def subscribe(self, callback):
         """callback(level, timestamp, message) for every *new* entry."""
@@ -97,7 +99,9 @@ class Log:
                     magic=dataguard.LOG_MAGIC) + "\n")
                 fh.flush()
                 self._file = fh
-            except OSError as exc:
+            except Exception as exc:   # noqa: BLE001 — the sink must never
+                                       # crash the caller (a UnicodeError
+                                       # from the header used to escape)
                 try:
                     fh.close()
                 except (OSError, NameError, UnboundLocalError):
@@ -134,14 +138,42 @@ class Log:
                                          # a session spanning midnight must
                                          # not export every line under
                                          # today's date
+        # ENCRYPT OUTSIDE THE LOCK: every log call used to run a DPAPI
+        # encrypt + base64 + flush while holding the global lock — a
+        # connection burst serialized every thread's logging behind file
+        # I/O, and drain()/the UI waited behind it too. Encrypt first,
+        # then only the (fast) write happens inside the lock.
+        fh = self._file
+        line = None
+        if fh is not None:
+            try:
+                line = dataguard.encrypt_line(
+                    f"[{date} {ts}] [{level.upper():5}] {msg}") + "\n"
+            except Exception as exc:  # noqa: BLE001 — a logging failure
+                                      # must never escape into the caller
+                                      # (it used to propagate out of
+                                      # log.warn() into the proxy handler)
+                line = None
+                if not self.file_error:
+                    self.file_error = f"log encryption failed: {exc}"
         with self._lock:
-            if self._file:
+            if line is not None and self._file is fh and self._file:
                 try:
-                    plain = f"[{date} {ts}] [{level.upper():5}] {msg}"
-                    self._file.write(dataguard.encrypt_line(plain) + "\n")
-                    self._file.flush()
-                except OSError:
-                    pass
+                    self._file.write(line)
+                    # flush policy: warn/error immediately (the lines a
+                    # crash post-mortem needs); everything else at most
+                    # once per second — flush() per line serialized bursts
+                    now = time.monotonic()
+                    if level in ("warn", "error") or \
+                            now - self._last_flush >= 1.0:
+                        self._file.flush()
+                        self._last_flush = now
+                except Exception as exc:  # noqa: BLE001 — non-OSError disk
+                                          # failures were swallowed without
+                                          # a trace before
+                    if not self.file_error:
+                        self.file_error = str(exc)
+            # ALWAYS buffered — a failed write used to lose the entry too
             self._buf.append(entry)
             subs = list(self._subs) if screen else []
         for cb in subs:

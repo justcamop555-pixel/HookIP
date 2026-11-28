@@ -75,6 +75,7 @@ import re
 import secrets
 import subprocess
 import threading
+import time
 import winreg
 from ctypes import wintypes
 
@@ -105,6 +106,11 @@ def _load_key():
     with _key_lock:
         if _ENTROPY_BLOB is not None:
             return
+        # outcome of the registry probe: 'ok' (key loaded), 'missing'
+        # (value absent — safe to create), 'invalid' (present but wrong
+        # type/len — can never decrypt anything), 'unreachable' (transient
+        # registry failure — we do NOT know whether the value exists)
+        status = "ok"
         key = None
         try:
             with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
@@ -112,9 +118,31 @@ def _load_key():
                 raw, _typ = winreg.QueryValueEx(k, _KEY_REGISTRY_VALUE)
             if isinstance(raw, bytes) and len(raw) == _KEY_LEN:
                 key = raw
+            else:
+                status = "invalid"
+        except FileNotFoundError:
+            status = "missing"
         except OSError:
-            key = None
-        if key is None:
+            # TRANSIENT registry failure (AV lock, key momentarily busy):
+            # the old code regenerated the key on ANY OSError and
+            # OVERWROTE a perfectly good one, orphaning every file ever
+            # written with it. Retry once; only create a key when the
+            # absence/invalidity is PROVEN.
+            try:
+                time.sleep(0.05)
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                    _KEY_REGISTRY_PATH) as k:
+                    raw, _typ = winreg.QueryValueEx(k, _KEY_REGISTRY_VALUE)
+                if isinstance(raw, bytes) and len(raw) == _KEY_LEN:
+                    key = raw
+                else:
+                    status = "invalid"
+            except FileNotFoundError:
+                status = "missing"
+            except OSError:
+                status = "unreachable"
+        if key is None and status in ("missing", "invalid"):
+            # absent or provably garbage: create a fresh per-install key
             key = secrets.token_bytes(_KEY_LEN)
             try:
                 with winreg.CreateKey(winreg.HKEY_CURRENT_USER,
@@ -126,6 +154,12 @@ def _load_key():
                 # entropy (old behavior) rather than failing every write
                 key = _LEGACY_ENTROPY
                 _legacy_fallback = True
+        elif key is None:
+            # 'unreachable': do NOT write anything — the stored key (if
+            # any) stays untouched, old files remain readable on the next
+            # run; this session degrades to the legacy entropy
+            key = _LEGACY_ENTROPY
+            _legacy_fallback = True
         _entropy = key
         _KEY_BUF = ctypes.create_string_buffer(key, len(key))
         _ENTROPY_BLOB = _DATA_BLOB(
@@ -287,12 +321,17 @@ def encrypt_line(text, magic=LOG_MAGIC):
 
     None is treated as an empty string so a logging path can never
     crash on a bad message; raises TypeError for non-str, non-None.
+    Encodes with errors='replace': log lines carry raw host strings that
+    Python may decode with surrogateescape — a lone surrogate crashes a
+    strict utf-8 encode, and that exception used to escape _emit into
+    the proxy's handler. Unpaired surrogates become '?' (b'\\x3f',
+    Python 3.15's replace behavior) — round-trippable, never an escape.
     """
     if text is None:
         text = ""
     if not isinstance(text, str):
         raise TypeError(f"encrypt_line expects str, got {type(text).__name__}")
-    blob = _crypt(text.encode("utf-8"), decrypt=False)
+    blob = _crypt(text.encode("utf-8", "replace"), decrypt=False)
     return magic + base64.b64encode(blob).decode("ascii")
 
 

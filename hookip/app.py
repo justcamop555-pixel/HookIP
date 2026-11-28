@@ -1485,7 +1485,7 @@ class App:
             cur = winproxy.read_current()
         except OSError:
             return
-        if self.running or not winproxy._is_ours(cur):
+        if self.running or not winproxy._is_ours(cur, self.cfg.port, self.pac_token):
             return
         if winproxy.has_backup():
             # backup exists only when the last activation never stopped
@@ -1525,7 +1525,7 @@ class App:
                             "previous settings.")
                 notify.notify("HookIP — internet restored",
                               "Windows points at your original connection again.")
-            elif winproxy._is_ours(cur):
+            elif winproxy._is_ours(cur, self.cfg.port, self.pac_token):
                 winproxy.remove_proxy()
                 self.log.ok("Internet restored: HookIP proxy settings cleared "
                             "(direct connection).")
@@ -1534,7 +1534,7 @@ class App:
                               "connection is back.")
             else:
                 self.log.info("Nothing to restore — system proxy is already "
-                              + winproxy.describe(cur))
+                              + winproxy.describe(cur, self.pac_token))
         except OSError as exc:
             self.log.error(f"Restore failed: {exc}")
 
@@ -1588,18 +1588,31 @@ class App:
             prev = winproxy.read_current()
         except OSError:
             prev = {}
-        net_proxy = winproxy.detect_network_proxy(prev)
+        # detection runs on a WORKER: the PAC fetch alone can take up to
+        # 4 s and used to freeze the window on every Start (and a
+        # malformed AutoConfigURL raising ValueError used to abort Start
+        # outright). _via_upstream reads cfg.upstream_proxy per-connection,
+        # so the result can be applied when it arrives.
+        net_proxy = ""
+        try:
+            net_proxy = winproxy.detect_network_proxy(prev)
+        except Exception as exc:  # noqa: BLE001 — never abort Start
+            self.log.debug(f"network-proxy detection failed: "
+                           f"{type(exc).__name__}: {exc}")
         cfg.upstream_proxy = net_proxy
         if net_proxy:
-            # credentials never reach logs/toasts: a detected corporate
-            # proxy can embed user:pass@ — mask before display
-            shown = winproxy.mask_proxy(net_proxy)
-            self.log.ok(f"This network requires its own proxy ({shown}) — "
-                        "HookIP will tunnel through it automatically.")
-            notify.notify("HookIP — restricted network detected",
-                          f"Your Wi-Fi only allows traffic through its own "
-                          f"proxy ({shown}). HookIP now chains through "
-                          "it, so sites keep working.", timeout_s=12)
+            self._announce_upstream(net_proxy)
+        else:
+            def _late_detect(prev_vals=prev):
+                try:
+                    found = winproxy.detect_network_proxy(prev_vals)
+                except Exception:
+                    return
+                if found and getattr(self, "cfg", None) is not None and \
+                        not getattr(self.cfg, "upstream_proxy", ""):
+                    self.cfg.upstream_proxy = found
+                    self._announce_upstream(found)
+            threading.Thread(target=_late_detect, daemon=True).start()
         try:
             self.proxy = ProxyServer(cfg, self.log, self.stats, self.pac_token)
             self.proxy.on_accept_death = self._on_accept_death
@@ -1612,7 +1625,7 @@ class App:
 
         # system proxy + crash safety
         try:
-            self.log.info("Current system proxy: " + winproxy.describe(winproxy.read_current()))
+            self.log.info("Current system proxy: " + winproxy.describe(winproxy.read_current(), self.pac_token))
             # on restricted networks DIRECT is blocked: keep excluded domains
             # OUT of the bypass lists or they would break (round-2 finding)
             bypass = None if net_proxy else cfg.excluded
@@ -1762,6 +1775,16 @@ class App:
             self.log.error(f"Emergency restore failed: {exc}")
         # UI refresh happens on the main thread via _pump_ui ("emergency_done")
         # — this hook runs on the accept thread and must not touch Tk directly
+
+    def _announce_upstream(self, net_proxy):
+        """Log + toast a detected network proxy (credentials masked)."""
+        shown = winproxy.mask_proxy(net_proxy)
+        self.log.ok(f"This network requires its own proxy ({shown}) — "
+                    "HookIP will tunnel through it automatically.")
+        notify.notify("HookIP — restricted network detected",
+                      f"Your Wi-Fi only allows traffic through its own "
+                      f"proxy ({shown}). HookIP now chains through "
+                      "it, so sites keep working.", timeout_s=12)
 
     def stop_proxy(self, tell_user=True):
         if not self.running:
@@ -2333,9 +2356,9 @@ class App:
         except Exception:
             pass
         cur = winproxy.read_current()
-        self._diag_result("System proxy", "info", winproxy.describe(cur))
+        self._diag_result("System proxy", "info", winproxy.describe(cur, self.pac_token))
         # stale-proxy detection: registry points at HookIP while we're off
-        if not self.running and winproxy._is_ours(cur):
+        if not self.running and winproxy._is_ours(cur, self.cfg.port, self.pac_token):
             port_s = f"127.0.0.1:{self.cfg.port}"
             stale = (winproxy.has_backup() or
                      port_s in str(cur.get("ProxyServer") or "") or
@@ -2612,8 +2635,13 @@ class App:
 
 def run():
     # Single instance: if another HookIP is running, activate it and exit.
+    # None = another instance holds the mutex; False = the mutex could not
+    # be created at all (a NULL handle used to be reported as 'already
+    # running', which was a lie) — proceed without single-instance then.
     mutex = winproxy.acquire_single_instance()
-    if mutex is None:
+    if mutex is False:
+        mutex = None
+    elif mutex is None:
         root = tk.Tk()
         root.withdraw()
         if winproxy.notify_running_instance():
@@ -2649,6 +2677,7 @@ def run():
             if winproxy.has_backup():
                 winproxy.restore_from_file()
             elif winproxy._is_ours(winproxy.read_current()):
+                # no app instance exists here — heuristic fallback
                 winproxy.remove_proxy()
         except Exception:
             pass

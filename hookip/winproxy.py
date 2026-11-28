@@ -120,7 +120,12 @@ def notify_shell():
     threading.Thread(target=_send, daemon=True).start()
 
 
-_CRED_RE = None  # compiled lazily in mask_proxy (import-time cost)
+def _split_prefix(seg):
+    """('scheme://' or 'scheme=' prefix, remainder) — so the scheme colon
+    is never mistaken for the user:pass separator."""
+    import re
+    m = re.match(r"^(\w+://|\w+=)(.*)$", seg, re.S)
+    return (m.group(1), m.group(2)) if m else ("", seg)
 
 
 def mask_proxy(proxy):
@@ -128,32 +133,49 @@ def mask_proxy(proxy):
     log, toast or diagnostics line. Handles scheme URLs
     ('http://user:pass@corp:8080'), per-scheme entries ('socks=user:pass@h:p')
     and the IE ProxyServer list format ('u:p@h:8080;socks=proxy:1080') —
-    per-segment and @-anchored, so a plain 'host:port' never matches."""
-    import re
-    global _CRED_RE
-    if _CRED_RE is None:
-        _CRED_RE = re.compile(r"([^/:@]+):([^@]+)@")
-
+    per-segment and @-anchored (rpartition: a password containing '@',
+    u:p@ss@h, used to leak its tail past the mask)."""
     def _seg(seg):
-        # strip a 'scheme://' or 'scheme=' prefix first so the scheme colon
-        # is never mistaken for the user:pass separator
-        m = re.match(r"^(\w+://|\w+=)(.*)$", seg, re.S)
-        prefix, rest = (m.group(1), m.group(2)) if m else ("", seg)
+        prefix, rest = _split_prefix(seg)
         if "@" in rest:
-            rest = _CRED_RE.sub(r"\1:***@", rest, count=1)
+            creds, _, host = rest.rpartition("@")
+            if ":" in creds:
+                rest = creds.split(":", 1)[0] + ":***@" + host
         return prefix + rest
 
     return ";".join(_seg(seg) for seg in str(proxy or "").split(";"))
 
 
-def describe(vals):
+def strip_creds(proxy):
+    """Remove credentials entirely (restore.cmd must not carry a masked —
+    i.e. BROKEN — password: 'user:***@h' would literally become the new
+    ProxyServer after a crash restore). The host:port survives; auth
+    re-prompts. The real values live only in the encrypted backup."""
+    def _seg(seg):
+        prefix, rest = _split_prefix(seg)
+        if "@" in rest:
+            rest = rest.rpartition("@")[2]
+        return prefix + rest
+
+    return ";".join(_seg(seg) for seg in str(proxy or "").split(";"))
+
+
+def describe(vals, pac_token=""):
+    """Human-readable proxy summary for logs and the Diagnostics report.
+
+    pac_token is masked out of the PAC URL: the report is designed to be
+    copy-pasted into bug reports, and the token lets anyone POST a PAC
+    request that looks like this install's."""
     if not vals or not vals.get("ProxyEnable") and not vals.get("AutoConfigURL"):
         return "direct connection (no proxy)"
     parts = []
     if vals.get("ProxyEnable"):
         parts.append(f"manual proxy {mask_proxy(vals.get('ProxyServer'))}")
     if vals.get("AutoConfigURL"):
-        parts.append(f"PAC {vals['AutoConfigURL']}")
+        acu = str(vals["AutoConfigURL"])
+        if pac_token:
+            acu = acu.replace(pac_token, "***")
+        parts.append(f"PAC {acu}")
     if vals.get("ProxyOverride"):
         parts.append("bypass: " + vals["ProxyOverride"])
     return "; ".join(parts) if parts else "direct"
@@ -175,8 +197,22 @@ def backup():
     # object HookIP wrote.
     from . import dataguard
     blob = dataguard.encrypt_bytes(json.dumps(cur).encode("utf-8"))
-    with open(BACKUP_PATH, "w", encoding="utf-8") as fh:
-        fh.write(blob)
+    # atomic write: a crash mid-write must not leave a truncated HKCFG1:
+    # file that restore_from_file would (correctly) refuse — losing the
+    # backup means losing the user's original proxy config
+    tmp = BACKUP_PATH + f".{threading.get_ident()}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(blob)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, BACKUP_PATH)
+    except OSError:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
     _write_restore_cmd(cur)
 
 
@@ -311,34 +347,57 @@ def detect_network_proxy(vals):
     HookIP replaces that setting, its own direct connects would all fail —
     so detect the network's proxy BEFORE overwriting and tunnel through it.
 
-    Returns 'host:port' or ''.
+    Returns 'host:port' or ''. Never raises (the caller runs this on the
+    UI thread path via a worker — but a malformed AutoConfigURL raising
+    ValueError used to abort Start outright).
     """
-    # 1. manual proxy: '1.2.3.4:8080' or 'http=…;https=…' form
-    ps = str(vals.get("ProxyServer") or "")
-    if vals.get("ProxyEnable") and ps:
-        if "=" in ps:
-            # per-protocol form: prefer https, then any first segment
-            segs = [s.split("=", 1)[1].strip() for s in ps.split(";") if "=" in s]
+    try:
+        # 1. manual proxy: '1.2.3.4:8080' or 'http=…;https=…' form.
+        # socks= segments are SKIPPED: _via_upstream speaks HTTP CONNECT,
+        # pointed at a SOCKS port it would send plain HTTP into a SOCKS
+        # listener and every connection would fail oddly.
+        ps = str(vals.get("ProxyServer") or "")
+        if vals.get("ProxyEnable") and ps:
+            if "=" in ps:
+                segs = [s.split("=", 1)[1].strip() for s in ps.split(";")
+                        if "=" in s and not s.lower().startswith("socks")]
+            else:
+                segs = [ps]
             for seg in segs:
-                if _lan_address(seg):
+                seg = _clean_upstream(seg)
+                if seg and _lan_address(seg):
                     return seg
-        elif _lan_address(ps):
-            return ps
-    # 2. PAC: fetch it (best effort) and take the first non-local PROXY entry
-    acu = str(vals.get("AutoConfigURL") or "")
-    if acu and _lan_address(acu):
-        try:
+        # 2. PAC: fetch it (best effort) and take the first non-local
+        # PROXY entry. ONLY http/https schemes — a file:// (or ftp://)
+        # AutoConfigURL passed _lan_address and used to be fetched
+        # directly. NOTE the first match is best-effort: a PAC script can
+        # return different proxies per condition; we cannot evaluate JS.
+        acu = str(vals.get("AutoConfigURL") or "")
+        if acu.lower().startswith(("http://", "https://")) and _lan_address(acu):
             import re
             import urllib.request
             req = urllib.request.Request(acu, headers={"User-Agent": "HookIP"})
             with urllib.request.urlopen(req, timeout=4) as r:
                 pac = r.read(65536).decode("latin1", "replace")
             for cand in re.findall(r"PROXY\s+([^;\s]+:\d+)", pac, re.IGNORECASE):
-                if _lan_address(cand):
+                cand = _clean_upstream(cand)
+                if cand and _lan_address(cand):
                     return cand
-        except OSError:
-            pass
+    except Exception:  # noqa: BLE001 — detection is best-effort, never fatal
+        pass
     return ""
+
+
+def _clean_upstream(addr):
+    """Normalize a candidate upstream proxy to 'host:port' — a scheme
+    prefix ('http://') or embedded user:pass@ would break _via_upstream,
+    which splits on ':' and would resolve 'http' as the host."""
+    a = str(addr or "").strip()
+    if "://" in a:
+        a = a.split("://", 1)[1]
+    if "@" in a:
+        a = a.rpartition("@")[2]
+    return a.strip("/")
 
 
 def remove_proxy():
@@ -356,11 +415,18 @@ EVENT_MODIFY_STATE = 0x0002
 
 def acquire_single_instance():
     """Hold a named mutex for the app's lifetime.
-    Returns the handle, or None if another HookIP instance is running."""
+
+    Returns the handle, None if another HookIP instance is running, or
+    False when the mutex could not be created for another reason — the
+    old code returned None for a NULL handle too, and run() then
+    reported 'already running' for a plain CreateMutexW failure."""
     handle = _k32.CreateMutexW(None, False, INSTANCE_MUTEX)
     if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
-        _k32.CloseHandle(handle)
+        if handle:
+            _k32.CloseHandle(handle)
         return None
+    if not handle:
+        return False
     return handle
 
 
@@ -374,23 +440,37 @@ def notify_running_instance():
     return ok
 
 
-def _is_ours(vals):
-    """Does this proxy configuration look like one HookIP set itself?"""
+def _is_ours(vals, port=None, pac_token=""):
+    """Is this proxy configuration one HookIP set itself?
+
+    Exact match on 127.0.0.1:{port} plus the PAC token — the old
+    startswith('127.0.0.1') heuristic counted a local Clash/Fiddler/
+    V2Ray as HookIP's, and a subsequent stop/restore then WIPED that
+    other tool's configuration (backup() skipped saving it). When the
+    port/token are unknown the heuristic stays as a last resort, but
+    every in-app caller passes both."""
     ps = str(vals.get("ProxyServer") or "")
     ac = str(vals.get("AutoConfigURL") or "")
+    if port:
+        ps_ours = ps == f"127.0.0.1:{port}"
+        ac_ours = bool(pac_token) and pac_token in ac and ac.endswith(".pac")
+        if ps or ac:
+            return ps_ours or ac_ours
+        return False
+    # heuristic fallback (no port context available)
     return ps.startswith("127.0.0.1") or ("127.0.0.1" in ac and ".pac" in ac)
 
 
 def _write_restore_cmd(vals):
-    # NOTE: ProxyServer values that embed credentials are MASKED here — the
-    # cmd is a plaintext recovery artifact by nature (reg.exe must read it)
-    # and used to copy user:pass@proxy strings to disk. The address
-    # survives a crash-restore; auth re-prompts. The complete unmasked
-    # values live only in the ENCRYPTED proxy backup.
+    # NOTE: ProxyServer values that embed credentials are STRIPPED here —
+    # the cmd is a plaintext recovery artifact by nature (reg.exe must read
+    # it), and writing 'user:***@host' would make *** the literal password
+    # after a crash restore. host:port survives; auth re-prompts. The
+    # complete unmasked values live only in the ENCRYPTED proxy backup.
     lines = ["@echo off"]
     lines.append(f'reg add "HKCU\\{KEY_PATH}" /v ProxyEnable /t REG_DWORD /d {1 if vals.get("ProxyEnable") else 0} /f')
     if vals.get("ProxyServer"):
-        lines.append(f'reg add "HKCU\\{KEY_PATH}" /v ProxyServer /t REG_SZ /d "{mask_proxy(vals["ProxyServer"])}" /f')
+        lines.append(f'reg add "HKCU\\{KEY_PATH}" /v ProxyServer /t REG_SZ /d "{strip_creds(vals["ProxyServer"])}" /f')
     else:
         lines.append(f'reg delete "HKCU\\{KEY_PATH}" /v ProxyServer /f >nul 2>&1')
     if vals.get("ProxyOverride"):
@@ -502,18 +582,28 @@ class Watchdog:
         flags = 0x08000000  # CREATE_NO_WINDOW
         # TWO children: killing one (Task Manager end-task on the wrong
         # HookIP.exe row, AV heuristic) must not leave the proxy unwatched
-        self._procs = [self._spawn(args, flags, env) for _ in range(2)]
-        # a watchdog that died at birth (broken cwd / python) used to leave
-        # crash protection silently OFF for the whole session — verify it
-        # actually survived startup, and respawn once before giving up
-        time.sleep(0.4)
-        self._procs = [p if (p is not None and p.poll() is None)
-                       else self._spawn(args, flags, env)
-                       for p in self._procs]
-        self._proc = next((p for p in self._procs if p is not None), None)
+        procs = self._procs = [self._spawn(args, flags, env) for _ in range(2)]
         self._beat_stop = threading.Event()
         self._beat_thread = threading.Thread(target=self._beat_loop, daemon=True)
         self._beat_thread.start()
+        # a watchdog that died at birth (broken cwd / python) used to leave
+        # crash protection silently OFF for the whole session — verify it
+        # actually survived startup, and respawn once before giving up.
+        # OFF THE CALLER'S THREAD: this slept 0.4 s inline, and
+        # _refresh_dashboard calls start() on the UI thread — a dead
+        # watchdog froze the window ~2 s per re-arm.
+        def _verify(spawn_args, spawn_flags, spawn_env, snapshot):
+            time.sleep(0.4)
+            if self._procs is not snapshot:
+                return          # stop() ran meanwhile — do not respawn
+            fresh = [p if (p is not None and p.poll() is None)
+                     else self._spawn(spawn_args, spawn_flags, spawn_env)
+                     for p in snapshot]
+            if self._procs is snapshot:
+                self._procs = fresh
+                self._proc = next((p for p in fresh if p is not None), None)
+        threading.Thread(target=_verify, args=(args, flags, env, procs),
+                         daemon=True).start()
 
     def stop(self):
         beat_stop = getattr(self, "_beat_stop", None)
@@ -526,23 +616,28 @@ class Watchdog:
         if not procs and getattr(self, "_proc", None):
             procs = [self._proc]
         if self._event:
+            event = self._event
             _k32.SetEvent(self._event)
-            # the onefile children react to the event instantly (~0.01 s) —
-            # give them that moment so terminate() below stays a rare
-            # fallback: killing a bootloader PID can orphan its inner child
-            deadline = time.time() + 1.5
-            while time.time() < deadline:
-                if all(p is None or p.poll() is not None for p in procs):
-                    break
-                time.sleep(0.05)
-            _k32.CloseHandle(self._event)     # one handle per start cycle
             self._event = None
-        for p in procs:
-            if p and p.poll() is None:
-                try:
-                    p.terminate()
-                except OSError:
-                    pass
+            # the onefile children react to the event instantly (~0.01 s) —
+            # the wait-for-exit + terminate fallback runs on a WORKER: the
+            # old inline 1.5 s poll blocked the UI thread on every Stop
+            # (the children exit on the event by themselves; terminate()
+            # only catches a child that ignored it)
+            def _reap():
+                deadline = time.time() + 1.5
+                while time.time() < deadline:
+                    if all(p is None or p.poll() is not None for p in procs):
+                        break
+                    time.sleep(0.05)
+                _k32.CloseHandle(event)   # one handle per start cycle
+                for p in procs:
+                    if p and p.poll() is None:
+                        try:
+                            p.terminate()
+                        except OSError:
+                            pass
+            threading.Thread(target=_reap, daemon=True).start()
         self._procs = []
         self._proc = None
         if self._beat:
