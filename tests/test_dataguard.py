@@ -835,6 +835,14 @@ try:
     c2 = _Cfg({"log_retention_days": 0})
     check("config: retention 0 (keep forever) accepted",
           c2.log_retention_days == 0)
+    # bool is an int subclass: JSON `true` used to pass the int check and
+    # silently become port 1 / fragment size 1
+    cb = _Cfg({"port": True, "fragment_size": True, "log_retention_days": True})
+    check("config: JSON booleans rejected for int fields",
+          cb.port == _Cfg().port and
+          cb.fragment_size == _Cfg().fragment_size and
+          cb.log_retention_days == _Cfg().log_retention_days,
+          str((cb.port, cb.fragment_size, cb.log_retention_days)))
 finally:
     shutil.rmtree(cfgc, ignore_errors=True)
 

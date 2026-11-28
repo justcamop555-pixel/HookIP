@@ -81,6 +81,32 @@ check("parse offsets sane",
       info is not None and rec[info["sni_start"]:info["sni_end"]] == b"example.com"
       and info["host"] == "example.com" and info["total"] == len(rec))
 
+# ---- 0: chunk_size is capped at the config ceiling (255) ---------------
+# An unbounded size would send the whole head in ONE segment — silently
+# disabling the bypass (a hand-edited settings.json used to be able to
+# reach this via a huge fragment_size before the config layer bounded it).
+for strat in ("smart", "chunk", "random"):
+    parts = tf.fragment(rec, strat, 100000)
+    check(f"huge chunk_size capped at 255 ({strat})",
+          b"".join(parts) == rec and
+          (len(parts) == 1 or max(len(p) for p in parts) <= 255),
+          f"{[len(p) for p in parts]}")
+rec_big = build_hello("a" * 300 + ".example.com")   # head > 255 bytes
+for strat in ("smart", "chunk", "random"):
+    parts = tf.fragment(rec_big, strat, 100000)
+    check(f"huge chunk_size on a long hello fragments ({strat})",
+          len(parts) >= 2 and b"".join(parts) == rec_big and
+          max(len(p) for p in parts) <= 255,
+          f"{len(parts)} parts")
+check("huge chunk_size with NO sni: whole record (nothing to hide)",
+      tf.fragment(build_hello(None), "smart", 100000) == [build_hello(None)])
+
+# chunk_size=1 on 'random': sizes stay 1..2 (randint(1, max(2, n)) — the
+# floor keeps the sizes from being a constant, matching the docstring)
+parts = tf.fragment(rec, "random", 1)
+check("random with chunk_size 1 still splits within the SNI",
+      len(parts) >= 2 and b"".join(parts) == rec, f"{len(parts)} parts")
+
 # ---- 1: 'random' with SNI LAST — hostname never whole in one segment --
 rec_last = build_hello("example-hostname-12345.com", sni_last=True)
 info_last = tf.parse_client_hello(rec_last)

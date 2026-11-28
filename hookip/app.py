@@ -1890,15 +1890,29 @@ class App:
         if self.running:
             return
         cfg = self.cfg
+        # per-field validation: the old shared try/except named the PORT
+        # field for fragment errors like 0 or 256 (its range test chained
+        # through `1 <= bad <= 65535`, which a bad fragment value fails)
         try:
             port = int(self.port_var.get())
             if not (1 <= port <= 65535):
                 raise ValueError(port)
             cfg.port = port
+        except ValueError as exc:
+            self.log.error("Local port must be a number from 1 to 65535 "
+                           f"(you typed \"{self.port_var.get()}\").")
+            self.log.info("Check the red-highlighted field in Settings.")
+            return
+        try:
             frag = int(self.frag_var.get())
             if not (1 <= frag <= 255):
                 raise ValueError(frag)
             cfg.fragment_size = frag
+        except ValueError as exc:
+            self.log.error("Fragment size must be 1-255 "
+                           f"(you typed \"{self.frag_var.get()}\").")
+            self.log.info("Check the red-highlighted field in Settings.")
+            return
             cfg.strategy = self.strategy_var.get()
             if cfg.strategy not in ("smart", "chunk", "random"):
                 cfg.strategy = "smart"
@@ -1913,15 +1927,6 @@ class App:
             cfg.minimize_to_tray = self.tray_var.get()
             cfg.excluded = self._parse_excluded()
             self.log.verbose = cfg.verbose
-        except ValueError as exc:
-            bad = exc.args[0] if exc.args else None
-            if isinstance(bad, int) and not (1 <= bad <= 255) and 1 <= bad <= 65535:
-                self.log.error(f"Fragment size must be 1–255 (you typed {bad}).")
-            else:
-                self.log.error("Local port must be a number from 1 to 65535.")
-            self.log.info("Check the red-highlighted field in Settings.")
-            return
-
         prev_port = getattr(self, "_live_port", None)
         self.log.info(f"Starting proxy on 127.0.0.1:{cfg.port} …")
         if prev_port and prev_port != cfg.port:

@@ -97,7 +97,9 @@ def fragment(data, strategy="smart", chunk_size=2):
     """
     info = parse_client_hello(data)
     try:
-        n = max(1, int(chunk_size))
+        n = min(255, max(1, int(chunk_size)))   # 255 = config ceiling: an
+        # unbounded size (hand-edited settings, a buggy caller) would send
+        # the whole head in ONE segment — silently disabling the bypass
     except (TypeError, ValueError):
         n = 2
     if info is None:

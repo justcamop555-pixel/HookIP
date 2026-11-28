@@ -62,10 +62,13 @@ class Config:
         """Type-check loaded settings: a hand-edited (or corrupt) settings.json
         must not put a string into cfg.port or a string into the excluded
         LIST (which used to explode into single characters in the editor box)."""
-        if not isinstance(clean.get("port"), int) or not (1 <= clean["port"] <= 65535):
-            clean["port"] = DEFAULTS["port"]
-        if not isinstance(clean.get("fragment_size"), int) or not (1 <= clean["fragment_size"] <= 255):
-            clean["fragment_size"] = DEFAULTS["fragment_size"]
+        # bool is an int subclass: a JSON `true` used to pass the int check
+        # and silently become port 1 / fragment size 1
+        for k, lo, hi in (("port", 1, 65535), ("fragment_size", 1, 255),
+                          ("log_retention_days", 0, 3650)):
+            v = clean.get(k)
+            if not isinstance(v, int) or isinstance(v, bool) or not (lo <= v <= hi):
+                clean[k] = DEFAULTS[k]
         if clean.get("strategy") not in ("smart", "chunk", "random"):
             clean["strategy"] = DEFAULTS["strategy"]
         if clean.get("proxy_mode") not in ("manual", "pac", "both"):
@@ -111,9 +114,6 @@ class Config:
                          key=lambda kv: kv[1].get("t", 0),
                          reverse=True)[:256]
             clean["strat_memory"] = dict(top)
-        lrd = clean.get("log_retention_days")
-        if not isinstance(lrd, int) or not (0 <= lrd <= 3650):
-            clean["log_retention_days"] = DEFAULTS["log_retention_days"]
         return clean
 
     # -- dict-style access ------------------------------------------------
