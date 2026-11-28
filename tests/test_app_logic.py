@@ -589,7 +589,7 @@ check("stale-upstream clear is announced",
       any("directly again" in m for (lvl, m) in _gone.log.lines),
       str(_gone.log.lines))
 check("stale-upstream clear re-applies the system proxy",
-      ("reapply", ()) in _gone._ui_queue, str(_gone._ui_queue))
+      ("reapply", (False,)) in _gone._ui_queue, str(_gone._ui_queue))
 
 _user = _upstream_fixture("my-own-proxy.example:3128", "lan-proxy.corp:8080")
 check("user-typed upstream survives proxy-less detection",
@@ -641,6 +641,40 @@ _skip_rows = [r for r in _diag3._diag_queue if r[0] == "result"]
 check("no proxy: bypass row says 'start the proxy first'",
       len(_skip_rows) == 1 and _skip_rows[0][2] == "skipped",
       str(_diag3._diag_queue))
+
+# ---- reapply restricted vs normal: bypass entries per situation ---------
+_rec = []
+_ra = make_app()
+_ra.running = True
+_ra.proxy = object()
+_ra._apply_proxy_settings = types.MethodType(appmod.App._apply_proxy_settings, _ra)
+_ra.cfg = types.SimpleNamespace(proxy_mode="manual", port=9440,
+                                excluded=["x.test"])
+with mock.patch.object(appmod.winproxy, "apply_manual",
+                       lambda port, bypass=None: _rec.append(("manual", bypass))):
+    appmod.App._reapply_system_proxy(_ra, True)     # restricted network
+    appmod.App._reapply_system_proxy(_ra, False)    # network's proxy gone
+check("restricted reapply keeps exclusions OUT of the bypass list",
+      _rec and _rec[0] == ("manual", None), str(_rec))
+check("normal reapply restores the user's bypass list",
+      len(_rec) == 2 and _rec[1] == ("manual", ["x.test"]), str(_rec))
+check("restricted reapply message names the late proxy",
+      any("arrived late" in m for (lvl, m) in _ra.log.lines if lvl == "ok"),
+      str(_ra.log.lines))
+check("normal reapply message names the restored bypass",
+      any("excluded" in m for (lvl, m) in _ra.log.lines if lvl == "ok"),
+      str(_ra.log.lines))
+
+_stopped = make_app()
+_stopped.running = False
+_stopped.proxy = None
+_stopped.cfg = types.SimpleNamespace(proxy_mode="manual", port=9440, excluded=[])
+_rec.clear()
+with mock.patch.object(appmod.winproxy, "apply_manual",
+                       lambda port, bypass=None: _rec.append(port)):
+    appmod.App._reapply_system_proxy(_stopped, True)
+check("reapply does nothing when the proxy was stopped meanwhile",
+      _rec == [], str(_rec))
 
 print(f"Summary: {sum(1 for _, c in RESULTS if c)}/{len(RESULTS)} passed")
 sys.exit(0 if all(c for _, c in RESULTS) else 1)

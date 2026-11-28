@@ -347,7 +347,7 @@ class App:
                 elif kind == "emergency_done":
                     self._set_running_ui(False)
                 elif kind == "reapply":
-                    self._reapply_system_proxy()
+                    self._reapply_system_proxy(args[0] if args else True)
                 elif kind == "vpn":
                     self._apply_vpn_state(args[0] if args else None)
                 elif kind == "upstream_ui":
@@ -565,7 +565,7 @@ class App:
             self.log.ok(
                 "This network no longer publishes its own proxy — upstream "
                 "chaining disabled, HookIP connects directly again.")
-            self._ui_queue.put(("reapply", ()))
+            self._ui_queue.put(("reapply", (False,)))
             return True
         return False
 
@@ -2409,18 +2409,31 @@ class App:
             pass
         self.proxy = None
 
-    def _reapply_system_proxy(self):
-        """Late network-proxy detection: re-apply the system proxy WITHOUT
-        bypass entries (restricted network: DIRECT is blocked, so user
-        exclusions must not be served as DIRECT). Runs on the MAIN thread
-        (via _pump_ui) — a background thread must never touch winreg/Tk;
-        does nothing when the proxy was stopped meanwhile."""
+    def _reapply_system_proxy(self, restricted=True):
+        """Re-apply the system proxy after a background detection changed
+        the upstream situation. Runs on the MAIN thread (via _pump_ui) —
+        a background thread must never touch winreg/Tk; does nothing when
+        the proxy was stopped meanwhile.
+
+        restricted=True (the network's own proxy arrived late): re-apply
+        WITHOUT bypass entries — DIRECT is blocked there, so user
+        exclusions must not be served as DIRECT. restricted=False (the
+        network's proxy is GONE and the detected upstream was cleared):
+        re-apply WITH the user's bypass list — the normal case; the old
+        shared message and the missing bypass list were both wrong for
+        this path (exclusions would have stayed tunneled forever)."""
         if not (self.running and self.proxy):
             return                      # stopped while detection ran
         try:
-            self._apply_proxy_settings(self.cfg, bypass=None)
-            self.log.ok("System proxy re-applied without bypass entries — "
-                        "the network's own proxy arrived late.")
+            self._apply_proxy_settings(
+                self.cfg, bypass=None if restricted else self.cfg.excluded)
+            if restricted:
+                self.log.ok("System proxy re-applied without bypass entries "
+                            "— the network's own proxy arrived late.")
+            else:
+                self.log.ok("System proxy re-applied with your excluded "
+                            "domains — the network no longer requires its "
+                            "own proxy.")
         except Exception as exc:  # noqa: BLE001 — re-apply is best-effort
             self.log.warn(f"Could not re-apply the system proxy: "
                           f"{type(exc).__name__}: {exc}")

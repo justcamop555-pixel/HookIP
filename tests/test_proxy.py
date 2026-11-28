@@ -1880,6 +1880,34 @@ def test_relay_initial_down_delivered_and_counted():
     c1.close(); c2.close(); s1.close()
 
 
+# ---- CONNECT/authority host:port parsing --------------------------------
+def test_parse_hostport_shapes():
+    from hookip.proxy import _parse_hostport
+    cases = [
+        (("example.com:443", 443), ("example.com", 443)),
+        (("example.com", 443), ("example.com", 443)),
+        (("[::1]:443", 443), ("::1", 443)),
+        (("[::1]", 443), ("::1", 443)),
+        # the old rpartition made this host '2001:db8:' port 1
+        (("2001:db8::1", 443), ("2001:db8::1", 443)),
+        (("2001:db8::1", 80), ("2001:db8::1", 80)),
+        # non-numeric / out-of-range stay the caller's reject path
+        (("example.com:99999", 443), ("example.com", 99999)),
+        (("example.com:abc", 443), ("example.com", 443)),
+        (("example.com:", 443), ("example.com", 443)),
+        (("http://p:8080", 443), ("http://p:8080", 443)),
+    ]
+    ok = True
+    detail = []
+    for (raw, dflt), want in cases:
+        got = _parse_hostport(raw, dflt)
+        if got != want:
+            ok = False
+            detail.append(f"{raw!r} -> {got!r} (want {want!r})")
+    check("host:port parsing handles brackets/IPv6/no-port", ok,
+          "; ".join(detail))
+
+
 # ---- timeout constants: shrunken per instance in tests, defaults intact --
 def test_hello_timeout_defaults_unchanged():
     """The class-level timeouts exist so tests can shrink them per
@@ -1947,6 +1975,7 @@ if __name__ == "__main__":
     test_upstream_target_shapes()
     test_via_upstream_connect_tail_preserved()
     test_relay_initial_down_delivered_and_counted()
+    test_parse_hostport_shapes()
 
     print()
     print(f"Summary: {sum(1 for _, c in RESULTS if c)}/{len(RESULTS)} passed")

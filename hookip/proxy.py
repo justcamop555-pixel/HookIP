@@ -209,6 +209,24 @@ def _upstream_target(up):
     return host.strip("[]"), (int(port) if port.isdigit() else 8080)
 
 
+def _parse_hostport(s, default_port):
+    """host, port from a CONNECT target or an absolute-URI authority.
+    The old rpartition(':') heuristic mis-parsed an unbracketed IPv6
+    target: '2001:db8::1' became host '2001:db8:' port 1, a connection
+    to nowhere. Bracketed IPv6, host:port, no-port and non-numeric-port
+    forms keep their old behavior (the caller still range-checks the
+    port and rejects it as a malformed request)."""
+    s = str(s or "").strip()
+    if s.startswith("[") and "]" in s:
+        h, _, rest = s.partition("]")
+        ps = rest[1:] if rest.startswith(":") else ""
+        return h[1:], (int(ps) if ps.isdigit() else default_port)
+    if s.count(":") == 1:
+        host, _, ps = s.rpartition(":")
+        return host, (int(ps) if ps.isdigit() else default_port)
+    return s, default_port
+
+
 class ProxyServer:
     """Threaded proxy on 127.0.0.1:<port>."""
 
@@ -636,11 +654,7 @@ class ProxyServer:
 
             if method == "CONNECT":
                 hostport = target
-                if ":" in hostport.rpartition(":")[0] or hostport.count(":") >= 1:
-                    host, _, port_s = hostport.rpartition(":")
-                    port = int(port_s) if port_s.isdigit() else 443
-                else:
-                    host, port = hostport, 443
+                host, port = _parse_hostport(hostport, 443)
                 # 'host:99999' passed isdigit() and later raised
                 # OverflowError deep in a worker thread — validate here,
                 # before anything is opened (stats stay balanced)
@@ -1467,11 +1481,7 @@ class ProxyServer:
             csock.sendall(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n")
             raise ValueError(f"non-absolute URI target: {target[:80]}")
         hostport = rest[1].split("/", 1)[0]
-        if ":" in hostport:
-            host, _, port_s = hostport.rpartition(":")
-            port = int(port_s) if port_s.isdigit() else 80
-        else:
-            host, port = hostport, 80
+        host, port = _parse_hostport(hostport, 80)
         if not 1 <= port <= 65535:
             # before conn_open: stats must stay balanced on the reject path
             raise ValueError("invalid port")
