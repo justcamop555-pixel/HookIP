@@ -291,26 +291,18 @@ class App:
                             pass
                 elif kind == "emergency_done":
                     self._set_running_ui(False)
-                elif kind == "dl_done":
-                    ok = bool(args and args[0])
-                    dest = getattr(self, "_downloaded_path", None)
+                elif kind == "dl_progress":
+                    mb, note = (args + ("",))[:2]
                     try:
-                        if ok and dest and os.path.isfile(dest):
-                            # a verified download turns the button into the
-                            # installer — no more 'close HookIP, find the
-                            # file in Downloads' dance
-                            self._dl_btn.configure(state="normal",
-                                                   text="▶ Install now",
-                                                   command=self._install_downloaded)
-                        else:
-                            self._dl_btn.configure(
-                                state="normal",
-                                text=(f"⬇ Download {self._pending_ver}"
-                                      if getattr(self, "_pending_ver", None)
-                                      else "⬇ Download"),
-                                command=self._download_update)
+                        self._dl_btn.configure(
+                            text=f"downloading… {mb:.1f} MB{(' ' + note) if note else ''}")
                     except tk.TclError:
                         pass
+                elif kind == "dl_done":
+                    self._handle_dl_done(bool(args and args[0]))
+                elif kind == "auto_install":
+                    self._install_downloaded(auto=True)
+
         except queue.Empty:
             pass
         except Exception as exc:  # noqa: BLE001 — never stop the UI pump;
@@ -326,6 +318,35 @@ class App:
             self.root.after(150, self._pump_ui)
         except (tk.TclError, RuntimeError):
             return
+
+    def _handle_dl_done(self, ok):
+        """A download finished: on a verified download the app now updates
+        ITSELF — no manual step, no second app. The running exe is renamed
+        to .old, the new one takes the SAME NAME, HookIP closes fully and
+        a waiter relaunches it (auto-install on a frozen build; the dev
+        python build keeps the manual 'Install now' button)."""
+        self._downloading = False
+        dest = getattr(self, "_downloaded_path", None)
+        try:
+            if ok and dest and os.path.isfile(dest):
+                if getattr(sys, "frozen", False):
+                    self._dl_btn.configure(state="disabled",
+                                           text="installing…")
+                    self._ui_queue.put(("auto_install", ()))
+                else:
+                    self._dl_btn.configure(state="normal",
+                                           text="▶ Install now",
+                                           command=self._install_downloaded)
+            else:
+                self._dl_btn.configure(
+                    state="normal",
+                    text=(f"⬇ Download {self._pending_ver}"
+                          if getattr(self, "_pending_ver", None)
+                          else "⬇ Download"),
+                    command=self._download_update)
+        except tk.TclError:
+            pass
+
 
     def _pump_tray(self):
         try:
@@ -620,6 +641,11 @@ class App:
                        sha_asset=None, prerelease=False, body=None,
                        http_error=None):
         self._update_running = False
+        # a running download OWNS the download button: a concurrent
+        # 'Check for updates' used to rebind it to '⬇ Download' (or hide
+        # it) mid-download — and a second download then corrupted the
+        # first through the same .part file
+        dl_locked = bool(getattr(self, "_downloading", False))
         try:
             if not latest:
                 stamp = time.strftime(" · checked %H:%M")
@@ -645,7 +671,8 @@ class App:
                     self.log.debug("Update check: no reachable release info "
                                    "(private repo).")
                 self.update_pill.configure(text="", fg=MUTED)
-                self._dl_btn.pack_forget()
+                if not dl_locked:
+                    self._dl_btn.pack_forget()
                 # offline is usually transient (or our own tunnel mid-restart)
                 # — re-check in 30 min instead of waiting 12 h (cancels any
                 # pending timer first; this path used to stack timers)
@@ -665,7 +692,8 @@ class App:
                     fg=MUTED)
                 self.update_pill.configure(
                     text=f"✓ v{__version__} — not published yet", fg=MUTED)
-                self._dl_btn.pack_forget()
+                if not dl_locked:
+                    self._dl_btn.pack_forget()
                 self.log.ok(
                     f"Update check: this build (v{__version__}"
                     + (f" build {__build_id__}" if __build_id__ else "")
@@ -681,7 +709,8 @@ class App:
                     text=f"pre-release {latest} exists — stable stays installed",
                     fg=MUTED)
                 self.update_pill.configure(text=f"✓ v{__version__}", fg=MUTED)
-                self._dl_btn.pack_forget()
+                if not dl_locked:
+                    self._dl_btn.pack_forget()
             elif newer:
                 self.update_label.configure(text=f"update available: {latest}", fg=WARN)
                 self.update_pill.configure(text=f"⬆ {latest} — click to update", fg=WARN)
@@ -696,8 +725,10 @@ class App:
                     self._update_sha_url = sha_asset
                     self._update_body = body
                     self._pending_ver = latest
-                    self._dl_btn.configure(text=f"⬇ Download {latest}", state="normal")
-                    self._dl_btn.pack(side="left", padx=(10, 0))
+                    if not dl_locked:
+                        self._dl_btn.configure(text=f"⬇ Download {latest}", state="normal")
+                    if not dl_locked:
+                        self._dl_btn.pack(side="left", padx=(10, 0))
                     self.log.info("A one-click download is available in "
                                   "Settings → Updates.")
                 if getattr(self, "_update_manual", False):
@@ -712,7 +743,8 @@ class App:
             else:
                 self.update_label.configure(text=f"up to date (v{__version__})", fg=OK)
                 self.update_pill.configure(text=f"✓ v{__version__}", fg=MUTED)
-                self._dl_btn.pack_forget()
+                if not dl_locked:
+                    self._dl_btn.pack_forget()
         except (tk.TclError, RuntimeError):
             pass
         # re-check every 12 h so a published update is noticed without a
@@ -723,15 +755,27 @@ class App:
         url = getattr(self, "_update_asset_url", None)
         if not url:
             return
-        self._dl_btn.configure(state="disabled", text="downloading…")
+        if getattr(self, "_downloading", False):
+            self.log.info("A download is already running — it owns the "
+                          "button until it finishes.")
+            return
+        self._downloading = True
+        try:
+            self._dl_btn.configure(state="disabled", text="downloading… 0.0 MB")
+        except tk.TclError:
+            pass
         threading.Thread(target=self._download_worker, args=(url,), daemon=True).start()
+
+    def _dl_progress(self, mb, note=""):
+        """Worker-thread safe: route through the UI queue."""
+        self._ui_queue.put(("dl_progress", (mb, note)))
 
     def _download_worker(self, url):
         import hashlib
         import urllib.request
         import urllib.error
 
-        def fetch(u, timeout=30):
+        def fetch(u, timeout=30, deadline=None, what="asset"):
             # Order: GitHub via system proxy (our own tunnel) → GitHub
             # direct → public mirrors of the same bytes. The asset CDN
             # (objects.githubusercontent.com) is unreachable for some
@@ -741,21 +785,24 @@ class App:
             variants = [u] + [m + u for m in self._DL_MIRRORS]
             last = None
             for u2 in variants:
-                try:
-                    return urllib.request.urlopen(
-                        urllib.request.Request(u2, headers={"User-Agent": "HookIP-updater"}),
-                        timeout=timeout)
-                except (OSError, urllib.error.URLError) as exc:
-                    last = exc
+                if deadline and time.monotonic() > deadline:
+                    break
+                for attempt in (0, 1):     # 0 = via system proxy, 1 = direct
                     try:
-                        opener = urllib.request.build_opener(
-                            urllib.request.ProxyHandler({}))
-                        return opener.open(
-                            urllib.request.Request(u2, headers={"User-Agent": "HookIP-updater"}),
+                        if attempt == 1:
+                            opener = urllib.request.build_opener(
+                                urllib.request.ProxyHandler({}))
+                            return opener.open(
+                                urllib.request.Request(
+                                    u2, headers={"User-Agent": "HookIP-updater"}),
+                                timeout=timeout)
+                        return urllib.request.urlopen(
+                            urllib.request.Request(
+                                u2, headers={"User-Agent": "HookIP-updater"}),
                             timeout=timeout)
-                    except (OSError, urllib.error.URLError) as exc2:
-                        last = exc2
-            raise OSError(f"all download sources failed ({last})")
+                    except (OSError, urllib.error.URLError) as exc:
+                        last = exc
+            raise OSError(f"all download sources failed for {what} ({last})")
 
         def body_sha256():
             """Fallback checksum source: the release notes text the API
@@ -775,20 +822,51 @@ class App:
                     return h.lower()
             return None
 
-        dest_dir = os.path.join(os.path.expanduser("~"), "Downloads")
+        # Destination: the exe's OWN directory when frozen — the install
+        # step then renames the RUNNING exe to .old and takes its exact
+        # name, so the updated app is the SAME FILE the user knows, with
+        # no manual run of a differently named file. (Downloading into
+        # %TEMP%-style dirs or Downloads left a second HookIP install.)
+        frozen = bool(getattr(sys, "frozen", False))
+        dest_dir = (os.path.dirname(os.path.abspath(sys.executable))
+                    if frozen else os.path.join(os.path.expanduser("~"), "Downloads"))
+        dest_name = ("HookIP.exe.new" if frozen else
+                     f"HookIP_{getattr(self, '_pending_ver', 'update').lstrip('v')}.exe")
         tmp = dest = None
         try:
             os.makedirs(dest_dir, exist_ok=True)
-            dest = os.path.join(
-                dest_dir, f"HookIP_{getattr(self, '_pending_ver', 'update').lstrip('v')}.exe")
-            tmp = dest + ".part"   # partial downloads never masquerade as the exe
+            dest = os.path.join(dest_dir, dest_name)
+            # UNIQUE per download: two concurrent downloads used to write
+            # the SAME .part file and corrupt each other
+            tmp = dest + f".part{threading.get_ident()}"
             data = b""
-            with fetch(url) as r:
+            deadline = time.monotonic() + 15 * 60   # overall download budget
+            last_progress = 0.0
+            with fetch(url, timeout=30, deadline=deadline) as r:
+                # read INSIDE the chosen connection with a no-data watchdog:
+                # the socket timeout (30 s) covers a fully stalled read, and
+                # the wall-clock deadline covers a TRICKLING stream that
+                # never EOFs (VM NAT networks do this) — the old loop lived
+                # OUTSIDE the mirror selection, so a bad connection was
+                # stuck forever with no failover and no progress display
+                last_data = time.monotonic()
                 while True:
-                    chunk = r.read(65536)
+                    if time.monotonic() > deadline:
+                        raise OSError("download exceeded the 15-minute budget")
+                    if time.monotonic() - last_data > 45:
+                        raise OSError("no data for 45 s — connection stalled")
+                    try:
+                        chunk = r.read(65536)
+                    except (socket.timeout, TimeoutError) as exc:
+                        raise OSError(f"read timed out (stalled): {exc}") from exc
                     if not chunk:
                         break
                     data += chunk
+                    last_data = time.monotonic()
+                    if len(data) - last_progress >= 1_000_000:
+                        last_progress = len(data)
+                        self._dl_progress(len(data) / 1_000_000)
+            self._dl_progress(len(data) / 1_000_000, "verifying…")
             # verify against a GitHub-published checksum — a corrupted
             # download is deleted, not left behind to be run by mistake.
             # FAIL CLOSED once a checksum is published: if no source can
@@ -801,7 +879,7 @@ class App:
             sha_url = getattr(self, "_update_sha_url", None)
             if sha_url:
                 try:
-                    with fetch(sha_url, timeout=15) as sr:
+                    with fetch(sha_url, timeout=15, what="checksum") as sr:
                         txt = sr.read(512).decode("utf-8", "replace")
                     expected = txt.split()[0].strip().lower() if txt.split() else None
                 except (OSError, urllib.error.URLError):
@@ -842,14 +920,10 @@ class App:
             with open(tmp, "wb") as fh:
                 fh.write(data)
             os.replace(tmp, dest)   # atomic: the exe appears only when complete
+            tmp = None              # moved — nothing to clean up
             self._downloaded_path = dest
             self._downloaded_ok = True
-            self.log.ok(f"Update downloaded to {dest} — press 'Install now' "
-                        "in Settings, or run the file manually.")
-            notify.notify("HookIP update downloaded",
-                          f"Saved to {dest}. Press 'Install now' in the app, "
-                          "or run the new file after closing HookIP.",
-                          timeout_s=12)
+            self.log.ok(f"Update downloaded and verified: {dest}")
             self._ui_queue.put(("dl_done", (True,)))
         except OSError as exc:
             if tmp:
@@ -859,6 +933,19 @@ class App:
                     pass
             self.log.error(f"Update download failed: {exc} — use 'click to "
                            "update' to get it from the Releases page.")
+            notify.notify("HookIP — update download failed",
+                          str(exc)[:140], timeout_s=12)
+            self._ui_queue.put(("dl_done", (False,)))
+        except Exception as exc:  # noqa: BLE001 — a download must never
+                                  # die silently (the button stayed on
+                                  # 'downloading…' forever if it did)
+            if tmp:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+            self.log.error(f"Update download crashed: "
+                           f"{type(exc).__name__}: {exc}")
             self._ui_queue.put(("dl_done", (False,)))
 
     def _update_pill_click(self, _event=None):
@@ -868,25 +955,36 @@ class App:
         else:
             self.check_updates(manual=True)
 
-    def _install_downloaded(self):
-        """One-click install of a verified download: HookIP closes cleanly
-        (proxy stopped, internet restored, settings saved) and the new exe
-        starts ~2 s later — via a detached waiter so it can never race our
-        single-instance mutex."""
+    def _install_downloaded(self, auto=False):
+        """Install a verified download.
+
+        Frozen build: the RUNNING HookIP.exe is renamed to HookIP.exe.old
+        (allowed while running), the verified download takes the SAME
+        NAME, and a detached waiter relaunches HookIP.exe as soon as this
+        process has fully exited (Wait-Process on our real PID — the old
+        fixed `timeout /t 2` raced the single-instance mutex and could
+        bounce the user to 'already running').
+
+        Dev (python) build: the download is its own exe; starting it is
+        the manual path (no renaming of python.exe)."""
         dest = getattr(self, "_downloaded_path", None)
         if not dest or not os.path.isfile(dest):
-            messagebox.showerror(
-                APP_NAME,
-                "The downloaded update file is gone —\n"
-                "download it again from Settings → Updates.")
-            self._dl_btn.configure(text=f"⬇ Download {self._pending_ver}"
-                                   if getattr(self, "_pending_ver", None)
-                                   else "⬇ Download",
-                                   command=self._download_update)
+            if not auto:
+                messagebox.showerror(
+                    APP_NAME,
+                    "The downloaded update file is gone —\n"
+                    "download it again from Settings → Updates.")
+            try:
+                self._dl_btn.configure(
+                    text=f"⬇ Download {self._pending_ver}"
+                    if getattr(self, "_pending_ver", None) else "⬇ Download",
+                    command=self._download_update)
+            except tk.TclError:
+                pass
             return
         if getattr(self, "_installing", False):
             return
-        if not messagebox.askyesno(
+        if not auto and not messagebox.askyesno(
                 APP_NAME,
                 f"Install the downloaded update now?\n\n{dest}\n\n"
                 "HookIP will close, your internet settings will be "
@@ -897,17 +995,75 @@ class App:
             self._dl_btn.configure(state="disabled", text="installing…")
         except tk.TclError:
             pass
+
+        frozen = bool(getattr(sys, "frozen", False))
+        if frozen:
+            # SAME-NAME replace: rename the running exe (Windows allows
+            # renaming a running image), then move the verified download
+            # into its exact name. The user's shortcut, Start-menu pin and
+            # taskbar icon all keep working — nothing else to run.
+            exe = os.path.abspath(sys.executable)
+            old = exe + ".old"
+            try:
+                try:
+                    if os.path.exists(old):
+                        os.remove(old)      # a previous update's leftover
+                except OSError:
+                    pass                    # locked — replace() still works
+                os.replace(exe, old)
+                os.replace(dest, exe)
+            except OSError as exc:
+                self._installing = False
+                # put the RUNNING exe back before giving up — otherwise
+                # HookIP.exe is renamed away and the shortcut breaks
+                try:
+                    if not os.path.exists(exe) and os.path.exists(old):
+                        os.replace(old, exe)
+                except OSError:
+                    pass
+                msg = (f"The update could not be swapped in:\n{exc}\n\n"
+                       "The downloaded file is kept — install it manually "
+                       "from the Releases page.")
+                if auto:
+                    self.log.error(msg.replace("\n", " "))
+                    notify.notify("HookIP — update install failed",
+                                  str(exc)[:140], timeout_s=15)
+                else:
+                    messagebox.showerror(APP_NAME, msg)
+                return
+            exe_dir = os.path.dirname(exe)
+        else:
+            exe_dir = os.path.dirname(dest)
+
+        # detached waiter: waits for THIS process to fully exit (not a
+        # fixed timeout that raced the single-instance mutex), then starts
+        # HookIP.exe from its own directory
+        ps = ("Wait-Process -Id %d -ErrorAction SilentlyContinue; "
+              "Start-Sleep -Milliseconds 500; "
+              "Start-Process -FilePath '%s' -WorkingDirectory '%s'"
+              % (os.getpid(),
+                 (os.path.join(exe_dir, "HookIP.exe") if frozen else dest),
+                 exe_dir))
         try:
             subprocess.Popen(
-                ["cmd", "/c", "timeout", "/t", "2", "/nobreak", ">nul",
-                 "&", "start", "", dest],
+                ["powershell", "-NoProfile", "-STA", "-WindowStyle", "Hidden",
+                 "-ExecutionPolicy", "Bypass", "-Command", ps],
                 creationflags=0x08000000)   # CREATE_NO_WINDOW
         except OSError as exc:
             self._installing = False
-            messagebox.showerror(APP_NAME, f"Could not start the installer:\n{exc}")
+            if auto:
+                self.log.error(f"Could not start the update waiter: {exc}")
+            else:
+                messagebox.showerror(APP_NAME,
+                                     f"Could not start the installer:\n{exc}")
             return
         self.log.ok(f"Installing {os.path.basename(dest)} — HookIP is closing "
-                    "and your internet settings are being restored.")
+                    "and your internet settings are being restored; the new "
+                    "version starts automatically under the same name.")
+        notify.notify("HookIP — updating",
+                      "Closing and restarting with the new version "
+                      "(same name, same place). Your internet settings "
+                      "are restored first.", timeout_s=10)
         try:
             self.root.after(300, self.on_close)
         except (tk.TclError, RuntimeError):
@@ -2702,6 +2858,17 @@ class App:
 
 
 def run():
+    # update leftover cleanup: a completed same-name update leaves the
+    # previous version as HookIP.exe.old — once WE are the new exe and
+    # hold the single-instance mutex, the old file is dead weight
+    if getattr(sys, "frozen", False):
+        try:
+            old = os.path.join(os.path.dirname(os.path.abspath(sys.executable)),
+                               "HookIP.exe.old")
+            if os.path.exists(old):
+                os.remove(old)
+        except OSError:
+            pass                        # locked/AV-scanning — next run
     # Single instance: if another HookIP is running, activate it and exit.
     # None = another instance holds the mutex; False = the mutex could not
     # be created at all (a NULL handle used to be reported as 'already
