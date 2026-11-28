@@ -2372,7 +2372,13 @@ class App:
                     dt = time.time() - t0
                     if rcode == 0 and ips:
                         ok_count += 1
-                        self._diag_result(name, "OK", f"{dt:.2f}s · A records: {', '.join(ips[:2])}", "ok")
+                        # surface the SNI mode: 'ip' = SNI-LESS (validated by
+                        # IP SAN — the DoH bypass-by-name fix), 'host' = the
+                        # resolver's cert had no IP SAN
+                        sni = "SNI-less" if getattr(conn, "validate_by_ip", True) else "SNI sent"
+                        self._diag_result(name, "OK",
+                                          f"{dt:.2f}s · {sni} · A records: {', '.join(ips[:2])}",
+                                          "ok")
                     else:
                         self._diag_result(name, "WARN", f"{dt:.2f}s · rcode={rcode}", "warn")
                 finally:

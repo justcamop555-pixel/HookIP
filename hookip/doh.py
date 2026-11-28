@@ -107,6 +107,7 @@ class _DoHConn:
                  validate_by_ip=True):
         self.ip = ip
         self.host = host
+        self.validate_by_ip = validate_by_ip   # True = SNI-LESS (IP-SAN)
         self.sock = socket.create_connection((ip, 443), timeout=timeout)
         self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self.sock.settimeout(timeout)
@@ -322,6 +323,9 @@ class Resolver:
         self._pool = {}                       # resolver name -> [_DoHConn, ...]
         self._sni_mode = {}                   # resolver -> 'ip' | 'host'
         self._last_plain_warn = 0.0           # throttles the DoH-fallback warn
+        # how long past its expiry a cached DoH answer may be served as
+        # stale when every resolver path fails (RFC 8767-style)
+        self._STALE_MAX = 600
         self._pool_lock = threading.Lock()
         self._pool_max = profile().doh_pool_per_resolver  # hardware-scaled
         self._pending = {}                    # resolver -> conns being created
@@ -630,6 +634,27 @@ class Resolver:
                         neg_ttl = 60
                     with self._lock:
                         self._neg_cache[host] = (now + neg_ttl, reason)
+            if not ips:
+                # SERVE-STALE (RFC 8767 flavored): every path failed, but if
+                # a recently-expired DoH answer is still within the
+                # staleness window, serve it briefly instead of falling to
+                # plaintext. The last authenticated answer beats a fresh
+                # forged one — and on flapping DoH the site keeps working.
+                stale = None
+                if self.cfg.doh_enabled:
+                    with self._lock:
+                        entry = self._cache.get(host)
+                        if entry and now < entry[0] + self._STALE_MAX:
+                            stale = entry
+                if stale:
+                    ips = list(stale[1])
+                    ttl = 30      # brief — the resolver retries DoH soon
+                    with self._lock:
+                        self._neg_cache.pop(host, None)
+                        self._cache[host] = (now + ttl, ips)
+                    self.log.warn(
+                        f"DoH unreachable — serving the STALE cached answer "
+                        f"for {host} (ttl {ttl}s); plaintext fallback skipped")
             if not ips:
                 raise ResolveError(reason if reason.startswith("no addresses for ")
                                    else f"no addresses for {host} ({reason})")

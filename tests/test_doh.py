@@ -760,6 +760,50 @@ def test_udp_verification():
 
 
 # ---- 9. _start_idx guarded / is_sinkhole uses module socket -----------
+def test_serve_stale_on_doh_outage():
+    """Serve-stale (RFC 8767 flavored): when every resolver path fails but a
+    recently-expired cached answer is still inside the staleness window,
+    it is served briefly (ttl 30) instead of falling to plaintext. Far-out
+    entries and doh-off sessions still fail normally."""
+    r = make_resolver(pool_max=2)
+    now = time.time()
+    r._via_doh = lambda h, q: ([], 120, "error: all failed")
+    r._via_tcp_dns = lambda *a, **k: ([], 0)
+    r._via_udp_dns = lambda *a, **k: ([], 0)
+    r._via_system = lambda *a, **k: ([], 0)
+
+    # inside the window: stale served, neg-cache cleared, warn logged
+    r._cache["stale.host.name"] = (now - 60, ["5.5.5.5"])
+    ips = r.resolve("stale.host.name")
+    warns = [m for (lvl, m) in r.log.lines if lvl == "warn"]
+    check("stale DoH answer served on total outage",
+          ips == ["5.5.5.5"] and any("STALE" in w for w in warns),
+          f"ips={ips} warns={len(warns)}")
+    check("stale served with a short ttl (retry DoH soon)",
+          abs(r._cache["stale.host.name"][0] - (now + 30)) < 5,
+          str(r._cache.get("stale.host.name")))
+
+    # beyond the staleness window: still a hard failure
+    r._cache.clear(); r._neg_cache.clear(); r.log.lines.clear()
+    r._cache["old.host.name"] = (now - 7000, ["6.6.6.6"])
+    try:
+        r.resolve("old.host.name")
+        check("too-old stale answer refused", False, "served stale anyway")
+    except ResolveError as exc:
+        check("too-old stale answer refused", "no addresses" in str(exc),
+              str(exc)[:70])
+
+    # secure DNS off: no serve-stale (plaintext IS the configured path)
+    r.cfg.doh_enabled = False
+    r._cache.clear(); r._neg_cache.clear(); r.log.lines.clear()
+    r._cache["off.host.name"] = (now - 60, ["7.7.7.7"])
+    try:
+        r.resolve("off.host.name")
+        check("doh disabled -> no serve-stale", False, "served")
+    except ResolveError:
+        check("doh disabled -> no serve-stale", True)
+
+
 def test_private_ip_poisoning_guard():
     """Plaintext answers (TCP/UDP/system) for a PUBLIC hostname that point
     into a PRIVATE range are dropped — DNS rebinding/poisoning/captive
@@ -893,6 +937,7 @@ if __name__ == "__main__":
     test_sinkhole_only_answer_raises()
     test_hedge_thread_start_failure_degrades()
     test_private_ip_poisoning_guard()
+    test_serve_stale_on_doh_outage()
 
     print()
     print(f"Summary: {sum(1 for _, c in RESULTS if c)}/{len(RESULTS)} passed")
