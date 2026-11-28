@@ -501,5 +501,32 @@ finally:
 check("tray thread stops cleanly (no leaked message loop)",
       not _t._thread.is_alive())
 
+
+
+# ---- per-domain exclusions: _parse_excluded normalization --------------
+class _FakeText:
+    def __init__(self, content): self._c = content
+    def get(self, _a, _b): return self._c
+    def delete(self, *a): pass
+    def insert(self, *a): pass
+
+fakeapp = make_app()
+fakeapp.excl_text = _FakeText(chr(10).join([
+    "https://Bank.example.com:8080/login",
+    "  Example.com  ",
+    "# a comment",
+    "vpn.corp.example.",
+    "[::1]:443",
+    "bücher.de"]))
+parsed = appmod.App._parse_excluded(fakeapp)
+check("pasted URL + :port stripped to the bare domain",
+      parsed.count("bank.example.com") == 1, str(parsed))
+check("deduped and lowercased",
+      parsed == ["bank.example.com", "example.com", "vpn.corp.example",
+                 "::1", "bücher.de"], str(parsed))
+check("trailing dot stripped, comment dropped",
+      "vpn.corp.example" in parsed and
+      not any(x.startswith("#") for x in parsed))
+
 print(f"Summary: {sum(1 for _, c in RESULTS if c)}/{len(RESULTS)} passed")
 sys.exit(0 if all(c for _, c in RESULTS) else 1)

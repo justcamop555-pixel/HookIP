@@ -417,16 +417,56 @@ def restore_from_file(path=None):
     return True
 
 
+def _norm_override_pattern(p):
+    """bypass-pattern normalization — the SAME form the browser sends and
+    the tunnel side compares (proxy._norm_domain semantics, kept local to
+    avoid a circular import):
+      - trimmed/lowered, trailing dot AND a trailing :port stripped
+        (a pasted 'https://host:8080/x' used to leave 'host:8080' —
+        which never matched anything in WinINET, the PAC or the tunnel)
+      - IDN labels in punycode (WinINET compares the punycode wire form;
+        a Unicode pattern like 'bücher.de' used to never match)
+      - [::1]:8080 bracket form -> ::1 (the built-in local rules cover it)
+    """
+    p = str(p).strip().lower()
+    if re.match(r"^[a-z0-9+.-]+://", p):
+        p = re.sub(r"^[a-z0-9+.-]+://", "", p)   # pasted URL -> its host
+    p = p.split("/")[0].split("?")[0].split("@")[-1].rstrip(".")
+    if not p:
+        return p
+    if p.startswith("[") and "]" in p:
+        p = p[1:].split("]")[0]
+    elif p.count(":") == 1 and p.split(":", 1)[1].isdigit():
+        p = p.split(":", 1)[0]
+    if any(ord(c) > 127 for c in p):
+        try:
+            p = ".".join(
+                l if (not l or l.startswith("*"))
+                else l.encode("idna").decode("ascii")
+                for l in p.split("."))
+        except (UnicodeError, OSError):
+            pass
+    return p
+
+
 def bypass_patterns(excluded):
     """Translate HookIP excluded patterns into WinINET ProxyOverride
-    entries: bare dotted domains match both the domain and its subdomains."""
+    entries: bare dotted domains match both the domain and its subdomains;
+    '*.example.com' ALSO emits the bare domain (the PAC and the tunnel
+    side both match it — the ProxyOverride did not, so manual mode sent
+    the bare domain through HookIP while PAC mode bypassed it)."""
     parts = []
+    seen = set()
     for p in (excluded or []):
-        p = str(p).strip().lower().rstrip(".")
+        p = _norm_override_pattern(p)
         if not p or p.startswith("#") or "/" in p:
             continue
+        if p in seen:
+            continue        # 'example.com' and 'example.com:8080' normalize
+        seen.add(p)         # to the same entry — keep the list unique
         if p.startswith("*."):
             parts.append(p)
+            parts.append(p[2:])           # bare domain (PAC/tunnel parity)
         elif "." in p and not p.replace(".", "").isdigit():
             parts.append(p)
             parts.append(f"*.{p}")

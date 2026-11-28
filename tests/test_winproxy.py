@@ -364,6 +364,32 @@ finally:
     import shutil as _sh6
     _sh6.rmtree(d, ignore_errors=True)
 
+# ---- bypass_patterns: WinINET ProxyOverride translation ----------------
+_bp = wpx.bypass_patterns([
+    "example.com", "*.flag.com", "bücher.de", "example.com:8080",
+    "https://pasted.example.org/path", "localhost", "intranet",
+    "192.168.1.5", "  ", "#comment", "with/slash", "*.", 192.168])
+check("bare dotted domain emits domain + subdomains",
+      _bp.count("example.com") >= 1 and "*.example.com" in _bp)
+check("*.x also emits the bare domain (PAC/tunnel parity)",
+      "*.flag.com" in _bp and "flag.com" in _bp)
+check("IDN pattern is punycoded for WinINET",
+      "xn--bcher-kva.de" in _bp and "bücher.de" not in str(_bp))
+check(":port stripped from the pattern",
+      _bp.count("example.com:8080") == 0)
+check("pasted URL stripped to the bare domain",
+      "pasted.example.org" in _bp and
+      not any("https" in x or "/" in x for x in _bp))
+check("single-label and IP forms pass through",
+      "intranet" in _bp and "localhost" in _bp and "192.168.1.5" in _bp)
+check("junk filtered (empty, comment, slash, comment-wildcard)",
+      "" not in _bp and not any(x.startswith("#") for x in _bp) and
+      not any("/" in x for x in _bp) and "*." not in _bp)
+check("no duplicate entries after *.x expansion",
+      len(_bp) == len(set(_bp)), str(_bp))
+check("non-string entries coerced safely",
+      "192.168" in _bp)
+
 # FINAL CANARY: the machine's real proxy settings must be byte-identical
 # to the baseline taken at import. If any test (present or FUTURE) leaks a
 # write through an unpatched _write/_write_raw/apply_*, this fails loudly

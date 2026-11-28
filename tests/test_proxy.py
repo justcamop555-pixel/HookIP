@@ -1064,6 +1064,31 @@ def test_exclusion_matching():
     check("case normalized", is_excluded("EXAMPLE.COM", ex))
 
 
+def test_exclusion_port_and_injection():
+    """A pasted 'https://host:8080/x' used to leave ':8080' in the
+    pattern (matching nothing anywhere); the PAC guard now also drops
+    patterns containing a single quote or backslash (PAC script break)."""
+    ex = ["example.com:8080", "[::1]:443", "it's.bad.test"]
+    check("dotted pattern with :port matches the bare domain",
+          is_excluded("example.com", ex) and
+          is_excluded("sub.example.com", ex))
+    check("bracket form with port normalizes to the bare host",
+          is_excluded("::1", ex))
+    # the TUNNEL side may match a quote-host via fnmatch (harmless — no
+    # JS there); what must never happen is the PAC breaking on it
+    check("lookalike without the quote is NOT excluded",
+          not is_excluded("its.bad.test", ex))
+    ps = make_server(port=9411)
+    pac = get_pac(ps, ex)
+    check("PAC omits the quote-bearing pattern entirely",
+          "it's.bad.test" not in pac and "bad.test" not in pac.split("DIRECT")[0]
+          or "it's" not in pac, pac[:0])
+    check("PAC keeps the port-stripped domain rule",
+          "host == 'example.com'" in pac and "example.com:8080" not in pac)
+    check("PAC survives quote-bearing exclusions (script still closed)",
+          pac.rstrip().endswith("}"))
+
+
 def test_recent_fail_cleared_on_success():
     """A host that failed everything gets a 60 s single-attempt cap — but
     the FIRST SUCCESS must clear it instantly, so recovery is immediate
@@ -1814,6 +1839,7 @@ if __name__ == "__main__":
     test_bind_error_messages()
     test_recent_fail_cleared_on_success()
     test_exclusion_matching()
+    test_exclusion_port_and_injection()
     test_post_body_bare_lf_intact()
     test_handle_canonicalizes_only_complete_heads()
     test_stop_does_no_disk_io()

@@ -544,6 +544,13 @@ class App:
                 continue
             ln = re.sub(r"^[a-z0-9+.-]+://", "", ln)      # strip scheme
             ln = ln.split("/")[0].split("?")[0].split("@")[-1]
+            # a pasted 'https://host:8080/x' used to keep ':8080' — a
+            # pattern that never matched the domain anywhere (exclusions
+            # are domain-scoped; PAC and WinINET have no port concept)
+            if ln.startswith("[") and "]" in ln:
+                ln = ln[1:].split("]")[0]
+            elif ln.count(":") == 1 and ln.split(":", 1)[1].isdigit():
+                ln = ln.split(":", 1)[0]
             ln = ln.strip(". ")                            # stray dots
             if ln and ln not in seen:
                 seen.add(ln)

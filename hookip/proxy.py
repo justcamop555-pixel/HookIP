@@ -121,9 +121,15 @@ class Stats:
 
 def _norm_domain(s):
     """Comparable domain form: trimmed, lowercased, no trailing dot,
-    IDN labels in punycode (the wire form) so 'bücher.com' can match the
-    punycode hostname that arrives in CONNECT targets."""
+    no trailing :port (a pasted 'https://host:8080/x' pattern used to
+    keep the port and never match), IDN labels in punycode (the wire
+    form) so 'bücher.com' can match the punycode hostname that arrives
+    in CONNECT targets."""
     s = (s or "").strip().lower().rstrip(".")
+    if s.startswith("[") and "]" in s:
+        s = s[1:].split("]")[0]
+    elif s.count(":") == 1 and s.split(":", 1)[1].isdigit():
+        s = s.split(":", 1)[0]
     if any(ord(c) > 127 for c in s):
         try:
             s = ".".join(
@@ -791,10 +797,13 @@ class ProxyServer:
         net_up = str(getattr(self.cfg, "upstream_proxy", "") or "").strip()
         for pat in (() if net_up else (self.cfg.excluded or [])):
             raw = str(pat).strip().lower()
-            # a control character or a double quote in a hand-edited
-            # pattern BREAKS the PAC script — the browser then goes DIRECT
-            # silently for everything. Skip those patterns.
-            if any(ord(c) < 0x20 or ord(c) == 0x7f for c in raw) or '"' in raw:
+            # a control character, a double quote, a single quote or a
+            # backslash in a hand-edited pattern BREAKS the PAC script —
+            # the browser then goes DIRECT silently for everything. Skip
+            # those patterns (the single quote sits inside a JS single-
+            # quoted string; a backslash can escape it).
+            if any(ord(c) < 0x20 or ord(c) == 0x7f for c in raw) \
+                    or '"' in raw or "'" in raw or "\\" in raw:
                 continue
             # punycode IDN patterns like the tunnel side (is_excluded uses
             # _norm_domain too — both sides must compare the same form)
@@ -803,6 +812,8 @@ class ProxyServer:
                 continue
             if pat.startswith("*."):
                 host = pat[2:]
+                if not host:
+                    continue               # bare '*.' would match nothing
                 rules.append(f"shExpMatch(host, '*.{host}')")
                 rules.append(f"host == '{host}'")   # bare domain too
             elif "*" in pat or "?" in pat:
