@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from hookip import proxy as proxymod  # noqa: E402
 from hookip.proxy import (ProxyServer, Stats, DpiReset, UpstreamDied,  # noqa: E402
-                          ClientAbortError)
+                          ClientAbortError, is_excluded)
 from hookip.doh import ResolveError  # noqa: E402
 
 RESULTS = []
@@ -849,6 +849,37 @@ def test_flap_retry_time_budget():
           and calls == ["smart"], f"calls={calls} err={result.get('err')}")
 
 
+def test_exclusion_matching():
+    """Exclusions must behave the SAME in the tunnel as the served PAC does:
+    bare dotted domains cover their subdomains, '*.x' covers the bare
+    domain too, IDN patterns match punycode hosts, and 'notexample.com'
+    never matches 'example.com'."""
+    ex = ["example.com", "*.flag.com", "wild*.com", "bücher.com"]
+    check("bare domain itself", is_excluded("example.com", ex))
+    check("bare domain subdomain (PAC parity)",
+          is_excluded("sub.example.com", ex))
+    check("deep subdomain", is_excluded("a.b.example.com", ex))
+    check("unrelated lookalike NOT excluded",
+          not is_excluded("notexample.com", ex))
+    check("suffix-in-hostname NOT excluded",
+          not is_excluded("example.com.evil.test", ex))
+    check("*.x matches subdomain", is_excluded("www.flag.com", ex))
+    check("*.x matches bare domain (PAC parity)",
+          is_excluded("flag.com", ex))
+    check("*.x does not match lookalike",
+          not is_excluded("xflag.com", ex))
+    check("wildcard pattern still works", is_excluded("wildcat.com", ex))
+    check("IDN pattern matches punycode host",
+          is_excluded("xn--bcher-kva.com", ex))
+    check("IDN pattern matches unicode host",
+          is_excluded("bücher.com", ex))
+    check("trailing dot normalized",
+          is_excluded("example.com.", ex) and is_excluded("example.com", ["example.com."]))
+    check("empty/whitespace patterns ignored",
+          not is_excluded("example.com", ["", "  "]))
+    check("case normalized", is_excluded("EXAMPLE.COM", ex))
+
+
 def test_recent_fail_cleared_on_success():
     """A host that failed everything gets a 60 s single-attempt cap — but
     the FIRST SUCCESS must clear it instantly, so recovery is immediate
@@ -1021,6 +1052,7 @@ if __name__ == "__main__":
     test_flap_retry_time_budget()
     test_bind_error_messages()
     test_recent_fail_cleared_on_success()
+    test_exclusion_matching()
 
     print()
     print(f"Summary: {sum(1 for _, c in RESULTS if c)}/{len(RESULTS)} passed")

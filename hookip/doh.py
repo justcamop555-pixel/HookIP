@@ -1,6 +1,7 @@
 """DNS resolution: DNS-over-HTTPS with a hand-driven, fragmented TLS
 handshake (so DoH itself cannot be SNI-blocked), falling back to
 DNS-over-TCP, DNS-over-UDP and finally the system resolver."""
+import ipaddress
 import socket
 import ssl
 import struct
@@ -52,6 +53,44 @@ def is_sinkhole(ip):
 
 class ResolveError(Exception):
     pass
+
+
+_PRIVATE_SUFFIXES = (".local", ".lan", ".home", ".internal", ".corp",
+                     ".intranet", ".localdomain", ".private", ".test",
+                     ".example", ".invalid", ".localhost")
+
+
+def _is_private_ip(ip):
+    """True for loopback/link-local/private/CGNAT/ULA/reserved addresses —
+    ranges a PUBLIC hostname should never legitimately point at in a
+    plaintext answer. Handles IPv4-mapped IPv6 forms."""
+    try:
+        a = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    if isinstance(a, ipaddress.IPv6Address) and a.ipv4_mapped:
+        a = a.ipv4_mapped
+    cgnat = (isinstance(a, ipaddress.IPv4Address)
+             and a in ipaddress.ip_network("100.64.0.0/10"))
+    return (not a.is_global) or cgnat
+
+
+def _public_hostname(host, excluded=()):
+    """False for names that plausibly live on a LAN and may legitimately
+    resolve to private addresses: single-label, private-ish suffixes,
+    reserved names, or user-excluded domains."""
+    h = host.strip("[]").lower().rstrip(".")
+    if not h or "." not in h or h == "localhost":
+        return False
+    if h.endswith(_PRIVATE_SUFFIXES):
+        return False
+    try:
+        from .proxy import is_excluded
+        if is_excluded(h, excluded or ()):
+            return False
+    except Exception:
+        pass
+    return True
 
 
 class VerifiedNegative(ResolveError):
@@ -592,6 +631,35 @@ class Resolver:
             if not ips:
                 raise ResolveError(reason if reason.startswith("no addresses for ")
                                    else f"no addresses for {host} ({reason})")
+
+        # ANTI-REBINDING / POISONING GUARD: a PLAINTEXT answer (TCP/UDP/
+        # system — every path an on-path attacker can forge) for a
+        # public-looking hostname that points into a PRIVATE range is
+        # almost certainly an attack: DNS rebinding, a poisoned record, or
+        # a captive portal hijacking the name. DoH answers are TLS-
+        # authenticated and cannot be forged on path, so this guard
+        # applies to the plaintext fallbacks only. LAN-plausible names
+        # (single-label, .local/.lan style, excluded domains) keep their
+        # private answers.
+        if (source not in ("doh", None) and self.cfg.doh_enabled
+                and ips and _public_hostname(host, getattr(self.cfg, "excluded", ()) or ())):
+            priv = [ip for ip in ips if _is_private_ip(ip)]
+            if priv and len(priv) == len(ips):
+                with self._lock:
+                    self._neg_cache[host] = (
+                        now + 120,
+                        "plaintext answer pointed into a private range "
+                        "(possible poisoning)")
+                raise ResolveError(
+                    f"no addresses for {host} (plaintext {source.upper()} "
+                    "DNS answered with private-range address(es) — dropped "
+                    "as possible DNS rebinding/poisoning)")
+            if priv:
+                ips = [ip for ip in ips if not _is_private_ip(ip)]
+                self.log.warn(
+                    f"plaintext {source.upper()} DNS answered {host} with "
+                    f"{len(priv)} private-range address(es) — dropped as "
+                    "possible DNS rebinding/poisoning")
 
         blocked = [ip for ip in ips if is_sinkhole(ip)]
         if blocked:

@@ -760,6 +760,69 @@ def test_udp_verification():
 
 
 # ---- 9. _start_idx guarded / is_sinkhole uses module socket -----------
+def test_private_ip_poisoning_guard():
+    """Plaintext answers (TCP/UDP/system) for a PUBLIC hostname that point
+    into a PRIVATE range are dropped — DNS rebinding/poisoning/captive
+    portal. DoH answers are TLS-authenticated and are never filtered this
+    way; LAN-plausible names (single-label, .local style, excluded
+    domains) keep their private answers."""
+    def chain(doh_result, tcp_result):
+        r = make_resolver(pool_max=2)
+        r.cfg.excluded = ["intranet.corp.local"]
+        r._via_doh = lambda host, qtype: doh_result
+        r._via_tcp_dns = lambda *a, **k: tcp_result
+        r._via_udp_dns = lambda *a, **k: ([], 0)
+        r._via_system = lambda *a, **k: ([], 0)
+        r._cache.clear(); r._neg_cache.clear()
+        return r
+
+    # plaintext TCP answers a public domain with a private IP -> refused
+    r = chain(([], 120, "error: doh down"), (["10.0.0.5"], 60))
+    try:
+        r.resolve("rebind.host.name")
+        check("private-range plaintext answer refused", False, "no raise")
+    except ResolveError as exc:
+        check("private-range plaintext answer refused",
+              "private-range" in str(exc) and "rebinding" in str(exc),
+              str(exc)[:90])
+
+    # the SAME answer over DoH is trusted (TLS-authenticated)
+    r2 = chain((["10.0.0.5"], 120, "ok (rcode 0)"), (["10.0.0.5"], 60))
+    ips = r2.resolve("rebind.host.name")
+    check("DoH answers are NOT private-filtered", ips == ["10.0.0.5"], str(ips))
+
+    # a .local name through plaintext keeps its private answer
+    r3 = chain(([], 120, "error: doh down"), (["192.168.1.10"], 60))
+    ips = r3.resolve("printer.local")
+    check(".local hostname keeps private answer", ips == ["192.168.1.10"], str(ips))
+
+    # a user-excluded domain keeps private answers
+    r4 = chain(([], 120, "error: doh down"), (["192.168.1.20"], 60))
+    r4.cfg.excluded = ["nas.home.internal"]
+    ips = r4.resolve("nas.home.internal")
+    check("excluded domain keeps private answer", ips == ["192.168.1.20"], str(ips))
+
+    # mixed public+private plaintext answer: public kept, private dropped
+    r5 = chain(([], 120, "error: doh down"), (["93.184.216.34", "192.168.0.1"], 60))
+    ips = r5.resolve("mixed.host.name")
+    check("mixed answer keeps only the public address",
+          ips == ["93.184.216.34"], str(ips))
+
+    # IPv4-mapped IPv6 private form is caught too
+    r6 = chain(([], 120, "error: doh down"), (["::ffff:10.0.0.9"], 60))
+    try:
+        r6.resolve("mapped.host.name")
+        check("v4-mapped v6 private form refused", False, "no raise")
+    except ResolveError as exc:
+        check("v4-mapped v6 private form refused", "private-range" in str(exc))
+
+    check("_is_private_ip sanity",
+          dohmod._is_private_ip("10.1.2.3") and dohmod._is_private_ip("100.64.0.1")
+          and dohmod._is_private_ip("::ffff:10.0.0.9") and dohmod._is_private_ip("fe80::1")
+          and not dohmod._is_private_ip("93.184.216.34")
+          and not dohmod._is_private_ip("not-an-ip"))
+
+
 def test_hedge_thread_start_failure_degrades():
     """Thread.start() failing (thread budget exhausted on a loaded low-end
     machine) must not lose the lookup — the attempt runs inline."""
@@ -829,6 +892,7 @@ if __name__ == "__main__":
     test_plain_fallback_warn_throttled()
     test_sinkhole_only_answer_raises()
     test_hedge_thread_start_failure_degrades()
+    test_private_ip_poisoning_guard()
 
     print()
     print(f"Summary: {sum(1 for _, c in RESULTS if c)}/{len(RESULTS)} passed")

@@ -114,14 +114,53 @@ class Stats:
             self._t = time.time()
 
 
+def _norm_domain(s):
+    """Comparable domain form: trimmed, lowercased, no trailing dot,
+    IDN labels in punycode (the wire form) so 'bücher.com' can match the
+    punycode hostname that arrives in CONNECT targets."""
+    s = (s or "").strip().lower().rstrip(".")
+    if any(ord(c) > 127 for c in s):
+        try:
+            s = ".".join(
+                l if (not l or l.startswith("*"))
+                else l.encode("idna").decode("ascii")
+                for l in s.split("."))
+        except (UnicodeError, OSError):
+            pass
+    return s
+
+
 def is_excluded(host, patterns):
-    host = host.lower().strip()
+    """User exclusions — the tunnel-side match, ALIGNED with the served PAC
+    (which emits both the bare domain and a subdomain rule):
+
+      'example.com'    -> the domain itself AND every subdomain. The old
+                          fnmatch-only check caught ONLY the bare domain,
+                          so one exclusion behaved differently in manual
+                          vs PAC mode (the tunnel ignored what the PAC
+                          bypassed, and vice versa).
+      '*.example.com'  -> subdomains AND the bare domain (fnmatch's '*.x'
+                          cannot match the bare form — the PAC emits both;
+                          now the tunnel does too).
+      wildcard patterns-> fnmatch semantics as before.
+
+    'notexample.com' still never matches 'example.com'. Case and trailing
+    dots are normalized; IDN patterns are compared in punycode."""
+    h = _norm_domain(host)
     for pat in patterns:
-        pat = pat.strip().lower()
-        if not pat:
+        p = _norm_domain(pat)
+        if not p:
             continue
-        if fnmatch.fnmatch(host, pat) or fnmatch.fnmatch(host + ".", pat + "."):
+        if fnmatch.fnmatch(h, p):
             return True
+        if p.startswith("*."):
+            base = p[2:]
+            if h == base or h.endswith("." + base):
+                return True
+        elif "." in p and "*" not in p and "?" not in p:
+            # bare dotted domain: every subdomain too (PAC parity)
+            if h.endswith("." + p):
+                return True
     return False
 
 
