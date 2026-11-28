@@ -116,8 +116,12 @@ def _load_app_icon():
                  os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               "hookip.ico")]
         if getattr(sys, "frozen", False):
-            paths.insert(0, os.path.join(sys._MEIPASS, "hookip.ico"))
-            paths.insert(0, os.path.join(sys._MEIPASS, "assets", "hookip.ico"))
+            # PyInstaller sets _MEIPASS on frozen runs; getattr so static
+            # analysis (and a hypothetical frozen build without it) is safe
+            meipass = getattr(sys, "_MEIPASS", "")
+            if meipass:
+                paths.insert(0, os.path.join(meipass, "hookip.ico"))
+                paths.insert(0, os.path.join(meipass, "assets", "hookip.ico"))
         for p in paths:
             IMAGE_ICON, LR_LOADFROMFILE = 1, 0x0010
             _user32.LoadImageW.restype = wintypes.HANDLE

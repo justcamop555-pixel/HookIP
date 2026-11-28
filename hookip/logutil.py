@@ -89,6 +89,9 @@ class Log:
                     old.close()
                 except OSError:
                     pass
+            fh = None                 # pre-set so the except block can
+                                      # tell 'open() failed' from 'write
+                                      # failed' without UnboundLocalError
             try:
                 if path.endswith(".log"):
                     path = path[:-4] + ".hlog"
@@ -103,10 +106,13 @@ class Log:
             except Exception as exc:   # noqa: BLE001 — the sink must never
                                        # crash the caller (a UnicodeError
                                        # from the header used to escape)
-                try:
-                    fh.close()
-                except (OSError, NameError, UnboundLocalError):
-                    pass
+                # fh is the pre-set None when open() itself failed (the
+                # old bare fh reference relied on UnboundLocalError)
+                if fh:
+                    try:
+                        fh.close()
+                    except OSError:
+                        pass
                 # a silent failure used to leave the UI claiming a session
                 # file that does not exist; remember it so the app can say so
                 if not self.file_error:

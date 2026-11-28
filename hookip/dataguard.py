@@ -712,8 +712,12 @@ def _has_marker(lines, src_sha):
         # is_marker(v) implies v is a plain str (UNREADABLE/None are
         # falsy/non-str) — but proving that to a checker needs the str
         # test spelled out here too
-        if isinstance(v, str) and is_marker(v) and                 _MARKER_RE.match(v.strip()).group(1) == src_sha:
-            return True
+        if isinstance(v, str) and is_marker(v):
+            # is_marker(v) implies v.strip() matches, but spell the match
+            # result out for the checker (match() can return None)
+            m = _MARKER_RE.match(v.strip())
+            if m is not None and m.group(1) == src_sha:
+                return True
     return False
 
 

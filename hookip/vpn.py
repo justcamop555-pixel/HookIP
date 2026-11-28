@@ -32,7 +32,9 @@ CREATE_NO_WINDOW = 0x08000000
 _CACHE_OK = 300.0            # a CONFIDENT answer is trusted for 5 minutes
 _CACHE_FAIL = 20.0           # a transient failure is retried quickly
 _cache_lock = threading.Lock()
-_cache = None                # (state, monotonic-at, ttl)
+# (state, monotonic-at, ttl) — annotated so the Optional-tuple shape is
+# declared, not inferred assignment-by-assignment
+_cache: tuple[dict | None, float, float] | None = None
 _last = None                 # most recent answer, however stale (peek)
 _probe_lock = threading.Lock()   # ONE in-flight probe; others wait
 
