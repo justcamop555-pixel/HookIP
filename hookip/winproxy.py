@@ -196,12 +196,13 @@ def backup():
     # hostnames. In plaintext this file was the single most profile-able
     # object HookIP wrote.
     from . import dataguard
-    blob = dataguard.encrypt_bytes(json.dumps(cur).encode("utf-8"))
     # atomic write: a crash mid-write must not leave a truncated HKCFG1:
     # file that restore_from_file would (correctly) refuse — losing the
     # backup means losing the user's original proxy config
-    tmp = BACKUP_PATH + f".{threading.get_ident()}.tmp"
+    tmp = None
     try:
+        blob = dataguard.encrypt_bytes(json.dumps(cur).encode("utf-8"))
+        tmp = BACKUP_PATH + f".{threading.get_ident()}.tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
             fh.write(blob)
             fh.flush()
@@ -209,7 +210,7 @@ def backup():
         os.replace(tmp, BACKUP_PATH)
     except OSError:
         try:
-            if os.path.exists(tmp):
+            if tmp and os.path.exists(tmp):
                 os.remove(tmp)
         except OSError:
             pass

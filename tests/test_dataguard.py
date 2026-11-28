@@ -617,6 +617,44 @@ try:
           d)
 
     c = _Cfg({"log_retention_days": "bogus"})
+
+    # 7. save() must never raise — the except-cleanup used to hit a
+    # NameError when os.makedirs failed before `tmp` was assigned
+    from unittest import mock as _mock
+    from hookip import config as _config
+    c3 = _Cfg()
+    with _mock.patch.object(_config.os, "makedirs",
+                            lambda *a, **k: (_ for _ in ()).throw(OSError("disk full"))):
+        raised = False
+        try:
+            c3.save()
+        except Exception as exc:  # noqa: BLE001
+            raised = True
+            print("   save raised:", type(exc).__name__, exc)
+    check("Config.save swallows an early makedirs failure (no NameError)",
+          not raised)
+
+    # 8. winproxy.backup same pattern: a failing encrypt must not raise
+    # out of backup() and must not leave a half-written temp file
+    import tempfile as _tf
+    d_bp = _tf.mkdtemp()
+    try:
+        with _mock.patch.object(_wpx, "BACKUP_PATH",
+                                os.path.join(d_bp, "proxy_backup.json")), \
+             _mock.patch.object(_wpx, "_write_restore_cmd", lambda vals: None), \
+             _mock.patch.object(dg, "encrypt_bytes",
+                                lambda data: (_ for _ in ()).throw(OSError("dpapi down"))):
+            raised = False
+            try:
+                _wpx.backup()
+            except Exception as exc:  # noqa: BLE001
+                raised = True
+                print("   backup raised:", type(exc).__name__, exc)
+        check("winproxy.backup swallows a failing encrypt (no NameError)",
+              not raised and not [n for n in os.listdir(d_bp) if ".tmp" in n],
+              str(os.listdir(d_bp)))
+    finally:
+        shutil.rmtree(d_bp, ignore_errors=True)
     check("config: bogus retention falls back to default",
           c.log_retention_days == _Cfg().log_retention_days,
           str(c.log_retention_days))

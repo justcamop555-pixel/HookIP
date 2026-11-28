@@ -52,7 +52,12 @@ $xml.LoadXml('<toast activationType="protocol" launch="hookip:show" scenario="de
 $toast = New-Object Windows.UI.Notifications.ToastNotification $xml
 [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('HookIP.Desktop').Show($toast)
 """
-        path = os.path.join(tempfile.gettempdir(), f"hookip_toast_{os.getpid()}.ps1")
+        # unique per toast: two rapid notifications from one process used
+        # to share a path — the second write could clobber the first before
+        # its PowerShell had read it (or serve a half-written script)
+        path = os.path.join(
+            tempfile.gettempdir(),
+            f"hookip_toast_{os.getpid()}_{time.time_ns()}.ps1")
         with open(path, "w", encoding="utf-8-sig") as fh:   # BOM: PS 5.1 needs it
             fh.write(ps)
         subprocess.Popen(

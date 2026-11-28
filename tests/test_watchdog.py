@@ -111,9 +111,10 @@ def test_self_check_rebuilds_backup():
                            lambda p, m, pid=0, reason=None:
                            restored.append(1) or True), \
          mock.patch.object(wd, "SELF_CHECK_MS", 300):
-        th = threading.Thread(
-            target=wd.main, args=(path, str(os.getpid()), FakeEvent.event_name),
-            daemon=True)
+        result = {}
+        def run_main():
+            result["rc"] = wd.main(path, str(os.getpid()), FakeEvent.event_name)
+        th = threading.Thread(target=run_main, daemon=True)
         th.start()
         time.sleep(1.2)                    # > one self-check tick
         check("self-check: backup rebuilt after deletion",
@@ -123,7 +124,8 @@ def test_self_check_rebuilds_backup():
         th.join(5)
     _k32.CloseHandle(live)
     check("signaled parent -> restore and exit", not th.is_alive() and restored)
-    check("watchdog main returns 0", True)
+    # the old check was vacuous ('True') — capture the real return value
+    check("watchdog main returns 0", result.get("rc") == 0, str(result))
 
 
 # ---- 4. full parent/child cycle (real processes, event stop) -----------

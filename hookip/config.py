@@ -144,6 +144,7 @@ class Config:
             return cls()
 
     def save(self):
+        tmp = None
         try:
             os.makedirs(APP_DIR, exist_ok=True)
             # atomic write: settings.json is replaced only after the temp
@@ -163,8 +164,9 @@ class Config:
                 os.fsync(fh.fileno())
             os.replace(tmp, SETTINGS_PATH)
         except OSError:
+            # tmp may be unbound if makedirs failed before the assignment
             try:
-                if os.path.exists(tmp):
+                if tmp and os.path.exists(tmp):
                     os.remove(tmp)
             except OSError:
                 pass
