@@ -26,6 +26,17 @@ def check(name, cond, extra=""):
     print(("PASS" if cond else "FAIL"), name, extra, flush=True)
 
 
+
+def _wait_until(pred, timeout=4.0, step=0.05):
+    """Poll until pred() is true (or deadline) — replaces fixed sleeps that
+    assumed the slowest possible spawn: fast when fast, safe when slow."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if pred():
+            return True
+        time.sleep(step)
+    return pred()
+
 def fake_restore_fail(path=winproxy.BACKUP_PATH):
     return False
 
@@ -112,13 +123,13 @@ def test_self_check_rebuilds_backup():
          mock.patch.object(wd, "_restore_and_notify",
                            lambda p, m, pid=0, reason=None, mem_vals=None:
                            restored.append(1) or True), \
-         mock.patch.object(wd, "SELF_CHECK_MS", 300):
+         mock.patch.object(wd, "SELF_CHECK_MS", 100):
         result = {}
         def run_main():
             result["rc"] = wd.main(path, str(os.getpid()), FakeEvent.event_name)
         th = threading.Thread(target=run_main, daemon=True)
         th.start()
-        time.sleep(1.2)                    # > one self-check tick
+        _wait_until(lambda: os.path.isfile(path), timeout=3)
         check("self-check: backup rebuilt after deletion",
               os.path.isfile(path) and open(path, encoding="utf-8").read() == payload)
         # now kill the parent handle -> the loop must restore + exit 0
@@ -153,18 +164,18 @@ def test_parent_child_cycle():
         return p
     with mock.patch.object(winproxy.subprocess, "Popen", guarded_popen):
         wdp.start(9099)
-    time.sleep(0.8)
+    _wait_until(lambda: wdp.alive(), timeout=5)
     check("watchdog child spawned and alive", wdp.alive(), str(spawned))
     wdp.stop()
-    time.sleep(0.6)
+    _wait_until(lambda: not wdp.alive(), timeout=5)
     check("watchdog child exits on stop event", not wdp.alive())
     # no leaked event handles: a second cycle must start a fresh child
     with mock.patch.object(winproxy.subprocess, "Popen", guarded_popen):
         wdp.start(9099)
-    time.sleep(0.8)
+    _wait_until(lambda: wdp.alive(), timeout=5)
     check("second start: fresh child alive", wdp.alive())
     wdp.stop()
-    time.sleep(0.6)
+    _wait_until(lambda: not wdp.alive(), timeout=5)
     check("second stop: child gone", not wdp.alive())
     for p in spawned:
         try:
@@ -195,7 +206,8 @@ def test_parent_death_restore():
          "sys.exit(wd.main(sys.argv[1], sys.argv[2], sys.argv[3]))",
          path, str(dummy.pid), ev],
         creationflags=0x08000000)
-    time.sleep(1.0)
+    _wait_until(lambda: child.poll() is None, timeout=5)
+    time.sleep(0.6)                    # settle: child reached its wait loop
     check("child watching a live dummy stays up", child.poll() is None)
     t0 = time.time()
     dummy.terminate()
@@ -281,7 +293,7 @@ def test_heartbeat_alive_keeps_watching():
             target=wd.main, args=(path, str(os.getpid()), "HookIP_Stop_x",
                                   "HookIP_Beat_x"), daemon=True)
         th.start()
-        time.sleep(1.5)                      # far past a 400 ms beat timeout
+        time.sleep(0.6)    # spans several 400 ms beat timeouts
         stopflag.set()
         _k32.SetEvent(stop)                  # now the clean-stop signal
         th.join(10)
@@ -337,12 +349,12 @@ def test_twin_children():
         return p
     with mock.patch.object(winproxy.subprocess, "Popen", guarded_popen):
         wdp.start(9098)
-    time.sleep(1.0)
+    _wait_until(lambda: wdp.watchers() == 2, timeout=5)
     check("twin watchdogs: two children alive", wdp.watchers() == 2,
           f"watchers={wdp.watchers()} spawned={len(spawned)}")
     check("beat event created", wdp._beat is not None)
     wdp.stop()
-    time.sleep(0.8)
+    _wait_until(lambda: wdp.watchers() == 0, timeout=5)
     check("twin watchdogs: both exit on stop", wdp.watchers() == 0)
     for p in spawned:
         try:

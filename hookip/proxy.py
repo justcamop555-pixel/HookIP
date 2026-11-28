@@ -181,6 +181,13 @@ def _set_keepalive(sock, idle=30, interval=5):
 class ProxyServer:
     """Threaded proxy on 127.0.0.1:<port>."""
 
+    # Socket timeouts, as CLASS attributes so tests can shrink them per
+    # instance (call-time bound — production behavior is unchanged):
+    HELLO_FIRST_TIMEOUT = 10.0    # idle preconnect before the first byte
+    HELLO_TAIL_TIMEOUT = 30.0     # mid-head pause budget (slow clients)
+    HELLO_TIMEOUT_443 = 10.0      # first-flight wait on CONNECT 443
+    HELLO_TIMEOUT_PLAIN = 2.0     # first-flight wait on plain-HTTP requests
+
     def __init__(self, cfg, log, stats, pac_token):
         self.cfg = cfg
         self.log = log
@@ -540,7 +547,7 @@ class ProxyServer:
         blocked = False
         opened = False
         try:
-            csock.settimeout(30)
+            csock.settimeout(self.HELLO_TAIL_TIMEOUT)
             head, complete = self._read_head(csock)
             if head:
                 # canonicalize bare-LF line endings ONCE, up front, so that
@@ -679,8 +686,7 @@ class ProxyServer:
                         pass
 
     # ------------------------------------------------------------------
-    @staticmethod
-    def _read_head(csock, first_byte_timeout=10.0):
+    def _read_head(self, csock, first_byte_timeout=None):
         """Read one HTTP request head. Returns (data, complete).
 
         The cap must be generous: Steam-style clients ship several KB of
@@ -695,6 +701,8 @@ class ProxyServer:
         the connection budget and make real requests hit the 503 path.
         10 s covers every real preconnect; genuine slow clients that are
         mid-request still get 30 s for the remainder."""
+        if first_byte_timeout is None:
+            first_byte_timeout = self.HELLO_FIRST_TIMEOUT
         data = b""
         try:
             csock.settimeout(first_byte_timeout)
@@ -702,7 +710,7 @@ class ProxyServer:
             if not first:
                 return (b"", False)
             data = first
-            csock.settimeout(30.0)
+            csock.settimeout(self.HELLO_TAIL_TIMEOUT)
             while b"\r\n\r\n" not in data and len(data) < 262144:
                 part = csock.recv(16384)
                 if not part:
@@ -867,7 +875,8 @@ class ProxyServer:
 
         # Sniff the client's first flight (normally the TLS ClientHello) ONCE.
         # Strategy retries reuse this captured data — the client cannot resend.
-        csock.settimeout(10 if port == 443 else 2)
+        csock.settimeout(self.HELLO_TIMEOUT_443 if port == 443
+                         else self.HELLO_TIMEOUT_PLAIN)
         first = b""
         wait_timed_out = False
         while True:

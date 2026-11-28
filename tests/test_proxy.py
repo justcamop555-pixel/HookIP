@@ -49,6 +49,13 @@ def make_server(port=9400, **kw):
     ps = ProxyServer(cfg, FakeLog(), Stats(), "tok")
     ps.resolver.resolve = lambda host, qtype=1: ["127.0.0.1"]
     ps.running = True
+    # SPEED: the real first-flight / head timeouts are 10 s and 30 s —
+    # shrunken per instance so timeout-driven paths complete in
+    # milliseconds without changing what is asserted
+    ps.HELLO_FIRST_TIMEOUT = 0.25
+    ps.HELLO_TAIL_TIMEOUT = 0.25
+    ps.HELLO_TIMEOUT_443 = 0.25
+    ps.HELLO_TIMEOUT_PLAIN = 0.25
     return ps
 
 
@@ -413,7 +420,9 @@ def run_tunnel_async(ps, csock, writer, host, port, result,
             result["err"] = e
     th = threading.Thread(target=run, daemon=True)
     th.start()
-    time.sleep(0.3)
+    # the hello must arrive INSIDE the (per-instance, shrunken) first-flight
+    # timeout — a real client sends it within milliseconds of the 200
+    time.sleep(0.05)
     if hello:
         try:
             writer.sendall(hello)
@@ -632,7 +641,7 @@ def test_443_no_data_still_aborts():
             result["err"] = e
     th = threading.Thread(target=run, daemon=True)
     th.start()
-    th.join(15)
+    th.join(8)
     check("443 no-data still ClientAbortError",
           isinstance(result.get("err"), ClientAbortError), str(result))
     client.close(); client_peer.close()
@@ -863,7 +872,7 @@ def test_upstream_skips_dns():
             result["err"] = repr(e)
     th = threading.Thread(target=run, daemon=True)
     th.start()
-    time.sleep(0.3)                      # let _tunnel send its 200 banner
+    time.sleep(0.05)   # hello must beat the shrunken first-flight timeout
     client_peer.sendall(b"\x16\x03\x01clienthello-bytes")
     th.join(10)
     check("upstream mode: CONNECT succeeds without resolving",
@@ -1253,13 +1262,13 @@ def test_handle_canonicalizes_only_complete_heads():
 
     # (a) incomplete head: _handle must come back without a 431, without
     # touching any origin, and without treating it as a request. The read
-    # tail waits out the full 30 s socket timeout before returning, so the
-    # join budget must cover it.
+    # tail waits out the (per-instance, shrunken) head-tail timeout before
+    # returning.
     th = threading.Thread(target=run_handle, args=(client, result), daemon=True)
     th.start()
     time.sleep(0.15)
     client_peer.sendall(b"GET http://x/y HTTP/1.1\nHost: x\n")   # no terminator
-    th.join(35)
+    th.join(10)
     check("head without terminator: handled, no crash",
           result.get("done") and not result.get("err"), str(result))
     check("head without terminator: origin never contacted",
@@ -1740,6 +1749,23 @@ def test_dpi_hist_bounded():
           ps._recent_dpi("h0.test") == 1)
 
 
+# ---- timeout constants: shrunken per instance in tests, defaults intact --
+def test_hello_timeout_defaults_unchanged():
+    """The class-level timeouts exist so tests can shrink them per
+    instance; PRODUCTION values must stay exactly what they were
+    (443 first-flight 10 s, plain 2 s, preconnect 10 s, head tail 30 s)."""
+    check("hello timeout defaults unchanged",
+          proxymod.ProxyServer.HELLO_TIMEOUT_443 == 10.0 and
+          proxymod.ProxyServer.HELLO_TIMEOUT_PLAIN == 2.0 and
+          proxymod.ProxyServer.HELLO_FIRST_TIMEOUT == 10.0 and
+          proxymod.ProxyServer.HELLO_TAIL_TIMEOUT == 30.0,
+          str((proxymod.ProxyServer.HELLO_TIMEOUT_443,
+               proxymod.ProxyServer.HELLO_TIMEOUT_PLAIN,
+               proxymod.ProxyServer.HELLO_FIRST_TIMEOUT,
+               proxymod.ProxyServer.HELLO_TAIL_TIMEOUT)))
+
+
+
 if __name__ == "__main__":
 
     test_parse_head_body()
@@ -1785,6 +1811,7 @@ if __name__ == "__main__":
     test_adaptive_capped_host_no_second_round()
     test_adaptive_raw_pref_escalates()
     test_dpi_hist_bounded()
+    test_hello_timeout_defaults_unchanged()
 
     print()
     print(f"Summary: {sum(1 for _, c in RESULTS if c)}/{len(RESULTS)} passed")
