@@ -326,6 +326,7 @@ def test_sni_less_and_fallback():
             warn=lambda *a, **k: None, error=lambda *a, **k: None)
         r.chunk = 2
         r._sni_mode = {}
+        r._sni_mode_ts = {}
         r._pool = {}
         r._pending = {}
         r._pool_lock = threading.Lock()
@@ -384,8 +385,52 @@ def test_sni_less_and_fallback():
         r2._new_conn("NoSAN", "9.9.9.9", "dns.nosan.example")
         check("cached 'host' mode skips the failing IP attempt",
               captured.get("modes") == [False], str(captured.get("modes")))
+
+        # hourly re-probe: a resolver could ADD an IP SAN — after an hour
+        # in 'host' mode, _new_conn retries the IP-SAN path once
+        r2._sni_mode_ts["NoSAN"] = time.time() - 3700
+        captured.clear()
+        r2._new_conn("NoSAN", "9.9.9.9", "dns.nosan.example")
+        check("stale 'host' mode re-probes the IP-SAN path",
+              captured.get("modes") == [True, False],
+              str(captured.get("modes")))
+        check("re-probe refreshes the fallback timestamp",
+              time.time() - r2._sni_mode_ts["NoSAN"] < 5,
+              str(r2._sni_mode_ts))
     finally:
         dohmod._DoHConn = real_conn
+
+
+def test_sni_less_preferred_in_rotation():
+    """A resolver known to fall back to hostname SNI is DEMOTED in the
+    hedge order (SNI-less resolvers serve most lookups). First-launched
+    attempt = order[0] — deterministic even though the answer races."""
+    r = script_resolver({"Cloudflare": [addrs("1.1.1.1")],
+                         "Google": [addrs("8.8.8.8")],
+                         "AdGuard": [addrs("9.9.9.9")],
+                         "ControlD": [addrs("7.7.7.7")]})
+    r._sni_mode["Google"] = "host"      # demote Google to the back
+    launched = []
+    real_session = r._doh_session
+    def session(name, dns_host, ip):
+        launched.append(name)
+        return real_session(name, dns_host, ip)
+    r._doh_session = session
+    with mock.patch.object(dohmod, "dnsmsg", StubDns):
+        ips, ttl, _note = r._via_doh("order.test", 1)
+    check("SNI-less resolver is launched FIRST",
+          launched and launched[0] != "Google", str(launched))
+    # demoted resolvers are still REACHABLE (never skipped): force the
+    # SNI-less ones to fail and confirm Google still answers
+    r2 = script_resolver({"Cloudflare": [OSError("down")],
+                          "Google": [addrs("8.8.8.8")],
+                          "AdGuard": [OSError("down")],
+                          "ControlD": [OSError("down")]})
+    r2._sni_mode["Google"] = "host"
+    with mock.patch.object(dohmod, "dnsmsg", StubDns):
+        ips2, _t, _n = r2._via_doh("reach.test", 1)
+    check("demoted SNI-host resolver still serves when others fail",
+          ips2 == ["8.8.8.8"], str(ips2))
 
 
 def test_frag_send():
@@ -1018,6 +1063,7 @@ if __name__ == "__main__":
     test_private_ip_poisoning_guard()
     test_circuit_breaker()
     test_serve_stale_on_doh_outage()
+    test_sni_less_preferred_in_rotation()
 
     print()
     print(f"Summary: {sum(1 for _, c in RESULTS if c)}/{len(RESULTS)} passed")

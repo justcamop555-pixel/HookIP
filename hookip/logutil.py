@@ -99,6 +99,7 @@ class Log:
                     magic=dataguard.LOG_MAGIC) + "\n")
                 fh.flush()
                 self._file = fh
+                self._last_flush = 0.0     # first entries flush promptly
             except Exception as exc:   # noqa: BLE001 — the sink must never
                                        # crash the caller (a UnicodeError
                                        # from the header used to escape)

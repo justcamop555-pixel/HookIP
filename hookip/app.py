@@ -1595,7 +1595,9 @@ class App:
         # so the result can be applied when it arrives.
         net_proxy = ""
         try:
-            net_proxy = winproxy.detect_network_proxy(prev)
+            # registry-form only on the UI thread (instant); the PAC fetch
+            # (up to 4 s) belongs to the worker below
+            net_proxy = winproxy.detect_network_proxy(prev, pac=False)
         except Exception as exc:  # noqa: BLE001 — never abort Start
             self.log.debug(f"network-proxy detection failed: "
                            f"{type(exc).__name__}: {exc}")
@@ -1608,7 +1610,7 @@ class App:
                     found = winproxy.detect_network_proxy(prev_vals)
                 except Exception:
                     return
-                if found and getattr(self, "cfg", None) is not None and \
+                if found and self.running and \
                         not getattr(self.cfg, "upstream_proxy", ""):
                     self.cfg.upstream_proxy = found
                     self._announce_upstream(found)

@@ -340,16 +340,19 @@ def _lan_address(addr):
     return bool(a) and "127.0.0.1" not in a and "localhost" not in a and "[::1]" not in a
 
 
-def detect_network_proxy(vals):
+def detect_network_proxy(vals, pac=True):
     """Restricted-network support: many Wi-Fi networks (offices, hotels,
     campuses) block DIRECT internet and require all traffic to go through
     the network's own proxy (WPAD/PAC or a manually configured one). When
     HookIP replaces that setting, its own direct connects would all fail —
     so detect the network's proxy BEFORE overwriting and tunnel through it.
 
-    Returns 'host:port' or ''. Never raises (the caller runs this on the
-    UI thread path via a worker — but a malformed AutoConfigURL raising
-    ValueError used to abort Start outright).
+    Returns 'host:port' or ''. Never raises (a malformed AutoConfigURL
+    raising ValueError used to abort Start outright).
+
+    pac=False skips the PAC FETCH (up to 4 s) and only reads the
+    registry-form proxy — that part is what the UI thread may call
+    synchronously; the fetch belongs on a worker.
     """
     try:
         # 1. manual proxy: '1.2.3.4:8080' or 'http=…;https=…' form.
@@ -372,8 +375,10 @@ def detect_network_proxy(vals):
         # AutoConfigURL passed _lan_address and used to be fetched
         # directly. NOTE the first match is best-effort: a PAC script can
         # return different proxies per condition; we cannot evaluate JS.
+        # (Skipped entirely when pac=False — see docstring.)
         acu = str(vals.get("AutoConfigURL") or "")
-        if acu.lower().startswith(("http://", "https://")) and _lan_address(acu):
+        if pac and acu.lower().startswith(("http://", "https://")) \
+                and _lan_address(acu):
             import re
             import urllib.request
             req = urllib.request.Request(acu, headers={"User-Agent": "HookIP"})
@@ -483,8 +488,22 @@ def _write_restore_cmd(vals):
         lines.append(f'reg delete "HKCU\\{KEY_PATH}" /v AutoConfigURL /f >nul 2>&1')
     lines.append(f'reg delete "HKCU\\{RUNONCE_PATH}" /v {RUNONCE_NAME} /f >nul 2>&1')
     os.makedirs(_app_dir(), exist_ok=True)
-    with open(RESTORE_CMD, "w", encoding="utf-8") as fh:
-        fh.write("\r\n".join(lines))
+    # atomic: a truncated cmd in RunOnce runs HALF a script (the reg
+    # delete lines execute, the restore adds do not) — a power loss
+    # mid-write must not leave a cmd that only deletes our RunOnce marker
+    tmp = RESTORE_CMD + f".{threading.get_ident()}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write("\r\n".join(lines))
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, RESTORE_CMD)
+    except OSError:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
 
 
 def set_runonce():

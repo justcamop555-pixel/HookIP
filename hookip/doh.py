@@ -324,6 +324,7 @@ class Resolver:
         self.verbose_stats = {}               # resolver -> success count
         self._pool = {}                       # resolver name -> [_DoHConn, ...]
         self._sni_mode = {}                   # resolver -> 'ip' | 'host'
+        self._sni_mode_ts = {}                # resolver -> last fallback ts
         self._last_plain_warn = 0.0           # throttles the DoH-fallback warn
         # how long past its expiry a cached DoH answer may be served as
         # stale when every resolver path fails (RFC 8767-style)
@@ -344,6 +345,13 @@ class Resolver:
         live). A cert without an IP SAN falls back to the hostname (SNI
         visible) and the working mode is cached per resolver."""
         mode = self._sni_mode.get(name, "ip")
+        if mode == "host":
+            # re-probe hourly: a resolver could ADD an IP SAN (cert
+            # rotation) — without this, one bad cert day demoted a
+            # resolver to SNI-visible for the whole install
+            if time.time() - self._sni_mode_ts.get(name, 0) > 3600:
+                self._sni_mode_ts[name] = time.time()
+                mode = "ip"
         try:
             conn = _DoHConn(ip, dns_host, chunk=max(1, self.chunk),
                             keepalive=True, validate_by_ip=(mode == "ip"))
@@ -355,8 +363,15 @@ class Resolver:
             conn = _DoHConn(ip, dns_host, chunk=max(1, self.chunk),
                             keepalive=True, validate_by_ip=False)
             self._sni_mode[name] = "host"
-            self.log.debug(f"DoH {name}: certificate has no IP SAN — "
-                           "falling back to hostname SNI")
+            self._sni_mode_ts[name] = time.time()
+            # VISIBLE, not a silent debug line: in 'host' mode the
+            # resolver's NAME is sent in the ClientHello SNI — a
+            # name-based DoH blocklist matches it. The user should know
+            # which resolvers degrade (once per resolver per session).
+            self.log.warn(f"DoH {name}: certificate has no IP SAN — "
+                          "falling back to hostname SNI "
+                          "(the resolver name is visible to the network; "
+                          "SNI-less resolvers are preferred automatically)")
             return conn
 
     def _doh_session(self, name, dns_host, ip):
@@ -819,8 +834,14 @@ class Resolver:
         with self._lock:
             order = [RESOLVERS[(self._start_idx + i) % n] for i in range(n)]
             self._start_idx = (self._start_idx + 1) % n
-        # fastest first — measured latency beats fixed rotation
+        # SNI-less first, then fastest — measured latency beats fixed
+        # rotation WITHIN each class. A resolver known to fall back to
+        # hostname SNI ('host' mode: its cert had no IP SAN) is demoted so
+        # the name-invisible resolvers serve most lookups; it still gets
+        # tried (never skipped) and flips back to the front the moment a
+        # fresh connection validates by IP again.
         order.sort(key=lambda r: self._lat.get(r[0], 1.0))
+        order.sort(key=lambda r: 1 if self._sni_mode.get(r[0]) == "host" else 0)
         # circuit breaker: cooling resolvers drop to the BACK of the order.
         # They are demoted, never skipped outright — a total outage still
         # reaches them, and they keep getting occasional probes so recovery
