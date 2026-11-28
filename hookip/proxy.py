@@ -185,6 +185,30 @@ def _set_keepalive(sock, idle=30, interval=5):
         pass
 
 
+def _upstream_target(up):
+    """host, port of the configured upstream proxy. The Settings field
+    stores the user's string VERBATIM, so this must tolerate every shape
+    _clean_upstream normalizes away: a scheme prefix ('http://proxy:8080'
+    used to make getaddrinfo resolve the literal host 'http://proxy...'),
+    embedded user:pass@, '[::1]:8080' brackets, a no-port 'proxy.corp.local'
+    (default 8080), and a bare unbracketed IPv6 (multiple colons)."""
+    a = str(up or "").strip()
+    if "://" in a:
+        a = a.split("://", 1)[1]
+    if "@" in a:
+        a = a.rpartition("@")[2]
+    a = a.strip("/")
+    if a.startswith("[") and "]" in a:
+        host = a[1:].split("]", 1)[0]
+        rest = a.split("]", 1)[1]
+        port = rest[1:] if rest.startswith(":") else ""
+    else:
+        host, _, port = a.rpartition(":")
+        if not port.isdigit() or ":" in host:
+            host, port = a, ""          # no port (or bare IPv6) -> default
+    return host.strip("[]"), (int(port) if port.isdigit() else 8080)
+
+
 class ProxyServer:
     """Threaded proxy on 127.0.0.1:<port>."""
 
@@ -1162,9 +1186,7 @@ class ProxyServer:
         """Open a connection to the network's own proxy for a plain-HTTP
         request (the request itself carries the absolute-URI target)."""
         up = str(getattr(self.cfg, "upstream_proxy", "") or "").strip()
-        phost, _, pport = up.rpartition(":")
-        pport_i = int(pport) if pport.isdigit() else 8080
-        phost = phost.strip("[]")
+        phost, pport_i = _upstream_target(up)
         try:
             infos = socket.getaddrinfo(phost, None, socket.AF_INET, socket.SOCK_STREAM)
             ips = list(dict.fromkeys(i[4][0] for i in infos))[:4]
@@ -1181,9 +1203,7 @@ class ProxyServer:
         ClientHello INSIDE that tunnel — the LAN proxy sees only a TLS
         handshake to the target, its filtering cannot read the SNI either."""
         up = str(getattr(self.cfg, "upstream_proxy", "") or "").strip()
-        phost, _, pport = up.rpartition(":")
-        pport_i = int(pport) if pport.isdigit() else 8080
-        phost = phost.strip("[]")
+        phost, pport_i = _upstream_target(up)
         try:
             infos = socket.getaddrinfo(phost, None, socket.AF_INET, socket.SOCK_STREAM)
             ips = list(dict.fromkeys(i[4][0] for i in infos))[:4]
@@ -1204,8 +1224,14 @@ class ProxyServer:
                 raise OSError(f"network proxy refused CONNECT to {host}:{port} "
                               f"({line.decode(errors='replace')[:80]})")
             server.settimeout(None)
+            # a chatty proxy can push bytes right after the header
+            # terminator — they are TUNNEL bytes (server -> client) and
+            # used to be silently dropped (a truncated handshake the
+            # client could never diagnose). Returned as (socket, tail);
+            # _relay delivers the tail to the client first.
+            tail = resp.split(b"\r\n\r\n", 1)[1]
             self.log.debug(f"{host}:{port} chained through network proxy {up}")
-            return server
+            return server, tail
         except OSError:
             try:
                 server.close()
@@ -1233,10 +1259,11 @@ class ProxyServer:
                 raise
             dns_ms = (time.time() - t0) * 1000
         t1 = time.time()
+        up_tail = b""   # CONNECT-tail bytes (non-empty only when chaining)
         upstream = str(getattr(self.cfg, "upstream_proxy", "") or "").strip()
         if upstream:
             try:
-                server = self._via_upstream(host, port)
+                server, up_tail = self._via_upstream(host, port)
             except OSError as exc:
                 # ConnectDead (not a plain OSError): the CONNECT to the
                 # network proxy died BEFORE any ClientHello byte, so a
@@ -1323,7 +1350,7 @@ class ProxyServer:
             self._tunnel_detail[host] = (strategy, dns_ms, conn_ms, nseg, total_ms)
         try:
             self._relay(csock, server, host, initial_up=len(first),
-                        count_first=count_first)
+                        count_first=count_first, initial_down=up_tail)
         except BaseException:
             # FIX: the _relay call sat outside the close-on-error guard —
             # an exception leaked the upstream socket
@@ -1334,7 +1361,8 @@ class ProxyServer:
             raise
         return server
 
-    def _relay(self, csock, server, host, initial_up=0, count_first=True):
+    def _relay(self, csock, server, host, initial_up=0, count_first=True,
+               initial_down=b""):
         # initial_up: bytes already pushed upstream before relay started
         # (the ClientHello). Without counting them, a clean FIN right
         # after the handshake read as outcome 'ok' and UpstreamDied never
@@ -1346,7 +1374,12 @@ class ProxyServer:
         # was sent but got nothing back is still 'died mid-handshake').
         sent = initial_up          # detection counter (always counts)
         up = initial_up if count_first else 0
-        down = 0
+        down = len(initial_down)   # CONNECT-tail bytes came from upstream
+        if initial_down:
+            try:
+                csock.sendall(initial_down)
+            except OSError:
+                pass                # client already gone — relay ends below
         started = time.time()
         sockets = [csock, server]
         _set_keepalive(csock)

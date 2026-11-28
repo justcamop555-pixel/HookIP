@@ -1793,6 +1793,93 @@ def test_dpi_hist_bounded():
           ps._recent_dpi("h0.test") == 1)
 
 
+# ---- upstream proxy: target parsing / CONNECT tail / relay delivery -----
+def test_upstream_target_shapes():
+    from hookip.proxy import _upstream_target
+    cases = [
+        ("proxy.corp.local:8080", ("proxy.corp.local", 8080)),
+        ("http://proxy.corp.local:8080", ("proxy.corp.local", 8080)),
+        ("user:pass@proxy.corp.local:3128", ("proxy.corp.local", 3128)),
+        ("http://user:pass@p.corp:3128/", ("p.corp", 3128)),
+        ("[::1]:8080", ("::1", 8080)),
+        ("proxy.corp.local", ("proxy.corp.local", 8080)),
+        ("2001:db8::1", ("2001:db8::1", 8080)),
+        ("http://p:8080", ("p", 8080)),
+    ]
+    ok = True
+    detail = []
+    for raw, want in cases:
+        got = _upstream_target(raw)
+        if got != want:
+            ok = False
+            detail.append(f"{raw!r} -> {got!r} (want {want!r})")
+    check("upstream target parses scheme/userinfo/brackets/no-port", ok,
+          "; ".join(detail))
+
+
+def test_via_upstream_connect_tail_preserved():
+    """Bytes a chatty network proxy pushes right after the CONNECT 200
+    belong INSIDE the tunnel and used to be dropped silently (a truncated
+    handshake the client could never diagnose)."""
+    up_port = free_port()
+    upsrv = socket.socket()
+    upsrv.bind(("127.0.0.1", up_port))
+    upsrv.listen(2)
+    modes = [b"TAILBYTES", b""]
+
+    def serve():
+        for m in modes:
+            try:
+                c, _ = upsrv.accept()
+                head = b""
+                while b"\r\n\r\n" not in head:
+                    head += c.recv(4096)
+                c.sendall(b"HTTP/1.1 200 Connection established"
+                          b"\r\nX-Note: hi\r\n\r\n" + m)
+                c.close()
+            except OSError:
+                pass
+
+    threading.Thread(target=serve, daemon=True).start()
+    ps = make_server(upstream_proxy=f"127.0.0.1:{up_port}")
+    s1, tail1 = ps._via_upstream("target.test", 443)
+    check("CONNECT tail returned alongside the socket",
+          tail1 == b"TAILBYTES", repr(tail1))
+    s1.close()
+    s2, tail2 = ps._via_upstream("target.test", 443)
+    check("clean 200: no phantom tail", tail2 == b"", repr(tail2))
+    s2.close()
+    upsrv.close()
+
+
+def test_relay_initial_down_delivered_and_counted():
+    """_relay must deliver the stashed CONNECT-tail to the client AHEAD
+    of relayed upstream data and count it as downloaded."""
+    ps = make_server()
+    c1, c2 = socketpair()
+    s1, s2 = socketpair()
+    s2.sendall(b"UPDATA")
+    res = {}
+    th = threading.Thread(
+        target=lambda: res.setdefault(
+            "r", ps._relay(c1, s1, "relay.test", initial_up=5,
+                           initial_down=b"TAIL")),
+        daemon=True)
+    th.start()
+    got = recv_until(c2, b"TAILUPDATA", budget=5)
+    check("relay: initial_down delivered ahead of upstream data",
+          got.startswith(b"TAIL") and b"UPDATA" in got, repr(got))
+    s2.close()
+    th.join(8)
+    check("relay: initial_down returns cleanly (down>0, no UpstreamDied)",
+          "r" in res and not isinstance(res.get("r"), Exception),
+          repr(res))
+    tot, act, up, down, failed, blocked = ps.stats.totals()
+    check("relay: initial_down counted in down stats", down >= 4,
+          f"down={down}")
+    c1.close(); c2.close(); s1.close()
+
+
 # ---- timeout constants: shrunken per instance in tests, defaults intact --
 def test_hello_timeout_defaults_unchanged():
     """The class-level timeouts exist so tests can shrink them per
@@ -1857,6 +1944,9 @@ if __name__ == "__main__":
     test_adaptive_raw_pref_escalates()
     test_dpi_hist_bounded()
     test_hello_timeout_defaults_unchanged()
+    test_upstream_target_shapes()
+    test_via_upstream_connect_tail_preserved()
+    test_relay_initial_down_delivered_and_counted()
 
     print()
     print(f"Summary: {sum(1 for _, c in RESULTS if c)}/{len(RESULTS)} passed")

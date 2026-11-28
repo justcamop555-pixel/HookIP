@@ -551,6 +551,24 @@ class App:
         return (any(ord(c) < 0x20 or ord(c) == 0x7f for c in p)
                 or '"' in p or "'" in p or "\\" in p)
 
+    def _upstream_gone(self):
+        """Detection found no network proxy on this network. Clear the
+        configured upstream ONLY when it was DETECTION that set it (a
+        proxy the user typed themselves stays). Without this, HookIP
+        kept chaining through a dead LAN proxy forever after the user
+        left the restricted Wi-Fi — every connection failing with no
+        hint why. Returns True when something was cleared."""
+        cur = str(getattr(self.cfg, "upstream_proxy", "") or "")
+        if cur and cur == getattr(self, "_detected_upstream", None):
+            self.cfg.upstream_proxy = ""
+            self._detected_upstream = None
+            self.log.ok(
+                "This network no longer publishes its own proxy — upstream "
+                "chaining disabled, HookIP connects directly again.")
+            self._ui_queue.put(("reapply", ()))
+            return True
+        return False
+
     def _report_exclusions(self, pats):
         """Make exclusions VISIBLE at Start. The PAC silently skips
         patterns that would corrupt its script (quote/backslash), and a
@@ -2089,28 +2107,42 @@ class App:
             self.log.debug(f"network-proxy detection failed: "
                            f"{type(exc).__name__}: {exc}")
         cfg.upstream_proxy = net_proxy
+        # remember what DETECTION set, so a stale detected value can be
+        # cleared later without touching a proxy the USER typed
+        self._detected_upstream = net_proxy or None
         if net_proxy:
             self._announce_upstream(net_proxy)
-        else:
-            def _late_detect(prev_vals=prev):
-                try:
-                    found = winproxy.detect_network_proxy(prev_vals)
-                except Exception:
-                    return
+
+        def _late_detect(prev_vals=prev):
+            """Runs in the background after every Start — both to catch a
+            slow LAN PAC fetch and to notice the network's proxy GONE
+            (HookIP used to keep chaining through a dead LAN proxy
+            forever after the user left the restricted Wi-Fi)."""
+            try:
+                found = winproxy.detect_network_proxy(prev_vals)
+            except Exception:
+                return
+            if found and self.proxy is not None and \
+                    not getattr(self.cfg, "upstream_proxy", ""):
                 # the race: running is only set AFTER apply_*/watchdog.start,
                 # so a fast LAN PAC fetch arrived while running was still
                 # False and was DROPPED — the bypass list was already
                 # written with the excluded domains. self.proxy is set as
                 # soon as the server is listening: gate on THAT instead.
-                if found and self.proxy is not None and \
-                        not getattr(self.cfg, "upstream_proxy", ""):
-                    self.cfg.upstream_proxy = found
-                    self._announce_upstream(found)
-                    # re-apply the system proxy WITHOUT bypass entries
-                    # (restricted network: DIRECT is blocked, user
-                    # exclusions must not go direct) — main thread only
-                    self._ui_queue.put(("reapply", ()))
-            threading.Thread(target=_late_detect, daemon=True).start()
+                self.cfg.upstream_proxy = found
+                self._detected_upstream = found
+                self._announce_upstream(found)
+                # re-apply the system proxy WITHOUT bypass entries
+                # (restricted network: DIRECT is blocked, user
+                # exclusions must not go direct) — main thread only
+                self._ui_queue.put(("reapply", ()))
+            elif not found and self.proxy is not None:
+                # the network no longer publishes a proxy: a DETECTION-set
+                # upstream is stale, a user-typed one stays (_upstream_gone
+                # decides; keeps this closure thin and unit-testable)
+                self._upstream_gone()
+
+        threading.Thread(target=_late_detect, daemon=True).start()
         try:
             self.proxy = ProxyServer(cfg, self.log, self.stats, self.pac_token)
             self.proxy.on_accept_death = self._on_accept_death

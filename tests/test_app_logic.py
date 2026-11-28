@@ -571,5 +571,38 @@ check("trailing dot stripped, comment dropped",
       "vpn.corp.example" in parsed and
       not any(x.startswith("#") for x in parsed))
 
+# ---- stale upstream cleanup: detection-set values are cleared, user- -----
+# ---- typed ones survive -------------------------------------------------
+def _upstream_fixture(cfg_value, detected):
+    a = make_app()
+    a.cfg = types.SimpleNamespace(upstream_proxy=cfg_value)
+    a._detected_upstream = detected
+    return a
+
+
+_gone = _upstream_fixture("lan-proxy.corp:8080", "lan-proxy.corp:8080")
+check("stale detected upstream cleared",
+      appmod.App._upstream_gone(_gone) is True and
+      _gone.cfg.upstream_proxy == "", str(_gone.cfg.upstream_proxy))
+check("stale-upstream clear is announced",
+      any("directly again" in m for (lvl, m) in _gone.log.lines),
+      str(_gone.log.lines))
+check("stale-upstream clear re-applies the system proxy",
+      ("reapply", ()) in _gone._ui_queue, str(_gone._ui_queue))
+
+_user = _upstream_fixture("my-own-proxy.example:3128", "lan-proxy.corp:8080")
+check("user-typed upstream survives proxy-less detection",
+      appmod.App._upstream_gone(_user) is False and
+      _user.cfg.upstream_proxy == "my-own-proxy.example:3128",
+      str(_user.cfg.upstream_proxy))
+check("no clear for user-typed upstream: no reapply queued",
+      not _user._ui_queue, str(_user._ui_queue))
+
+_empty = _upstream_fixture("", None)
+check("empty upstream: no-op",
+      appmod.App._upstream_gone(_empty) is False and
+      _empty.cfg.upstream_proxy == "" and not _empty._ui_queue,
+      str(_empty._ui_queue))
+
 print(f"Summary: {sum(1 for _, c in RESULTS if c)}/{len(RESULTS)} passed")
 sys.exit(0 if all(c for _, c in RESULTS) else 1)
