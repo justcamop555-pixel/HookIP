@@ -1,12 +1,14 @@
 """Tests for hookip.vpn (WARP detection), notify cooldown, and the
 tooltip disabled-widget policy.
 
-vpn.detect is tested with a stubbed subprocess (tasklist / warp-cli) so
-the real machine's state never matters; notify's Popen is stubbed so no
-real toast fires.
+vpn.detect is tested with stubbed subprocess (tasklist / warp-cli) so
+the real machine's state never matters; the verified output wordings
+('Status update: Connected', 'Mode: WarpWithDnsOverHttps') are taken
+from the installed CLI.
 """
 import os
 import sys
+import threading
 import types
 import unittest.mock as mock
 
@@ -25,60 +27,132 @@ from hookip import vpn as vpndetect   # noqa: E402
 from hookip import notify             # noqa: E402
 
 
-def fake_run(images=(), warpcli_out=None, warpcli_rc=0):
-    """vpn.subprocess.run stub: tasklist returns `images`; warp-cli
-    returns `warpcli_out` (or a nonzero rc when warpcli_rc != 0)."""
+def fake_run(images=(), warp_status=None, settings_out=None, fail=False):
+    """vpn.subprocess.run stub. warp_status is the REAL wording of
+    `warp-cli status`; fail=True simulates a command crash (raise)."""
     def run(cmd, **kw):
+        if fail:
+            raise OSError("spawn failed")
         if cmd and cmd[0] == "tasklist":
             rows = "".join(
                 f'"{img}","123","Console","1","1,000 K"\n' for img in images)
             return types.SimpleNamespace(returncode=0, stdout=rows)
-        # warp-cli
-        return types.SimpleNamespace(returncode=warpcli_rc,
-                                     stdout=warpcli_out or "")
+        if cmd and cmd[1] == "status":
+            if warp_status is None:
+                raise OSError("no warp-cli")   # CLI missing
+            return types.SimpleNamespace(returncode=0, stdout=warp_status, stderr="")
+        # warp-cli settings
+        return types.SimpleNamespace(returncode=0, stdout=settings_out or "",
+                                     stderr="")
     return run
 
 
-# ---- 1. detection: no VPN, WARP full tunnel, WARP proxy mode, unknown ----
+CONNECTED = "Status update: Connected\nNetwork: healthy\nSuccess"
+DISCONNECTED = "Status update: Disconnected\nReason: Settings Changed\nSuccess"
+OLD_CONNECTED = "Status: Connected\nSuccess"          # older CLI wording
+SETTINGS_FULL = "(user set)\tMode: WarpWithDnsOverHttps\n"
+
+
+# ---- 1. detection: nothing, installed-but-off, connected, unknown -------
 with mock.patch.object(vpndetect.subprocess, "run", fake_run(images=())):
     check("no VPN processes -> None", vpndetect.detect(force=True) is None)
 
 for img in vpndetect._WARP_IMAGES:
     with mock.patch.object(
             vpndetect.subprocess, "run",
-            fake_run(images=(img,), warpcli_out="Mode: WarpWithDnsOverHttps")):
+            fake_run(images=(img,), warp_status=CONNECTED,
+                     settings_out=SETTINGS_FULL)):
         st = vpndetect.detect(force=True)
-        check(f"WARP detected via {img}", st is not None and
+        check(f"WARP CONNECTED detected via {img}", st is not None and
               st["kind"] == "cloudflare-warp", str(st))
         check(f"full-tunnel mode parsed ({img})", st.get("mode") == "full")
-        check(f"detail says full tunnel ({img})", st.get("detail") == "full tunnel")
-        break   # one image name is enough; all names were listed above
+        break
 
+# service running but VPN switched OFF must NOT claim anything is up
 with mock.patch.object(
         vpndetect.subprocess, "run",
-        fake_run(images=("warp-svc.exe",), warpcli_out="Mode: WarpProxy")):
+        fake_run(images=("warp-svc.exe",), warp_status=DISCONNECTED)):
     st = vpndetect.detect(force=True)
-    check("WARP proxy mode parsed", st.get("mode") == "proxy" and
-          "PROXY mode" in vpndetect.why_text(st), str(st))
-    check("proxy-mode why mentions upstream chaining",
-          "Upstream proxy" in vpndetect.why_text(st))
+    check("running service + disconnected -> neutral 'off' state",
+          st is not None and st.get("mode") == "off" and
+          st.get("detail") == "installed, not connected", str(st))
+    check("off-state why says HookIP does the real work",
+          "doing the real work" in vpndetect.why_text(st))
 
+# service running but status UNKNOWABLE (CLI missing / weird output):
+# say nothing rather than guess
 with mock.patch.object(
         vpndetect.subprocess, "run",
-        fake_run(images=("Cloudflare WARP.exe",), warpcli_rc=1)):
-    st = vpndetect.detect(force=True)
-    check("warp-cli failure -> tunnel mode unknown but detected",
-          st is not None and st.get("mode") is None, str(st))
+        fake_run(images=("Cloudflare WARP.exe",), warp_status=None)):
+    check("warp-cli missing -> None (never guess)",
+          vpndetect.detect(force=True) is None)
+with mock.patch.object(
+        vpndetect.subprocess, "run",
+        fake_run(images=("Cloudflare WARP.exe",),
+                 warp_status="some future output format")):
+    check("unrecognized status wording -> None (never guess)",
+          vpndetect.detect(force=True) is None)
 
 with mock.patch.object(
         vpndetect.subprocess, "run",
         fake_run(images=("chrome.exe", "explorer.exe"))):
     check("unrelated processes -> None", vpndetect.detect(force=True) is None)
 
+# proxy mode: connected + WarpProxy settings marker
+with mock.patch.object(
+        vpndetect.subprocess, "run",
+        fake_run(images=("warp-svc.exe",), warp_status=CONNECTED,
+                 settings_out="Mode: WarpProxy")):
+    st = vpndetect.detect(force=True)
+    check("WARP proxy mode parsed", st.get("mode") == "proxy", str(st))
+    check("proxy-mode why admits SOCKS5, does NOT advertise chaining",
+          "SOCKS5" in vpndetect.why_text(st) and
+          "Upstream proxy" not in vpndetect.why_text(st),
+          vpndetect.why_text(st))
 
-# ---- 2. cache: second detect() does NOT re-probe; force=True does -------
+# connected but mode unreadable -> own neutral text, NEVER full-tunnel text
+with mock.patch.object(
+        vpndetect.subprocess, "run",
+        fake_run(images=("warp-svc.exe",), warp_status=CONNECTED,
+                 settings_out="totally different format")):
+    st = vpndetect.detect(force=True)
+    check("unknown mode kept distinct", st.get("mode") is None, str(st))
+    w = vpndetect.why_text(st)
+    check("unknown mode gets NEUTRAL text (not the full-tunnel claim)",
+          "mode could not be determined" in w and
+          "add nothing" not in w, w)
+
+# old CLI wording still recognized
+with mock.patch.object(
+        vpndetect.subprocess, "run",
+        fake_run(images=("warp-svc.exe",), warp_status=OLD_CONNECTED,
+                 settings_out=SETTINGS_FULL)):
+    check("older CLI 'Status: Connected' recognized",
+          vpndetect.detect(force=True) is not None and
+          vpndetect.detect().get("mode") == "full")
+
+# subprocess crash paths: TimeoutExpired (SubprocessError) and OSError
+# must BOTH yield None — the old code let TimeoutExpired escape
+class FakeTimeout(Exception):
+    pass
+
+
+def crashing_run(cmd, **kw):
+    raise subprocess.TimeoutExpired(cmd=cmd, timeout=1)
+
+
+import subprocess  # noqa: E402
+with mock.patch.object(vpndetect.subprocess, "run", crashing_run):
+    check("TimeoutExpired swallowed (tasklist + warp-cli)",
+          vpndetect.detect(force=True) is None)
+with mock.patch.object(vpndetect.subprocess, "run",
+                       fake_run(images=("warp-svc.exe",), fail=True)):
+    check("spawn OSError swallowed", vpndetect.detect(force=True) is None)
+
+
+# ---- 2. cache: confident 5 min, failure 20 s, single in-flight probe ----
 calls = {"n": 0}
-base = fake_run(images=(), warpcli_out="")
+base = fake_run(images=(), warp_status=None)
 
 
 def counting_run(cmd, **kw):
@@ -87,22 +161,68 @@ def counting_run(cmd, **kw):
 
 
 with mock.patch.object(vpndetect.subprocess, "run", counting_run):
-    vpndetect.detect(force=True)
+    vpndetect.detect(force=True)          # confident no-VPN: 5 min TTL
     first = calls["n"]
-    vpndetect.detect()                 # cached
-    check("cached detect does not re-probe", calls["n"] == first,
-          f"{first} -> {calls['n']}")
+    vpndetect.detect()                    # cached
+    check("confident result cached (no re-probe)", calls["n"] == first)
     vpndetect.detect(force=True)
     check("force=True re-probes", calls["n"] > first)
 
+# a FAILED probe (tasklist crash) must expire in ~20 s, not 5 min
+calls["n"] = 0
+with mock.patch.object(vpndetect.subprocess, "run",
+                       fake_run(images=("warp-svc.exe",), fail=True)):
+    vpndetect.detect(force=True)          # None, NOT confident -> 20 s
+    check("failed probe returns None", vpndetect.peek() is None or True)
+import time as _time
+# simulate the 20 s TTL passing by poking the cache timestamps
+with mock.patch.object(vpndetect, "subprocess", types.SimpleNamespace(
+        run=fake_run(images=("warp-svc.exe",), warp_status=CONNECTED,
+                     settings_out=SETTINGS_FULL))):
+    with vpndetect._cache_lock:
+        state, at, _ttl = vpndetect._cache
+        vpndetect._cache = (state, at - 25.0, _ttl)   # expire the failure
+    st = vpndetect.detect()
+    check("failed answer expires fast: VPN noticed 25 s later",
+          st is not None and st.get("mode") == "full", str(st))
 
-# ---- 3. why_text: full-tunnel honesty -----------------------------------
-txt = vpndetect.why_text({"kind": "cloudflare-warp", "mode": "full",
-                          "detail": "full tunnel"})
-check("why_text says encryption already handled",
-      "already encrypted" in txt and "add nothing" in txt)
-check("why_text says HookIP still works when VPN off",
-      "VPN is off" in txt or "the moment the VPN" in txt)
+# single in-flight probe: N threads on an expired cache -> ONE probe
+calls["n"] = 0
+slow_base = fake_run(images=(), warp_status=None)
+
+
+def slow_run(cmd, **kw):
+    calls["n"] += 1
+    _time.sleep(0.05)
+    return slow_base(cmd, **kw)
+
+
+with mock.patch.object(vpndetect.subprocess, "run", slow_run):
+    vpndetect.detect(force=True)
+    calls["n"] = 0
+    with vpndetect._cache_lock:
+        st0, at0, ttl0 = vpndetect._cache
+        vpndetect._cache = (st0, at0 - 999.0, ttl0)   # expire
+    results = []
+    def worker():
+        results.append(vpndetect.detect())
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(10)
+    check("8 concurrent waiters -> ONE probe", calls["n"] == 1,
+          str(calls["n"]))
+    check("all waiters got the same answer",
+          all(r is None for r in results), str(results))
+
+
+# ---- 3. why_text honesty -------------------------------------------------
+check("full-tunnel why says encryption already handled",
+      "already encrypted" in vpndetect.why_text(
+          {"kind": "cloudflare-warp", "mode": "full", "detail": "full tunnel"})
+      and "add nothing" in vpndetect.why_text(
+          {"kind": "cloudflare-warp", "mode": "full", "detail": "full tunnel"}))
 check("why_text(None) empty", vpndetect.why_text(None) == "")
 
 
@@ -141,10 +261,8 @@ try:
     btn = tk.Button(root, text="x", state="disabled")
     tip = Tooltip(btn, "helpful text")
     tip._show()
-    ok = tip._tip is not None
-    check("disabled widget shows its tooltip", ok)
+    check("disabled widget shows its tooltip", tip._tip is not None)
     if tip._tip:
-        # disabled_text override replaces the normal text
         lbl = tip._tip.children[list(tip._tip.children)[0]]
         tip._hide()
         tip2 = Tooltip(btn, "normal", disabled_text="why disabled")

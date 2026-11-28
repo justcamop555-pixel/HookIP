@@ -1248,7 +1248,11 @@ class App:
                                  bg="#202634", fg=MUTED, padx=8, pady=3)
         self.vpn_tip = None
         self._vpn_refresh_scheduled = False
-        self.root.after(1500, self._refresh_vpn_pill)   # after the window paints
+        # after the window paints — on a WORKER thread: detect() spawns
+        # subprocesses (tasklist, warp-cli) and must never run on the UI
+        # thread, where a hung probe could freeze the window
+        self.root.after(1500, lambda: threading.Thread(
+            target=self._refresh_vpn_pill, daemon=True).start())
         # flat-button hover feedback (header buttons)
         for btn, hot, cold in ((self.restore_btn, "#2a3244", "#202634"),):
             btn.bind("<Enter>", lambda e, b=btn, c=hot: b.configure(bg=c), add="+")
@@ -2032,8 +2036,11 @@ class App:
         # VPN awareness: say HONESTLY what HookIP does and does not add
         # while a full-tunnel VPN (e.g. Cloudflare WARP) is up — the user
         # asked 'do they conflict?' too often for this to stay invisible.
+        # peek() = cache only: no subprocess on the Start path (the
+        # pill's worker refresh keeps the cache warm; without a cached
+        # answer we simply say nothing yet)
         try:
-            vpn_state = vpndetect.detect()
+            vpn_state = vpndetect.peek()
         except Exception:
             vpn_state = None
         protect_msg = (f"Proxy running on 127.0.0.1:{cfg.port}.\n"
