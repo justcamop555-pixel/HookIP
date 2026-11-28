@@ -292,7 +292,68 @@ def test_worker_redirect_populates_checksum_sources():
           _asset and _asset.endswith("v1.2.0/HookIP.exe"), str(_asset))
 
 
+
+def test_worker_asset_sha_pairing():
+    """A mixed asset set must not pair an exe with a DIFFERENT file's
+    checksum (the download would verify against the wrong hash and a
+    GOOD file would be deleted as a false mismatch)."""
+    import json as _json
+
+    def api_response(assets):
+        data = _json.dumps({
+            "tag_name": "v2.0.0", "html_url": "https://github.com/r/releases/tag/v2.0.0",
+            "prerelease": False, "body": "notes",
+            "assets": [{"name": n, "browser_download_url":
+                        f"https://github.com/r/releases/download/v2.0.0/{n}"}
+                       for n in assets]}).encode()
+        class R:
+            def read(self, n=-1): return data
+            def __enter__(self): return self
+            def __exit__(self, *a): return None
+        return R()
+
+    def run_with(assets, sha_file=None):
+        sha_line = ("cd" * 32) + "  " + (sha_file or "HookIP.exe") + chr(10)
+        def fake_urlopen(req, timeout=None):
+            url = req.full_url if hasattr(req, "full_url") else str(req)
+            if url.endswith(".sha256"):
+                class S:
+                    def read(self, n=-1): return sha_line.encode()
+                    def __enter__(self): return self
+                    def __exit__(self, *a): return None
+                return S()
+            return api_response(assets)
+        captured = []
+        app = make_fake_app()
+        app.UPDATE_REPO = appmod.App.UPDATE_REPO
+        app._ui_queue = types.SimpleNamespace(put=lambda item: captured.append(item))
+        with _mock.patch.object(_urlreq, "urlopen", fake_urlopen),              _mock.patch.object(_urlreq, "build_opener",
+                                lambda *a, **k: (_ for _ in ()).throw(OSError("x"))):
+            appmod.App._update_worker(app)
+        return captured[0][1]   # (latest, url, off, asset, sha_asset, pre, body, err, sha_pre)
+
+    # mixed set with a matching exe present: re-paired to the matching exe
+    (l, u, off, a, sa, pre, b, e, sp) = run_with(
+        ["HookIP.exe", "HookIP_x64.exe", "HookIP_x64.exe.sha256"])
+    check("mixed assets re-paired exe with ITS checksum",
+          a and a.endswith("v2.0.0/HookIP_x64.exe") and
+          sa.endswith("v2.0.0/HookIP_x64.exe.sha256"),
+          f"asset={a}")
+    # mixed set with NO matching exe: fail closed (no one-click download)
+    (l, u, off, a, sa, pre, b, e, sp) = run_with(
+        ["HookIP.exe", "HookIP_x64.exe.sha256"])
+    check("no exe matching the published checksum -> no download button",
+          a is None and sa.endswith("HookIP_x64.exe.sha256"), f"asset={a}")
+    # consistent set untouched
+    (l, u, off, a, sa, pre, b, e, sp) = run_with(
+        ["HookIP_x64.exe", "HookIP_x64.exe.sha256"])
+    check("consistent asset set passes through unchanged",
+          a.endswith("HookIP_x64.exe") and sa.endswith("HookIP_x64.exe.sha256"))
+
+
+test_sha_pre_fallback_chain()
 test_worker_redirect_populates_checksum_sources()
+test_worker_asset_sha_pairing()
 
 print()
 print(f"Summary: {sum(1 for _, c in RESULTS if c)}/{len(RESULTS)} passed")

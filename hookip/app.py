@@ -43,6 +43,16 @@ def resource_path(name):
     return os.path.join(base, name)
 
 
+def _dl_stem(url):
+    """Basename of a release-asset URL, minus the .sha256 suffix — used to
+    pair an exe asset with ITS OWN checksum file. A mixed asset set
+    (HookIP.exe + HookIP_x64.exe.sha256) must never pair an exe with a
+    DIFFERENT file's checksum: the download would be good and then be
+    deleted as a false mismatch."""
+    name = str(url or "").rstrip("/").split("?")[0].split("/")[-1].lower()
+    return name[:-len(".sha256")] if name.endswith(".sha256") else name
+
+
 def _parse_sha_file(txt):
     """First token of a .sha256 release asset -> 64-hex lowercase, or None.
     An HTML error page (or any non-hex junk) is NOT a checksum."""
@@ -700,13 +710,34 @@ class App:
                         asset = a.get("browser_download_url")
                     elif nm.endswith(".sha256") and not sha_asset:
                         sha_asset = a.get("browser_download_url")
+                # PAIRING GUARD: the exe and the checksum must describe the
+                # SAME file. A mixed asset set used to pair HookIP.exe with
+                # HookIP_x64.exe.sha256 — the download verified against the
+                # wrong hash and a GOOD file was deleted as a mismatch.
+                if asset and sha_asset and \
+                        _dl_stem(asset) != _dl_stem(sha_asset):
+                    match = next(
+                        (a.get("browser_download_url")
+                         for a in data.get("assets") or []
+                         if str(a.get("name", "")).lower().endswith(".exe")
+                         and _dl_stem(a.get("browser_download_url", ""))
+                         == _dl_stem(sha_asset)),
+                        None)
+                    asset = match if match else None
+                    # no exe matching the published checksum -> no one-click
+                    # download at all (fail-closed; the Releases page works)
                 if not sha_asset and latest:
                     # notes of some releases carry no sha256 — probe the
                     # asset directly so the download can always verify
                     found = tag_checksum(latest)
                     if found:
-                        sha_pre, sha_asset, asset2 = found
-                        asset = asset or asset2
+                        sha_pre, sha_asset, probed_exe = found
+                        if asset is None or \
+                                _dl_stem(asset) != _dl_stem(sha_asset):
+                            # keep the exe/sha a matching pair: the probe's
+                            # exe URL is derived from the .sha256 name, so
+                            # it always matches the checksum we fetched
+                            asset = probed_exe
         except urllib.error.HTTPError as exc:
             offline = exc.code in (403, 429, 500, 502, 503)
             http_error = exc.code   # NOT 'offline': the network answered
@@ -992,6 +1023,7 @@ class App:
             # sha256 printed in the release notes (github.com server side,
             # immune to asset-CDN blocks).
             expected = None
+            sha_src = None                # which source produced `expected`
             sha_url = getattr(self, "_update_sha_url", None)
             if sha_url:
                 try:
@@ -1002,24 +1034,30 @@ class App:
                     # (that would fail every genuine download with a
                     # nonsense mismatch)
                     expected = _parse_sha_file(txt)
+                    if expected:
+                        sha_src = "the release's .sha256 asset"
                 except (OSError, urllib.error.URLError):
                     expected = None
             if expected is None:
                 expected = getattr(self, "_update_sha_pre", None)
                 if expected:
+                    sha_src = "the check-time fetch (github.com, not the "\
+                              "rate-limited API)"
                     self.log.info("Update checksum taken from the check-time "
                                   "fetch (asset unreachable right now).")
             if expected is None:
                 expected = body_sha256()
                 if expected:
+                    sha_src = "the release notes"
                     self.log.info("Update checksum taken from the release "
                                   "notes (asset CDN unreachable).")
             if expected is None:
                 self.log.error(
                     "Update download REFUSED: no checksum could be "
-                    "obtained for this release (checksum asset and "
-                    "release notes both unavailable) — install manually "
-                    "from the Releases page.")
+                    "obtained for this release (the .sha256 asset, the "
+                    "check-time fetch and the release notes all failed) "
+                    "— often transient: retry, or install manually from "
+                    "the Releases page.")
                 notify.notify(
                     "HookIP — update download failed",
                     "No checksum could be obtained for this release, so "
@@ -1042,9 +1080,12 @@ class App:
                     # leave it stuck on 'downloading…' forever
                     self._ui_queue.put(("dl_done", (False,)))
                     return
-                src = ("check-time fetch" if sha_url is None and not body_sha256()
-                       else "release checksum")
-                self.log.ok(f"Downloaded update verified against the {src}.")
+                # the label names the source that ACTUALLY produced the
+                # hash (the old guess read the URL that existed, not the
+                # source that answered — it said 'release checksum' even
+                # when that fetch had failed and the check-time sha won)
+                self.log.ok(f"Downloaded update verified against "
+                            f"{sha_src or 'the published checksum'}.")
             with open(tmp, "wb") as fh:
                 fh.write(data)
             os.replace(tmp, dest)   # atomic: the exe appears only when complete
