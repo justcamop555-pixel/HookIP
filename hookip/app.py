@@ -3218,6 +3218,30 @@ class App:
         tag = ("ok" if ok_count == len(RESOLVERS)
                else ("warn" if ok_count else "fail"))
         self._diag_result("DNS summary", f"{ok_count}/{len(RESOLVERS)} reachable", "", tag)
+        # per-domain secure-DNS bypass visibility: domains where secure DNS
+        # could not answer and the resolver now goes straight to plaintext
+        proxy = self.proxy
+        res = getattr(proxy, "resolver", None) if proxy else None
+        self._diag_doh_bypass(res)
+
+    def _diag_doh_bypass(self, res):
+        """Which domains are currently force-ignored for secure DNS —
+        silent filtering is a bug, so the report names them."""
+        if res is None:
+            self._diag_result("DoH bypassed domains", "skipped",
+                              "start the proxy first", "info")
+            return
+        items = res.doh_bypass_snapshot()
+        if items:
+            shown = ", ".join(h for h, _r in items[:3])
+            self._diag_result(
+                "DoH bypassed domains", "WARN",
+                f"{len(items)} force-ignored (secure DNS had no answer, "
+                f"plaintext DNS did): {shown}", "warn")
+        else:
+            self._diag_result("DoH bypassed domains", "OK",
+                              "none — every domain answered via secure "
+                              "DNS", "ok")
 
     def _diag_tunnel(self):
         self._diag_section("End-to-end tunnel through HookIP")

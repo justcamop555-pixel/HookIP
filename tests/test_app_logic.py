@@ -6,6 +6,7 @@ winproxy/urllib access is monkeypatched — no real registry or network.
 """
 import io
 import os
+import threading
 import urllib.request as _urlreq
 import sys
 import tempfile
@@ -603,6 +604,43 @@ check("empty upstream: no-op",
       appmod.App._upstream_gone(_empty) is False and
       _empty.cfg.upstream_proxy == "" and not _empty._ui_queue,
       str(_empty._ui_queue))
+
+# ---- diagnostics: DoH-bypassed domains visible, never silently filtered -
+def _diag_fixture():
+    a = make_app()
+    a._diag_lock = threading.Lock()
+    a._diag_queue = []
+    a._diag_result = types.MethodType(appmod.App._diag_result, a)
+    return a
+
+
+_diag = _diag_fixture()
+appmod.App._diag_doh_bypass(
+    _diag, types.SimpleNamespace(
+        doh_bypass_snapshot=lambda: [("split.test", "no usable record"),
+                                     ("corp.lan.example", "NXDOMAIN")]))
+_rows = list(_diag._diag_queue)
+_warn_rows = [r for r in _rows if r[0] == "result" and r[2] == "WARN"]
+check("bypassed domains surfaced as a WARN row",
+      len(_warn_rows) == 1 and _warn_rows[0][1] == "DoH bypassed domains",
+      str(_rows))
+check("the row NAMES the skipped domains",
+      any("split.test" in r[3] and "corp.lan.example" in r[3]
+          for r in _warn_rows), str(_warn_rows))
+
+_diag2 = _diag_fixture()
+appmod.App._diag_doh_bypass(
+    _diag2, types.SimpleNamespace(doh_bypass_snapshot=lambda: []))
+_ok_rows = [r for r in _diag2._diag_queue if r[0] == "result" and r[2] == "OK"]
+check("empty bypass list reported as OK (not silent)",
+      len(_ok_rows) == 1 and "none" in _ok_rows[0][3], str(_diag2._diag_queue))
+
+_diag3 = _diag_fixture()
+appmod.App._diag_doh_bypass(_diag3, None)
+_skip_rows = [r for r in _diag3._diag_queue if r[0] == "result"]
+check("no proxy: bypass row says 'start the proxy first'",
+      len(_skip_rows) == 1 and _skip_rows[0][2] == "skipped",
+      str(_diag3._diag_queue))
 
 print(f"Summary: {sum(1 for _, c in RESULTS if c)}/{len(RESULTS)} passed")
 sys.exit(0 if all(c for _, c in RESULTS) else 1)

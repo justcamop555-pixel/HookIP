@@ -1222,6 +1222,103 @@ def test_dohconn_handshake_failure_closes_socket():
           str(closed))
 
 
+# ---- per-domain secure-DNS force-ignore (bypass) -------------------------
+def test_doh_bypass_recorded_on_plaintext_success():
+    """DoH answered-but-empty + plaintext answer -> the domain is
+    force-ignored for secure DNS, and the answer still works."""
+    r = make_resolver()
+    r._via_doh = lambda host, qtype: ([], 120,
+                                      "NXDOMAIN (unconfirmed, single resolver)")
+    r._via_tcp_dns = lambda *a, **k: (["93.184.216.34"], 60)
+    r._via_udp_dns = lambda *a, **k: ([], 0)
+    r._via_system = lambda *a, **k: ([], 0)
+    ips = r.resolve("split.test")
+    check("plaintext answer wins despite the DoH NX vote",
+          ips == ["93.184.216.34"], repr(ips))
+    snap = r.doh_bypass_snapshot()
+    check("domain force-ignored for secure DNS",
+          any(h == "split.test" and "secure DNS" in rr for h, rr in snap),
+          str(snap))
+
+
+def test_doh_bypass_skips_doh_attempt():
+    """A force-ignored domain resolves WITHOUT touching DoH; once the
+    bypass expires, DoH is asked again."""
+    r = make_resolver()
+    doh_calls = []
+
+    def doh(host, qtype):
+        doh_calls.append(host)
+        return ([], 120, "no A records (NODATA, verified via DoH x.test)")
+
+    r._via_doh = doh
+    r._via_tcp_dns = lambda *a, **k: (["1.2.3.4"], 60)
+    r._via_udp_dns = lambda *a, **k: ([], 0)
+    r._via_system = lambda *a, **k: ([], 0)
+    r.resolve("skip.test")
+    check("first lookup recorded the bypass", len(doh_calls) == 1,
+          str(doh_calls))
+    ips = r.resolve("skip.test")
+    check("bypassed domain skips DoH entirely", len(doh_calls) == 1,
+          str(doh_calls))
+    check("bypassed domain still resolves", ips == ["1.2.3.4"], repr(ips))
+    with r._lock:
+        r._cache.pop("skip.test", None)   # the fresh answer is still cached
+        r._doh_bypass["skip.test"] = (time.time() - 1, "expired")
+    r.resolve("skip.test")
+    check("expired bypass: DoH asked again", len(doh_calls) == 2,
+          str(doh_calls))
+
+
+def test_doh_bypass_dropped_when_plaintext_dies():
+    """A stale bypass whose plaintext chain finds nothing is dropped so
+    secure DNS is re-asked — no permanent lockout of a changed domain."""
+    r = make_resolver()
+    r._via_doh = lambda host, qtype: ([], 120, None)
+    r._via_tcp_dns = lambda *a, **k: ([], 0)
+    r._via_udp_dns = lambda *a, **k: ([], 0)
+    r._via_system = lambda *a, **k: ([], 0)
+    with r._lock:
+        r._doh_bypass["dead.test"] = (time.time() + 900, "old")
+    try:
+        r.resolve("dead.test")
+        check("total failure still raises ResolveError", False, "no raise")
+    except ResolveError:
+        check("total failure still raises ResolveError", True)
+    except Exception as e:
+        check("total failure still raises ResolveError", False, repr(e))
+    with r._lock:
+        gone = "dead.test" not in r._doh_bypass
+    check("stale bypass dropped on total failure", gone)
+
+
+def test_split_horizon_system_rescue():
+    """DoH + TCP both verify NXDOMAIN, but the SYSTEM resolver (the local
+    network's own DNS) answers: the answer wins, the negative cache is
+    NOT poisoned, and the domain is force-ignored for secure DNS."""
+    r = make_resolver()
+    r._via_doh = lambda host, qtype: ([], 120,
+                                      "NXDOMAIN (unconfirmed, single resolver)")
+
+    def tcp_confirms(host, qtype, doh_nx_vote=False):
+        raise VerifiedNegative(
+            f"{host}: NXDOMAIN (verified via DoH + TCP DNS x)")
+
+    r._via_tcp_dns = tcp_confirms
+    r._via_udp_dns = lambda *a, **k: ([], 0)
+    r._via_system = lambda *a, **k: (["10.0.0.5"], 60)
+    ips = r.resolve("corp.lan.example")
+    check("system resolver answer beats a verified public NXDOMAIN",
+          ips == ["10.0.0.5"], repr(ips))
+    check("negative cache NOT poisoned after the rescue",
+          "corp.lan.example" not in r._neg_cache,
+          str(r._neg_cache.get("corp.lan.example")))
+    snap = r.doh_bypass_snapshot()
+    check("rescued domain force-ignored for secure DNS",
+          any(h == "corp.lan.example" and "NXDOMAIN" in rr for h, rr in snap),
+          str(snap))
+
+
 if __name__ == "__main__":
 
     test_pool_max()
@@ -1251,6 +1348,12 @@ if __name__ == "__main__":
     test_pending_full_waits_without_cpu_spin()
     test_doh_attempt_unexpected_exception()
     test_dohconn_handshake_failure_closes_socket()
+
+    test_dohconn_handshake_failure_closes_socket()
+    test_doh_bypass_recorded_on_plaintext_success()
+    test_doh_bypass_skips_doh_attempt()
+    test_doh_bypass_dropped_when_plaintext_dies()
+    test_split_horizon_system_rescue()
 
     print()
     print(f"Summary: {sum(1 for _, c in RESULTS if c)}/{len(RESULTS)} passed")

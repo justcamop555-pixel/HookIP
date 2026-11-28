@@ -338,6 +338,13 @@ class Resolver:
         self._sni_mode = {}                   # resolver -> 'ip' | 'host'
         self._sni_mode_ts = {}                # resolver -> last fallback ts
         self._last_plain_warn = 0.0           # throttles the DoH-fallback warn
+        # PER-DOMAIN SECURE-DNS BYPASS ("force-ignore"): hosts where secure
+        # DNS had no answer while plaintext DNS did — every lookup of such
+        # a domain used to re-burn the full DoH attempt (and, for
+        # split-horizon names, end in a verified NXDOMAIN) forever.
+        self._doh_bypass = {}                 # host -> (expiry, reason)
+        self._BYPASS_TTL = 900                # 15 min per domain
+        self._BYPASS_CAP = 256
         # how long past its expiry a cached DoH answer may be served as
         # stale when every resolver path fails (RFC 8767-style)
         self._STALE_MAX = 600
@@ -564,12 +571,21 @@ class Resolver:
         verified_neg = None    # trusted negative verdict string (NXDOMAIN / NODATA)
         doh_note = None        # detailed last DoH verdict (helps messaging)
         source = None          # where the winning answer came from (logging)
+        # the per-domain bypass: a host on the force-ignore list skips the
+        # DoH attempt entirely (primary AND cross-type below) and goes
+        # straight to the plaintext chain
+        with self._lock:
+            bp = self._doh_bypass.get(host)
+            if bp and bp[0] <= now:
+                self._doh_bypass.pop(host, None)   # expired — ask DoH again
+                bp = None
+        bypass_doh = bp is not None
         try:
-            if self.cfg.doh_enabled:
+            if self.cfg.doh_enabled and not bypass_doh:
                 ips, ttl, doh_note = self._via_doh(host, qtype)
                 if ips:
                     source = "doh"
-            else:
+            elif not self.cfg.doh_enabled:
                 ips, ttl, doh_note = [], 120, None
             if not ips:
                 # a single unconfirmed DoH NXDOMAIN vote makes TCP DNS the
@@ -597,6 +613,30 @@ class Resolver:
             ips, ttl = self._via_system(host, qtype)
             if ips:
                 source = "system"
+        if not ips and verified_neg:
+            # SPLIT-HORIZON LAST CHANCE: the PUBLIC resolvers (DoH + TCP
+            # second opinion) agree the name does not exist — but the
+            # network's OWN resolver may still know it (company LAN names,
+            # campus DNS). The chain used to declare the domain dead
+            # without ever asking the local authority, and the negative
+            # cache then locked the site out for the full ttl. The system
+            # resolver is the local network's word: an answer here wins,
+            # and secure DNS is force-ignored for this domain (public DoH
+            # will keep saying NXDOMAIN for a name it cannot know).
+            sys_ips, sys_ttl = [], 120
+            try:
+                sys_ips, sys_ttl = self._via_system(host, qtype)
+            except (ResolveError, OSError):
+                pass
+            if sys_ips:
+                ips, ttl = sys_ips, sys_ttl
+                source = "system"
+                verified_neg = None
+                with self._lock:
+                    self._neg_cache.pop(host, None)
+                self._force_ignore_doh(
+                    host, "secure DNS said NXDOMAIN, the system resolver "
+                    "answered")
         if not ips:
             # A resolver that ANSWERED (rcode 0) but has no usable records
             # is a trusted verdict (NODATA). A single unconfirmed DoH
@@ -629,7 +669,7 @@ class Resolver:
             other_note = None
             if not nx_verdict:
                 try:
-                    if self.cfg.doh_enabled:
+                    if self.cfg.doh_enabled and not bypass_doh:
                         ips, ttl, other_note = self._via_doh(host, other)
                         if ips:
                             source = "doh"
@@ -677,6 +717,12 @@ class Resolver:
                     with self._lock:
                         self._neg_cache[host] = (now + neg_ttl, reason)
             if not ips:
+                if bypass_doh:
+                    # the bypassed plaintext chain ALSO found nothing: the
+                    # bypass entry may be stale (the domain changed) — drop
+                    # it so the next lookup asks secure DNS again
+                    with self._lock:
+                        self._doh_bypass.pop(host, None)
                 # SERVE-STALE (RFC 8767 flavored): every path failed, but if
                 # a recently-expired DoH answer is still within the
                 # staleness window, serve it briefly instead of falling to
@@ -765,6 +811,17 @@ class Resolver:
         if source and source != "doh" and self.cfg.doh_enabled and ips:
             self._plain_fallback_warn(host, source)
 
+        # PER-DOMAIN BYPASS TRIGGER: secure DNS ANSWERED (an outage leaves
+        # doh_note None) but had no usable record, while a plaintext path
+        # produced the address — a split-DNS/parental-filter pattern where
+        # every lookup would re-pay the full DoH round-trip. Force-ignore
+        # secure DNS for this domain for a while.
+        if (ips and not stale_served and source in ("tcp", "udp", "system")
+                and self.cfg.doh_enabled and doh_note is not None):
+            self._force_ignore_doh(
+                host, f"secure DNS had no usable record ({doh_note}), "
+                "plaintext DNS answered")
+
         ttl = min(300, max(10, int(ttl or 120)))   # None -> sensible default
         with self._lock:
             cap = profile().cache_cap
@@ -789,6 +846,37 @@ class Resolver:
             self._cache[host] = (now + ttl, list(ips))
         self.log.debug(f"resolve {host} -> {', '.join(ips[:4])} (ttl {ttl}s)")
         return list(ips)
+
+    def _force_ignore_doh(self, host, reason):
+        """Force-ignore secure DNS for ONE domain: for _BYPASS_TTL every
+        lookup of this host skips the DoH attempt (primary and cross-type)
+        and goes straight to the plaintext chain. Auto-expires, so DoH is
+        periodically re-asked — if it then answers, the entry is simply
+        not refreshed and normal resolution resumes."""
+        with self._lock:
+            if len(self._doh_bypass) > self._BYPASS_CAP:
+                now2 = time.time()
+                alive = {h: e for h, e in self._doh_bypass.items()
+                         if e[0] > now2}
+                if len(alive) > self._BYPASS_CAP:
+                    alive = dict(sorted(alive.items(),
+                                        key=lambda kv: kv[1][0])
+                                 [:self._BYPASS_CAP // 2])
+                self._doh_bypass = alive
+            self._doh_bypass[host] = (time.time() + self._BYPASS_TTL,
+                                      str(reason)[:160])
+        self.log.info(f"secure DNS force-ignored for {host} for "
+                      f"{self._BYPASS_TTL // 60} min ({reason})")
+
+    def doh_bypass_snapshot(self):
+        """Currently force-ignored domains as [(host, reason)], for the
+        diagnostics report."""
+        now = time.time()
+        with self._lock:
+            return sorted(
+                ((h, r) for h, (exp, r) in self._doh_bypass.items()
+                 if exp > now),
+                key=lambda kv: kv[0])
 
     # -- strategies ------------------------------------------------------
     # -- circuit breaker -------------------------------------------------
