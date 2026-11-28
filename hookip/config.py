@@ -21,6 +21,7 @@ DEFAULTS = {
     "minimize_to_tray": True,
     "pac_token": "",              # stable PAC URL token (generated once)
     "upstream_proxy": "",         # network's own mandatory proxy (restricted Wi-Fi), "" = none
+    "strat_memory": {},           # host -> ClientHello strategy that last worked (persisted)
 }
 
 
@@ -56,6 +57,22 @@ class Config:
             clean["pac_token"] = DEFAULTS["pac_token"]
         if not isinstance(clean.get("upstream_proxy"), str):
             clean["upstream_proxy"] = DEFAULTS["upstream_proxy"]
+        sm = clean.get("strat_memory")
+        if isinstance(sm, dict):
+            # per-entry filter: one hand-edited bad value must not throw
+            # away the whole learned map (all-or-nothing used to reset it)
+            sm = {k: v for k, v in sm.items()
+                  if isinstance(k, str) and isinstance(v, str)
+                  and v in ("smart", "chunk", "random", "raw")}
+            clean["strat_memory"] = sm
+        else:
+            clean["strat_memory"] = {}
+        # bound it: a marathon session on a browsing-heavy machine can
+        # learn thousands of hosts; keep the most recently LEARNED 256
+        # (dict insertion order — evictions re-insert learned hosts at
+        # the end, so the tail is the live set)
+        if len(clean["strat_memory"]) > 256:
+            clean["strat_memory"] = dict(list(clean["strat_memory"].items())[-256:])
         return clean
 
     # -- dict-style access ------------------------------------------------

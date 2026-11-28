@@ -317,6 +317,8 @@ class Resolver:
         self._lock = threading.Lock()
         self._start_idx = 0
         self._lat = {}                          # resolver name -> EMA latency (s)
+        self._cb_fail = {}                      # resolver -> consecutive failures
+        self._cb_open = {}                      # resolver -> cooldown-until (ts)
         self._inflight = {}                     # host -> Event (lookup coalescing)
         self._inflight_lock = threading.Lock()
         self.verbose_stats = {}               # resolver -> success count
@@ -723,6 +725,52 @@ class Resolver:
         return list(ips)
 
     # -- strategies ------------------------------------------------------
+    # -- circuit breaker -------------------------------------------------
+    # A resolver that fails repeatedly (blocked IPs, dead network path)
+    # used to be retried on EVERY lookup — each miss burned a hedge slot
+    # and 0.4 s of latency for the other resolvers. After 3 consecutive
+    # failures it now cools down for 5 minutes and is skipped by the
+    # rotation (unless ALL resolvers are cooling, in which case nobody is
+    # skipped — a total outage must still be attempted). The first
+    # success resets it.
+    _CB_FAILS = 3          # consecutive failures before the cooldown
+    _CB_COOLDOWN = 300.0   # seconds
+
+    def _cb_note(self, name, ok):
+        with self._lock:
+            prev = self._cb_fail.get(name, 0)
+            if ok:
+                if prev >= self._CB_FAILS:
+                    self.log.ok(f"DoH {name}: working again after "
+                                f"{prev} consecutive failures — back in rotation")
+                self._cb_fail[name] = 0
+                self._cb_open.pop(name, None)
+            else:
+                fails = prev + 1
+                self._cb_fail[name] = fails
+                if fails >= self._CB_FAILS and name not in self._cb_open:
+                    self._cb_open[name] = time.time() + self._CB_COOLDOWN
+                    self.log.warn(
+                        f"DoH {name}: failed {fails}× in a row — paused "
+                        f"for {self._CB_COOLDOWN // 60} min (auto-retries; "
+                        "other resolvers keep serving)")
+
+    def _cb_skip(self, name):
+        """True when this resolver is in cooldown AND at least one other
+        resolver is currently usable — a total outage skips nobody."""
+        with self._lock:
+            until = self._cb_open.get(name)
+            if not until or time.time() >= until:
+                return False            # not cooling
+            for other in RESOLVERS:
+                on = other[0]
+                if on == name:
+                    continue
+                o = self._cb_open.get(on)
+                if not o or time.time() >= o:
+                    return True         # someone else is usable — sit out
+            return False                # everyone cooling — keep trying
+
     def _note_latency(self, name, dt, ok=True):
         """Exponential moving average so slow resolvers (e.g. ~1s AdGuard)
         automatically drop to the back of the rotation."""
@@ -742,6 +790,11 @@ class Resolver:
             self._start_idx = (self._start_idx + 1) % n
         # fastest first — measured latency beats fixed rotation
         order.sort(key=lambda r: self._lat.get(r[0], 1.0))
+        # circuit breaker: cooling resolvers drop to the BACK of the order.
+        # They are demoted, never skipped outright — a total outage still
+        # reaches them, and they keep getting occasional probes so recovery
+        # is detected without waiting out the full cooldown.
+        order.sort(key=lambda r: 1 if self._cb_skip(r[0]) else 0)
         query = dnsmsg.encode_query(host, qtype)
         rec = "AAAA" if qtype == dnsmsg.TYPE_AAAA else "A"
 
@@ -901,8 +954,10 @@ class Resolver:
             rcode, answers = dnsmsg.parse_response(resp, qname=host)
             dt = time.time() - t0
             self._note_latency(name, dt, ok=True)
+            self._cb_note(name, ok=True)   # reachable and answering → reset
             self.log.debug(f"DoH {name}: {host} rcode={rcode} in {dt:.2f}s")
             if rcode == 3:
+                self._cb_note(name, ok=True)  # spoke authoritatively → reset
                 return ("nx", name, None)
             if rcode != 0:
                 return ("err", f"{name}: rcode {rcode}", None)
@@ -962,6 +1017,7 @@ class Resolver:
             return ("verified_neg", str(exc), None)
         except (OSError, ResolveError, ValueError, ssl.SSLError) as exc:
             self._note_latency(name, time.time() - t0, ok=False)
+            self._cb_note(name, ok=False)     # transport failure → breaker
             self.log.debug(f"DoH {name} failed: {exc}")
             return ("err", f"{name}: {exc}", None)
         finally:

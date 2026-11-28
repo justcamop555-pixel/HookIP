@@ -185,6 +185,18 @@ class ProxyServer:
         self.resolver = Resolver(cfg, log, chunk=cfg.fragment_size)
         self._strat_pref = {}                 # host -> strategy that last worked
         self._strat_cap = 512                 # keep the memory map bounded
+        # strategy memory SURVIVES restarts: seeded from settings at start,
+        # persisted back at stop / every 5 min — DPI behavior of a filter
+        # does not change between runs, so 'what worked last time' is
+        # worth keeping
+        try:
+            seed = getattr(cfg, "strat_memory", None)
+            if isinstance(seed, dict):
+                self._strat_pref.update(seed)
+        except (OSError, ValueError, TypeError):
+            pass
+        self._strat_dirty = False
+        self._strat_save_at = time.time() + 300
         self.on_accept_death = None           # app hook: emergency restore
         self._blocked_seen = {}               # host -> last 'blocked/dead' log ts
         self._lsock = None
@@ -246,6 +258,7 @@ class ProxyServer:
 
     def stop(self):
         self.running = False
+        self._persist_strat_memory()
         if self._lsock:
             try:
                 self._lsock.close()
@@ -336,7 +349,24 @@ class ProxyServer:
     def _tick_loop(self):
         while self.running:
             self.stats.tick()
+            if self._strat_dirty and time.time() >= self._strat_save_at:
+                self._persist_strat_memory()
             time.sleep(1.0)
+
+    def _persist_strat_memory(self):
+        """Write the learned host->strategy map into settings (capped to
+        256 entries — the config layer prunes on load too). Never raises:
+        a failed save must not stop the proxy or the exit sequence."""
+        try:
+            with self._state_lock:
+                snap = dict(list(self._strat_pref.items())[-256:])
+            self.cfg.strat_memory = snap
+            if getattr(self.cfg, "remember", True):
+                self.cfg.save()
+            self._strat_dirty = False
+            self._strat_save_at = time.time() + 300
+        except Exception:  # noqa: BLE001 — persistence is best-effort
+            pass
 
     def _bounded_state_put(self, d, key, value, cap):
         """Store in a shared state dict under _state_lock with bounded
@@ -396,6 +426,18 @@ class ProxyServer:
         try:
             csock.settimeout(30)
             head, complete = self._read_head(csock)
+            if head:
+                # canonicalize bare-LF line endings ONCE, up front, so that
+                # parsing, body splitting and the plain-HTTP rebuild all see
+                # the SAME bytes. Without this, a head mixing LF and CRLF
+                # (the \r\n\r\n terminator made it "complete") let an
+                # interior bare \n inside one header value survive parsing —
+                # the rebuild in _plain_http joins values with \r\n, and the
+                # embedded \n then became a real attacker-chosen header line
+                # in the upstream request (request smuggling).
+                # 1:1 byte-for-byte, so length checks stay valid.
+                head = head.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+                complete = b"\r\n\r\n" in head
             if not complete:
                 if len(head) >= 262144:
                     # headers too big to be a legitimate request — tell the
@@ -710,6 +752,7 @@ class ProxyServer:
                 ssock = self._tunnel_once(csock, host, port, strategy, first, excl)
                 self._bounded_state_put(self._strat_pref, host, strategy,
                                         self._strat_cap)
+                self._strat_dirty = True
                 return ssock
             except ResolveError as exc:
                 # DNS-level failure (NXDOMAIN / SERVFAIL / sinkhole-only):
@@ -763,6 +806,7 @@ class ProxyServer:
                     "handshake attempt itself.")
                 self._bounded_state_put(self._strat_pref, host, "raw",
                                         self._strat_cap)
+                self._strat_dirty = True
                 return ssock
             except (OSError, ResolveError) as exc2:
                 attempt_errors.append(f"unfragmented: {exc2}")
@@ -783,6 +827,7 @@ class ProxyServer:
                     "upstream), not blocked.")
                 self._bounded_state_put(self._strat_pref, host, "smart",
                                         self._strat_cap)
+                self._strat_dirty = True
                 return ssock
             except (OSError, ResolveError) as exc3:
                 attempt_errors.append(f"flap-retry: {exc3}")

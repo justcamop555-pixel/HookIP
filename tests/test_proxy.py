@@ -193,6 +193,100 @@ def test_plain_http_body_once():
         client.close(); client_peer.close()
 
 
+def test_lf_header_smuggling_neutralized():
+    """A head mixing bare-LF and CRLF endings used to smuggle a real header
+    line into the upstream request: the interior \n inside one header value
+    survived parsing and the plain-HTTP rebuild joined it back with \r\n.
+    _handle now canonicalizes line endings up front, so no header value can
+    ever contain LF again."""
+    raw = (b"GET http://127.0.0.1:9999/ HTTP/1.1\r\n"
+           b"Host: 127.0.0.1\r\n"
+           b"X-A: v1\nX-Injected: 1\r\n"
+           b"Connection: close\r\n\r\n")
+    # documents the pre-fix parse: the value carried the smuggled line
+    pre_v = ProxyServer._parse_head(raw)[2].get("x-a", "")
+    check("pre-canonicalization parse reproduces the smuggling payload",
+          "\n" in pre_v, repr(pre_v))
+    # what _handle now does before parsing
+    canon = raw.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+    headers = ProxyServer._parse_head(canon)[2]
+    check("canonical parse: no header value contains LF",
+          all("\n" not in v for v in headers.values()), str(headers))
+    check("canonical parse keeps both headers as separate lines",
+          headers.get("x-a") == "v1" and headers.get("x-injected") == "1",
+          str(headers))
+
+    # end-to-end: what the ORIGIN receives matches the canonical parse —
+    # go through the real rebuild path (_plain_http, non-upstream)
+    responses = (b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n"
+                 b"Connection: close\r\n\r\nhi")
+    got, done, _srv, origin_port = origin_server(responses=responses)
+    ps = make_server()
+    client, client_peer = socketpair()
+    target = f"http://127.0.0.1:{origin_port}/smuggle"
+    head = (f"GET {target} HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+            f"X-A: v1\nX-Injected: 1\r\nConnection: close\r\n\r\n").encode()
+    head = head.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")   # _handle step
+    result = {}
+    def call():
+        try:
+            ps._plain_http(client, head, "GET", target,
+                           ProxyServer._parse_head(head)[2])
+            result["ok"] = True
+        except Exception as e:
+            result["err"] = e
+    th = threading.Thread(target=call, daemon=True)
+    th.start()
+    th.join(8)
+    check("smuggle-head request completes", result.get("ok"),
+          repr(result.get("err")))
+    done.wait(5)
+    data = got["data"]
+    check("origin saw no LF inside a header line",
+          b"\n" not in data.replace(b"\r\n", b""), data[:80])
+    check("origin saw the headers as clean CRLF lines",
+          b"x-a: v1\r\n" in data and b"x-injected: 1\r\n" in data,
+          data[:120])
+    client.close(); client_peer.close()
+
+
+def test_strat_memory_persisted():
+    """The per-host strategy memory survives restarts: ProxyServer start
+    seeds from cfg.strat_memory; stop (and the 5-min ticker) persists the
+    learned map back, capped at 256."""
+    ps = make_server()
+    saved = {}
+    ps.cfg.remember = True
+    ps.cfg.save = lambda: saved.update(ps.cfg.strat_memory)
+    for i in range(300):
+        ps._strat_pref[f"h{i}.host.name"] = "chunk"
+    ps._strat_dirty = True
+    ps._persist_strat_memory()
+    check("stop persists the learned strategies (capped at 256)",
+          len(saved) == 256 and saved.get("h299.host.name") == "chunk",
+          f"{len(saved)} entries")
+    check("dirty flag cleared after persist", not ps._strat_dirty)
+
+    # a fresh session seeds from settings
+    cfg2 = types.SimpleNamespace(port=9401, fragment_size=2, strategy="smart",
+                                 excluded=[], doh_enabled=False,
+                                 proxy_mode="manual", upstream_proxy="",
+                                 strat_memory={"seed.host.name": "random"})
+    ps2 = ProxyServer(cfg2, FakeLog(), Stats(), "tok")
+    check("start seeds strategy memory from settings",
+          ps2._strat_pref.get("seed.host.name") == "random",
+          str(ps2._strat_pref))
+
+    # the config layer sanitizes what it loads (hand-edited settings.json)
+    from hookip.config import Config
+    c = Config({"strat_memory": {"a.host.name": "bogus", "b.host.name": "chunk"}})
+    check("invalid strategy values dropped on load",
+          c.strat_memory == {"b.host.name": "chunk"}, str(c.strat_memory))
+    big = {f"k{i}.host.name": "smart" for i in range(300)}
+    check("oversized strat_memory pruned to 256",
+          len(Config({"strat_memory": big}).strat_memory) == 256)
+
+
 def test_expect_100_continue():
     got, done, _srv, origin_port = origin_server(
         responses=b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n"
@@ -1031,6 +1125,8 @@ if __name__ == "__main__":
     test_parse_head_body()
     test_plain_http_body_once()
     test_expect_100_continue()
+    test_lf_header_smuggling_neutralized()
+    test_strat_memory_persisted()
     test_relay_initial_up()
     test_dpi_flag_and_raw_last_resort()
     test_always_resets_falls_through_raw()

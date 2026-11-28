@@ -747,6 +747,8 @@ def test_udp_verification():
         # correct transaction ID -> accepted
         FakeUDP.instances.clear()
         FakeUDP.reply = b"\xab\xcd" + b"resp"
+        real_parse = StubDns.parse_response
+        real_extract = StubDns.extract_ips
         StubDns.parse_response = staticmethod(
             lambda resp, qname=None: (0, [(("n"), 1, 60, "6.6.6.6")]))
         StubDns.extract_ips = staticmethod(
@@ -754,9 +756,15 @@ def test_udp_verification():
         with mock.patch.object(dohmod.socket, "socket", FakeUDP), \
              mock.patch.object(dohmod, "dnsmsg", StubDns):
             ips, ttl = r._via_udp_dns("udp2.test", 1)
-        check("UDP correct transaction ID accepted", ips == ["6.6.6.6"], str(ips))
+        check("UDP correct transaction ID accepted", ips == ["6.6.6.6"],
+              str(ips))
     finally:
+        # restore ALL the monkey-patched members: parse_response/
+        # extract_ips used to stay patched after this test, making any
+        # LATER test's stubbed answer come back as 6.6.6.6
         StubDns.encode_query = staticmethod(real_encode)
+        StubDns.parse_response = staticmethod(real_parse)
+        StubDns.extract_ips = staticmethod(real_extract)
 
 
 # ---- 9. _start_idx guarded / is_sinkhole uses module socket -----------
@@ -802,6 +810,48 @@ def test_serve_stale_on_doh_outage():
         check("doh disabled -> no serve-stale", False, "served")
     except ResolveError:
         check("doh disabled -> no serve-stale", True)
+
+
+def test_circuit_breaker():
+    """3 consecutive transport failures cool a resolver down for 5 min
+    (demoted to the BACK of the hedge order, never skipped when everyone
+    is cooling); the first success resets it and logs the recovery."""
+    fail = OSError("blocked (simulated)")
+    scripts = {n: [fail] for n, _, _ in dohmod.RESOLVERS}
+    r = script_resolver(scripts, pool_max=2)
+    r._via_tcp_dns = lambda *a, **k: ([], 0)
+    r._via_udp_dns = lambda *a, **k: ([], 0)
+    r._via_system = lambda *a, **k: ([], 0)
+
+    for i in range(3):
+        try:
+            r.resolve(f"outage{i}.host.name")
+        except ResolveError:
+            pass
+    names = {n for n, _, _ in dohmod.RESOLVERS}
+    check("3+ consecutive failures counted on every resolver",
+          all(r._cb_fail.get(n, 0) >= 3 for n in names), str(r._cb_fail))
+    check("breaker opened on every resolver",
+          set(r._cb_open) == names, str(r._cb_open))
+    pauses = [m for (lvl, m) in r.log.lines if lvl == "warn" and "paused" in m]
+    check("one pause warn per resolver (no spam)", len(pauses) == 4,
+          f"{len(pauses)} pause warns")
+    check("total outage: nobody is skipped",
+          not any(r._cb_skip(n) for n in names), str(r._cb_open))
+
+    # recovery: Cloudflare starts answering — its breaker resets and the
+    # OTHERS are now skippable (one usable resolver is enough)
+    scripts["Cloudflare"] = [addrs("1.2.3.4")]
+    with mock.patch.object(dohmod, "dnsmsg", StubDns):
+        ips = r.resolve("recovery.host.name")
+    check("recovered resolver answers", ips == ["1.2.3.4"], str(ips))
+    check("breaker reset on success",
+          r._cb_fail.get("Cloudflare") == 0 and "Cloudflare" not in r._cb_open,
+          f"fail={r._cb_fail.get('Cloudflare')} open={'Cloudflare' in r._cb_open}")
+    check("recovery logged", any("working again" in m
+          for (lvl, m) in r.log.lines if lvl == "ok"))
+    check("still-cooling resolvers are skippable when one is usable",
+          r._cb_skip("Google") and not r._cb_skip("Cloudflare"))
 
 
 def test_private_ip_poisoning_guard():
@@ -937,6 +987,7 @@ if __name__ == "__main__":
     test_sinkhole_only_answer_raises()
     test_hedge_thread_start_failure_degrades()
     test_private_ip_poisoning_guard()
+    test_circuit_breaker()
     test_serve_stale_on_doh_outage()
 
     print()
